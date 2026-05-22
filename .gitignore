@@ -1,0 +1,5 @@
+node_modules
+dist
+.env
+.firebase
+data/wallonia_postal_street.csv

@@ -1,0 +1,704 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function role() {
+      return isSignedIn() && request.auth.token.role is string ? request.auth.token.role : "";
+    }
+
+    function adminType() {
+      return isSignedIn() && request.auth.token.adminType is string ? request.auth.token.adminType : "";
+    }
+
+    function visualTheme() {
+      return isSignedIn() && request.auth.token.visualTheme is string ? request.auth.token.visualTheme : "";
+    }
+
+    function identifierNumber() {
+      return isSignedIn() && request.auth.token.identifierNumber is string ? request.auth.token.identifierNumber : "";
+    }
+
+    function assignedCircuits() {
+      return isSignedIn() && request.auth.token.assignedCircuits is list ? request.auth.token.assignedCircuits : [];
+    }
+
+    function assignedSchools() {
+      return isSignedIn() && request.auth.token.assignedSchools is list ? request.auth.token.assignedSchools : [];
+    }
+
+    function linkedChildrenIds() {
+      return isSignedIn() && request.auth.token.linkedChildrenIds is list ? request.auth.token.linkedChildrenIds : [];
+    }
+
+    function uidIn(values) {
+      return isSignedIn() && values is list && request.auth.uid in values;
+    }
+
+    function isAssignedToCircuit(circuitId) {
+      return circuitId is string && circuitId != "" && circuitId in assignedCircuits();
+    }
+
+    function isLinkedChildId(childId) {
+      return childId is string && childId != "" && childId in linkedChildrenIds();
+    }
+
+    function isAssignedToSchool(schoolName) {
+      return schoolName is string && schoolName != "" && schoolName in assignedSchools();
+    }
+
+    function isSystemAdmin() {
+      return isSignedIn()
+        && (
+          role() in ["system_admin", "admin_system"]
+          || (role() == "admin" && (adminType() == "system" || identifierNumber() == "6183"))
+        );
+    }
+
+    function isSpw() {
+      return isSignedIn()
+        && (
+          role() == "spw"
+          || (role() == "admin" && (adminType() == "spw" || visualTheme() == "spw"))
+        );
+    }
+
+    function isTransportManager() {
+      return isSignedIn()
+        && (
+          role() in ["transport_manager", "gestionnaire_transport"]
+          || (role() == "admin" && !isSystemAdmin() && !isSpw())
+        );
+    }
+
+    function isDriver() {
+      return role() == "driver";
+    }
+
+    function isAssistant() {
+      return role() == "assistant";
+    }
+
+    function isParent() {
+      return role() == "parent";
+    }
+
+    function isSupport() {
+      return role() == "support";
+    }
+
+    function isTransportOperator() {
+      return isTransportManager() || isSpw() || isDriver() || isAssistant();
+    }
+
+    function profileIsSystemAdmin(data) {
+      return data.role in ["system_admin", "admin_system"]
+        || (data.role == "admin" && (data.adminType == "system" || data.identifierNumber == "6183"));
+    }
+
+    function studentSensitiveKeys() {
+      return [
+        "medicalHelpSheet",
+        "medicalDisabilityType",
+        "allergies",
+        "medicalConditions",
+        "medicalSymptoms",
+        "symptomInstructions",
+        "transitionObject",
+        "mobilityHelp",
+        "tripOccupation",
+        "transportSickness",
+        "communicationHelp",
+        "nonVerbalCommunication",
+        "pictograms",
+        "signs",
+        "careAdviceNotes",
+        "sensitiveStudent",
+        "attentionSpeciale",
+        "typeAttention",
+        "noteAttention",
+        "niveauAttention",
+        "alternatingCustody",
+        "alternatingResidence",
+        "autonomy",
+        "transportExclusion",
+        "exclusionType",
+        "exclusionReason",
+        "exclusionStartDate",
+        "exclusionEndDate",
+        "responsiblePersons",
+        "guardians",
+        "authorizedPersons",
+        "authorizedPickupPersons"
+      ];
+    }
+
+    function parentMedicalUpdateKeys() {
+      return [
+        "medicalHelpSheet",
+        "allergies",
+        "medicalConditions",
+        "medicalSymptoms",
+        "symptomInstructions",
+        "transitionObject",
+        "mobilityHelp",
+        "tripOccupation",
+        "transportSickness",
+        "communicationHelp",
+        "nonVerbalCommunication",
+        "pictograms",
+        "signs",
+        "careAdviceNotes",
+        "parentMedicalHelpCompletedAt",
+        "parentMedicalHelpCompletedBy",
+        "updatedAt",
+        "updatedBy",
+        "updatedByRole"
+      ];
+    }
+
+    function changedKeys() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    function changesNoStudentSensitiveData() {
+      return !changedKeys().hasAny(studentSensitiveKeys());
+    }
+
+    function studentLinkedToUser(studentData, studentId) {
+      return uidIn(studentData.parentIds)
+        || request.auth.uid == studentData.parentId
+        || request.auth.uid == studentData.driverId
+        || request.auth.uid == studentData.assistantId
+        || isLinkedChildId(studentId)
+        || isAssignedToCircuit(studentData.circuitNumber)
+        || isAssignedToCircuit(studentData.pickupCircuitId)
+        || isAssignedToCircuit(studentData.schoolCircuitId)
+        || isAssignedToCircuit(studentData.transferSchoolCircuitId);
+    }
+
+    function canReadStudent(studentData, studentId) {
+      return isSignedIn()
+        && !isSupport()
+        && !isSystemAdmin()
+        && (
+          isSpw()
+          || isTransportManager()
+          || ((isDriver() || isAssistant() || isParent()) && studentLinkedToUser(studentData, studentId))
+        );
+    }
+
+    function canCreateStudent() {
+      return isSpw()
+        || (isTransportManager() && !request.resource.data.keys().hasAny(studentSensitiveKeys()));
+    }
+
+    function canUpdateStudent(studentId) {
+      return isSpw()
+        || (isTransportManager() && changesNoStudentSensitiveData())
+        || (
+          isParent()
+          && studentLinkedToUser(resource.data, studentId)
+          && changedKeys().hasOnly(parentMedicalUpdateKeys())
+        );
+    }
+
+    function canReadAddressedMessage(messageData) {
+      return isSignedIn()
+        && (
+          uidIn(messageData.recipientIds)
+          || (messageData.recipientType == role())
+        );
+    }
+
+    function isConversationParticipant(conversationData) {
+      return isSignedIn()
+        && !isSupport()
+        && !isParent()
+        && !isSystemAdmin()
+        && uidIn(conversationData.participants);
+    }
+
+    function canReadPrivateConversation(conversationData) {
+      return isSignedIn()
+        && !isSupport()
+        && !isSystemAdmin()
+        && uidIn(conversationData.participants);
+    }
+
+    function canWritePrivateConversation(conversationData) {
+      return isSignedIn()
+        && !isSupport()
+        && !isSystemAdmin()
+        && uidIn(conversationData.participants);
+    }
+
+    function canReadSupportRequest(requestData) {
+      return isSupport()
+        || isTransportManager()
+        || isSpw()
+        || (isSignedIn() && request.auth.uid == requestData.userId && !isParent());
+    }
+
+    function canWriteSupportRequest(requestData) {
+      return isSupport()
+        || isTransportManager()
+        || isSpw()
+        || (isSignedIn() && request.auth.uid == requestData.userId && !isParent());
+    }
+
+    function canReadCircuitBoundData(data) {
+      return isTransportManager()
+        || isSpw()
+        || ((isDriver() || isAssistant()) && isAssignedToCircuit(data.circuitId))
+        || ((isDriver() || isAssistant()) && isAssignedToCircuit(data.circuitNumber))
+        || ((isParent()) && isAssignedToCircuit(data.circuitId));
+    }
+
+    match /students/{studentId} {
+      allow read: if canReadStudent(resource.data, studentId);
+      allow create: if canCreateStudent();
+      allow update: if canReadStudent(resource.data, studentId) && canUpdateStudent(studentId);
+      allow delete: if isTransportManager() || isSpw();
+    }
+
+    match /children/{studentId} {
+      allow read: if canReadStudent(resource.data, studentId);
+      allow create: if canCreateStudent();
+      allow update: if canReadStudent(resource.data, studentId) && canUpdateStudent(studentId);
+      allow delete: if isTransportManager() || isSpw();
+    }
+
+    match /studentMedical/{studentId} {
+      allow read: if isSpw()
+        || request.auth.uid == resource.data.driverId
+        || request.auth.uid == resource.data.assistantId
+        || uidIn(resource.data.parentIds)
+        || (isParent() && isLinkedChildId(studentId));
+      allow create, update: if isSpw()
+        || (
+          isParent()
+          && (isLinkedChildId(studentId) || uidIn(resource.data.parentIds) || uidIn(request.resource.data.parentIds))
+        );
+      allow delete: if isSpw();
+    }
+
+    match /studentSensitive/{studentId} {
+      allow read: if isSpw()
+        || request.auth.uid == resource.data.driverId
+        || request.auth.uid == resource.data.assistantId
+        || uidIn(resource.data.parentIds)
+        || (isParent() && isLinkedChildId(studentId));
+      allow create, update, delete: if isSpw();
+    }
+
+    match /users/{userId} {
+      allow read: if isSignedIn()
+        && (
+          request.auth.uid == userId
+          || isSystemAdmin()
+          || (isTransportManager() && !profileIsSystemAdmin(resource.data) && resource.data.role != "assistant")
+          || (isSpw() && resource.data.role in ["assistant", "spw"])
+        );
+      allow create: if isTransportManager()
+        && request.resource.data.role in ["driver", "support", "transport_manager", "admin"]
+        && !profileIsSystemAdmin(request.resource.data);
+      allow create: if isSpw()
+        && request.resource.data.role in ["assistant", "spw"];
+      allow update: if request.auth.uid == userId
+        && !changedKeys().hasAny(["role", "adminType", "visualTheme", "identifierNumber", "assignedCircuits", "isActive"]);
+      allow update: if isTransportManager()
+        && !profileIsSystemAdmin(resource.data)
+        && resource.data.role != "assistant"
+        && request.resource.data.role == resource.data.role;
+      allow update: if isSpw()
+        && resource.data.role in ["assistant", "spw"]
+        && request.resource.data.role == resource.data.role;
+      allow delete: if isTransportManager()
+        && !profileIsSystemAdmin(resource.data)
+        && resource.data.role in ["driver", "support", "transport_manager", "admin"];
+      allow delete: if isSpw() && resource.data.role == "assistant";
+    }
+
+    match /parents/{parentId} {
+      allow read: if request.auth.uid == parentId || isTransportManager() || isSpw();
+      allow create, update, delete: if isTransportManager() || isSpw();
+    }
+
+    match /drivers/{driverId} {
+      allow read: if isTransportManager()
+        || isSpw()
+        || request.auth.uid == driverId
+        || ((isDriver() || isAssistant()) && isAssignedToCircuit(resource.data.schoolCircuit));
+      allow create, update, delete: if isTransportManager();
+      allow update: if request.auth.uid == driverId
+        && !changedKeys().hasAny(["id", "role", "accessCode", "identifierNumber"]);
+    }
+
+    match /assistants/{assistantId} {
+      allow read: if isTransportManager()
+        || isSpw()
+        || request.auth.uid == assistantId
+        || ((isDriver() || isAssistant()) && isAssignedToCircuit(resource.data.schoolCircuit));
+      allow create, update, delete: if isSpw();
+      allow update: if request.auth.uid == assistantId
+        && !changedKeys().hasAny(["id", "role", "accessCode", "identifierNumber"]);
+    }
+
+    match /vehicles/{vehicleId} {
+      allow read: if isTransportManager()
+        || isSpw()
+        || request.auth.uid == resource.data.driverId
+        || request.auth.uid == resource.data.assistantId
+        || isAssignedToCircuit(resource.data.circuitId)
+        || (isParent() && isAssignedToCircuit(resource.data.circuitId) && resource.data.isOutOfService == true);
+      allow create, update, delete: if isTransportManager();
+    }
+
+    match /schools/{schoolId} {
+      allow read: if isTransportManager()
+        || isSpw()
+        || ((isDriver() || isAssistant()) && isAssignedToSchool(resource.data.name));
+      allow create, update, delete: if isTransportManager() || isSpw();
+    }
+
+    match /circuits/{circuitId} {
+      allow read: if isTransportManager()
+        || isSpw()
+        || isAssignedToCircuit(resource.data.name)
+        || isAssignedToCircuit(circuitId);
+      allow create, update, delete: if isTransportManager() || isSpw();
+    }
+
+    match /studentAbsences/{absenceId} {
+      allow read: if isSignedIn()
+        && (
+          request.auth.uid == resource.data.parentId
+          || request.auth.uid == resource.data.driverId
+          || request.auth.uid == resource.data.assistantId
+        );
+      allow create: if isParent()
+        && request.auth.uid == request.resource.data.parentId;
+      allow update, delete: if false;
+    }
+
+    match /studentIssues/{issueId} {
+      allow read: if isTransportManager()
+        || isSpw()
+        || request.auth.uid == resource.data.driverId
+        || request.auth.uid == resource.data.assistantId
+        || uidIn(resource.data.parentIds);
+      allow create: if isTransportManager()
+        || isSpw()
+        || request.auth.uid == request.resource.data.driverId
+        || request.auth.uid == request.resource.data.assistantId
+        || uidIn(request.resource.data.parentIds);
+      allow update: if isTransportManager()
+        || isSpw()
+        || request.auth.uid == resource.data.driverId
+        || request.auth.uid == resource.data.assistantId
+        || uidIn(resource.data.parentIds);
+      allow delete: if isTransportManager() || isSpw();
+
+      match /messages/{messageId} {
+        allow read, create: if isTransportManager()
+          || isSpw()
+          || request.auth.uid == get(/databases/$(database)/documents/studentIssues/$(issueId)).data.driverId
+          || request.auth.uid == get(/databases/$(database)/documents/studentIssues/$(issueId)).data.assistantId
+          || uidIn(get(/databases/$(database)/documents/studentIssues/$(issueId)).data.parentIds);
+        allow update, delete: if false;
+      }
+    }
+
+    match /incidents/{issueId} {
+      allow read: if isTransportManager()
+        || isSpw()
+        || request.auth.uid == resource.data.driverId
+        || request.auth.uid == resource.data.assistantId
+        || uidIn(resource.data.parentIds);
+      allow create, update: if isTransportManager()
+        || isSpw()
+        || request.auth.uid == request.resource.data.driverId
+        || request.auth.uid == request.resource.data.assistantId
+        || uidIn(request.resource.data.parentIds);
+      allow delete: if isTransportManager() || isSpw();
+    }
+
+    match /privateMessages/{conversationId} {
+      allow read, update: if canReadPrivateConversation(resource.data);
+      allow create: if canWritePrivateConversation(request.resource.data);
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        allow read, update: if canReadAddressedMessage(resource.data)
+          || canReadPrivateConversation(get(/databases/$(database)/documents/privateMessages/$(conversationId)).data);
+        allow create: if canWritePrivateConversation(get(/databases/$(database)/documents/privateMessages/$(conversationId)).data)
+          && request.auth.uid == request.resource.data.authorId
+          && uidIn(request.resource.data.recipientIds);
+        allow delete: if request.auth.uid == resource.data.authorId;
+      }
+    }
+
+    match /teamMessages/{conversationId} {
+      allow read, update: if isConversationParticipant(resource.data);
+      allow create: if isConversationParticipant(request.resource.data);
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        allow read, update: if isConversationParticipant(get(/databases/$(database)/documents/teamMessages/$(conversationId)).data)
+          && uidIn(resource.data.recipientIds);
+        allow create: if isConversationParticipant(get(/databases/$(database)/documents/teamMessages/$(conversationId)).data)
+          && request.auth.uid == request.resource.data.authorId
+          && uidIn(request.resource.data.recipientIds);
+        allow delete: if request.auth.uid == resource.data.authorId;
+      }
+    }
+
+    match /directMessages/{conversationId} {
+      allow read, update: if isConversationParticipant(resource.data);
+      allow create: if isConversationParticipant(request.resource.data);
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        allow read, update: if isConversationParticipant(get(/databases/$(database)/documents/directMessages/$(conversationId)).data);
+        allow create: if isConversationParticipant(get(/databases/$(database)/documents/directMessages/$(conversationId)).data)
+          && request.auth.uid == request.resource.data.authorId;
+        allow delete: if request.auth.uid == resource.data.authorId;
+      }
+    }
+
+    match /roleAnnouncements/{announcementId} {
+      allow read: if isSignedIn()
+        && !isSystemAdmin()
+        && (
+          request.auth.uid == resource.data.createdBy
+          || uidIn(resource.data.recipientIds)
+          || (resource.data.recipientType == "role_group" && role() == resource.data.targetRole)
+        );
+      allow create, update, delete: if isTransportManager() || isSpw();
+    }
+
+    match /supportRequests/{requestId} {
+      allow create: if (!isSignedIn() && request.resource.data.userRole != "parent")
+        || (isSignedIn() && !isParent());
+      allow read: if canReadSupportRequest(resource.data);
+      allow update: if canWriteSupportRequest(resource.data);
+      allow delete: if isSupport() || isTransportManager() || isSpw();
+
+      match /messages/{messageId} {
+        allow read, create: if canReadSupportRequest(get(/databases/$(database)/documents/supportRequests/$(requestId)).data);
+        allow update, delete: if isSupport();
+      }
+    }
+
+    match /accessRequests/{requestId} {
+      allow create: if true;
+      allow read, update: if isSupport() || isTransportManager() || isSpw();
+      allow delete: if isTransportManager() || isSpw();
+    }
+
+    match /parentChangeRequests/{requestId} {
+      allow read, update: if isSignedIn()
+        && (
+          request.auth.uid == resource.data.driverId
+          || request.auth.uid == resource.data.assistantId
+          || request.auth.uid == resource.data.parentId
+        );
+      allow create: if isParent()
+        && request.auth.uid == request.resource.data.parentId;
+      allow delete: if false;
+    }
+
+    match /transportTransfers/{transferId} {
+      allow read: if !isSpw()
+        && (
+          isTransportManager()
+          || request.auth.uid == resource.data.driverId
+          || request.auth.uid == resource.data.convoyeurId
+          || uidIn(resource.data.parentIds)
+          || uidIn(resource.data.studentsIds)
+          || isAssignedToCircuit(resource.data.circuitId)
+        );
+      allow create, update: if (isDriver() || isAssistant())
+        && (
+          request.auth.uid == request.resource.data.driverId
+          || request.auth.uid == request.resource.data.convoyeurId
+        );
+      allow delete: if false;
+    }
+
+    match /transferDelays/{delayId} {
+      allow read: if !isSpw()
+        && (
+          isTransportManager()
+          || request.auth.uid == resource.data.driverId
+          || request.auth.uid == resource.data.convoyeurId
+          || uidIn(resource.data.parentIds)
+          || uidIn(resource.data.studentsIds)
+          || isAssignedToCircuit(resource.data.circuitId)
+        );
+      allow create: if (isDriver() || isAssistant())
+        && (
+          request.auth.uid == request.resource.data.driverId
+          || request.auth.uid == request.resource.data.convoyeurId
+        );
+      allow update: if (isDriver() || isAssistant())
+        && (
+          request.auth.uid == resource.data.driverId
+          || request.auth.uid == resource.data.convoyeurId
+        );
+      allow delete: if false;
+    }
+
+    match /replacementRules/{ruleId} {
+      allow read: if isTransportManager()
+        || isSpw()
+        || isDriver()
+        || isAssistant()
+        || (isParent() && (isAssignedToCircuit(resource.data.inactiveCircuitId) || isAssignedToCircuit(resource.data.primaryReplacementCircuitId)));
+      allow create, update, delete: if isTransportManager() || isSpw();
+    }
+
+    match /smsAlerts/{alertId} {
+      allow read: if isTransportManager()
+        || isSpw()
+        || request.auth.uid == resource.data.createdBy;
+      allow create: if isTransportOperator()
+        && request.auth.uid == request.resource.data.createdBy
+        && request.resource.data.type in ["delay", "cancellation"];
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    match /notifications/{notificationId} {
+      allow read, update, delete: if isSignedIn()
+        && request.auth.uid == resource.data.userId;
+      allow create: if isTransportManager()
+        || isSpw()
+        || isDriver()
+        || isAssistant()
+        || isSupport();
+    }
+
+    match /leaveRequests/{requestId} {
+      allow read: if isTransportManager()
+        || request.auth.uid == resource.data.createdBy;
+      allow create: if isDriver()
+        && request.auth.uid == request.resource.data.createdBy;
+      allow update: if isTransportManager();
+      allow delete: if false;
+    }
+
+    match /poolTransport/{transportId} {
+      allow read, create, update, delete: if isTransportManager();
+    }
+
+    match /extraSchoolTransport/{transportId} {
+      allow read, create, update, delete: if isTransportManager();
+    }
+
+    match /extraTransports/{transportId} {
+      allow read, create, update, delete: if isTransportManager();
+    }
+
+    match /vehicleRepairs/{repairId} {
+      allow read: if isTransportManager()
+        || request.auth.uid == resource.data.createdBy;
+      allow create: if isDriver()
+        && request.auth.uid == request.resource.data.createdBy;
+      allow update: if isTransportManager();
+      allow delete: if false;
+    }
+
+    match /vehicleReports/{repairId} {
+      allow read: if isTransportManager()
+        || request.auth.uid == resource.data.createdBy;
+      allow create: if isDriver()
+        && request.auth.uid == request.resource.data.createdBy;
+      allow update: if isTransportManager();
+      allow delete: if false;
+    }
+
+    match /anomalies/{anomalyId} {
+      allow read: if isTransportManager()
+        || request.auth.uid == resource.data.createdBy;
+      allow create: if isDriver()
+        && request.auth.uid == request.resource.data.createdBy;
+      allow update: if isTransportManager();
+      allow delete: if false;
+    }
+
+    match /historyLogs/{logId} {
+      allow read: if isTransportManager() || isSpw();
+      allow create: if isSignedIn()
+        && !isSupport()
+        && !isSystemAdmin()
+        && request.resource.data.modifiedBy == request.auth.uid
+        && (
+          request.resource.data.modifiedByRole == role()
+          || (request.resource.data.modifiedByRole == "admin" && (isTransportManager() || isSpw()))
+        );
+      allow update, delete: if false;
+    }
+
+    match /securityLogs/{logId} {
+      allow read: if isSystemAdmin();
+      allow create: if true;
+      allow update, delete: if false;
+    }
+
+    match /loginLogs/{logId} {
+      allow read: if isSystemAdmin();
+      allow create: if true;
+      allow update, delete: if false;
+    }
+
+    match /connectionLogs/{logId} {
+      allow read: if isSystemAdmin();
+      allow create: if true;
+      allow update, delete: if false;
+    }
+
+    match /serviceStatus/{statusId} {
+      allow read: if isSignedIn();
+      allow create, update: if isSystemAdmin() || isTransportManager();
+      allow delete: if false;
+    }
+
+    match /settings/{settingId} {
+      allow read: if isSignedIn();
+      allow create, update: if isTransportManager() || isSpw() || isSystemAdmin();
+      allow delete: if false;
+    }
+
+    match /appSettings/{settingId} {
+      allow read: if isSignedIn();
+      allow create, update: if isTransportManager() || isSpw();
+      allow delete: if false;
+    }
+
+    match /pdfExports/{exportId} {
+      allow read, create: if isTransportManager() || isSpw() || isDriver() || isAssistant();
+      allow update, delete: if false;
+    }
+
+    match /tecStops/{stopId} {
+      allow read, write: if false;
+    }
+
+    match /walloniaAddresses/{addressId} {
+      allow read, write: if false;
+    }
+
+    match /belgianAddresses/{addressId} {
+      allow read, write: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

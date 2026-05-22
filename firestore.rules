@@ -1,0 +1,21 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    /*
+      RÈGLES TEMPORAIRES DE DÉVELOPPEMENT LOCAL
+
+      Objectif :
+      - permettre à l'application GTS locale de synchroniser les données avec Firestore
+      - éviter le blocage "permission-denied" pendant la phase de configuration
+
+      IMPORTANT :
+      - ne pas utiliser ces règles en production
+      - les règles strictes ont été conservées dans firestore.production.rules
+      - remettre les règles strictes avant une mise en ligne publique
+    */
+    match /{document=**} {
+      allow read, write: if true;
+    }
+  }
+}

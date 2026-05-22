@@ -1,0 +1,23 @@
+{
+  "name": "gts-mobile",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "serve": "python3 -m http.server 5173",
+    "check": "node --check app.js",
+    "backup": "node scripts/backup-firestore.js",
+    "convert:wallonia-addresses": "node scripts/convert-wallonia-addresses.js",
+    "convert:tec-stops": "node scripts/convert-gtfs-stops.js",
+    "deploy": "firebase deploy",
+    "deploy:hosting": "firebase deploy --only hosting",
+    "deploy:rules": "firebase deploy --only firestore:rules"
+  },
+  "dependencies": {
+    "firebase": "^12.13.0"
+  },
+  "devDependencies": {
+    "vite": "^5.4.11"
+  }
+}
