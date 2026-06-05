@@ -52,8 +52,8 @@ async function loadFirebaseConfig() {
   return firebaseConfig;
 }
 
-function todayFolderName(date = new Date()) {
-  return date.toISOString().slice(0, 10);
+function backupFolderName(date = new Date()) {
+  return date.toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
 }
 
 function normalizeFirestoreValue(value) {
@@ -95,7 +95,7 @@ async function backupCollection(db, collectionName, outputDir, exportedAt) {
 
 async function main() {
   const exportedAt = new Date().toISOString();
-  const outputDir = path.join(backupRoot, todayFolderName());
+  const outputDir = path.join(backupRoot, backupFolderName());
   await fs.mkdir(outputDir, { recursive: true });
 
   const app = initializeApp(await loadFirebaseConfig());

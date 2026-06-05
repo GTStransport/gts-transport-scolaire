@@ -10,7 +10,7 @@ Application web Firebase pour le transport scolaire specialise.
 4. Activer Cloud Storage si le module est necessaire plus tard.
 5. Copier `.env.example` vers `.env.local`.
 6. Remplir `.env.local` avec les valeurs Firebase du projet.
-7. Adapter `firestore.rules` avant la mise en production.
+7. Conserver `firestore.rules` pour la production et `firestore.dev.rules` uniquement pour le test local.
 
 La configuration Firebase est centralisee dans `src/lib/firebase.js`. Le fichier utilise uniquement les variables `import.meta.env.VITE_FIREBASE_*` et exporte :
 
@@ -40,7 +40,62 @@ Ouvrir ensuite l'application sur l'URL affichee par Vite, generalement `http://l
 
 GTS garde son fonctionnement local existant avec `localStorage` comme fallback. Quand Firebase est disponible, l'application synchronise les donnees texte avec Cloud Firestore. Firebase Authentication et Cloud Storage sont initialises dans la configuration, mais aucune fonctionnalite visuelle n'a ete refaite pour cette integration.
 
-Important : sans regles Firestore strictes et strategie d'authentification adaptee, l'application doit rester prudente avant une mise en production.
+Important : les regles strictes de production utilisent Firebase Authentication et des claims de role. La connexion interne actuelle de GTS ne suffit pas, seule, a autoriser Firestore en production. Avant une mise en ligne publique, il faudra relier les comptes GTS a Firebase Auth ou a un backend qui cree les claims securises.
+
+Documentation des accès métier :
+
+- [Rapport détaillé GTS Connect](docs/rapport-app-gts-connect.md)
+- [Notice utilisateur](docs/notice-utilisateur.md)
+- [Accès par rôles](docs/acces-par-roles.md)
+- [Registre RGPD des traitements](docs/rgpd-registre-traitements.md)
+- [Politique de conservation et suppression](docs/rgpd-conservation-suppression.md)
+- [Procédures RGPD](docs/rgpd-procedures.md)
+- [AIPD / DPIA](docs/rgpd-aipd.md)
+- [Notification e-mail support](docs/support-email.md)
+
+## Mise en production Firebase
+
+Firebase Hosting publie uniquement le dossier `dist/`. Il ne publie plus la racine du projet.
+
+Verifier le code :
+
+```bash
+npm run check
+```
+
+Generer la version de production :
+
+```bash
+npm run build
+```
+
+Tester le build localement :
+
+```bash
+npm run preview
+```
+
+Deployer uniquement l'hebergement :
+
+```bash
+npm run deploy:hosting
+```
+
+Deployer uniquement les regles Firestore :
+
+```bash
+npm run deploy:rules
+```
+
+Regles Firestore :
+
+- `firestore.rules` : regles strictes pour production.
+- `firestore.production.rules` : copie de reference des regles strictes.
+- `firestore.dev.rules` : regles ouvertes de developpement local, a ne jamais deployer en production.
+
+Ne pas deployer `firestore.dev.rules` sur un site public. Ces regles permettent a l'application locale de tester la synchronisation, mais elles ouvrent toutes les lectures/ecritures.
+
+Le fichier `firebase.json` ajoute aussi des en-tetes de securite pour limiter l'integration en iframe, les permissions navigateur inutiles et les fuites de referer.
 
 ## Alertes SMS parents
 
@@ -172,13 +227,26 @@ Important : les arrêts TEC ne sont pas importes dans Firestore. Cela evite les 
 
 ## Sauvegarde Firestore
 
-Exporter les collections métier importantes en JSON :
+Une sauvegarde native Firestore est planifiée sur le projet Firebase de production :
+
+- base : `(default)`
+- récurrence : hebdomadaire, le lundi
+- conservation : 84 jours
+- schedule : `projects/gestion-transport-scolaire/databases/(default)/backupSchedules/12ec08da-8577-4dbd-ade3-15562d6dd0b0`
+
+Vérifier la planification :
+
+```bash
+firebase firestore:backups:schedules:list --database '(default)'
+```
+
+Exporter localement certaines collections métier importantes en JSON reste possible avec :
 
 ```bash
 npm run backup
 ```
 
-La commande crée un dossier daté dans `backups/YYYY-MM-DD/` avec un fichier JSON par collection :
+Cette commande crée un dossier daté dans `backups/YYYY-MM-DD/` avec un fichier JSON par collection :
 
 - `students`
 - `users`
@@ -187,4 +255,4 @@ La commande crée un dossier daté dans `backups/YYYY-MM-DD/` avec un fichier JS
 - `drivers`
 - `parents`
 
-Chaque fichier conserve l'identifiant du document, son chemin Firestore et les données normalisées. La sauvegarde ne supprime et ne modifie jamais les données Firestore.
+Chaque fichier conserve l'identifiant du document, son chemin Firestore et les données normalisées. La sauvegarde locale ne supprime et ne modifie jamais les données Firestore. Si elle est bloquée par les règles Firestore, utiliser la sauvegarde native Firebase ci-dessus comme référence production.

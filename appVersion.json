@@ -1,0 +1,5 @@
+{
+  "version": "1.2.92",
+  "updatedAt": "04/06/2026",
+  "changes": ["Correction synchronisation messages support", "Récupération automatique des conflits support"]
+}

@@ -1,0 +1,9 @@
+.firebase/
+*.log
+firestore-debug.log
+data/Wallonia_postal_street.csvnode_modules/
+.env.local
+functions/.env
+dist/
+backups/
+data/wallonia_postal_street.csv

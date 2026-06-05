@@ -1,5 +1,11 @@
-node_modules
-dist
+node_modules/
 .env
-.firebase
+.env.local
+functions/.env
+dist/
+backups/
 data/wallonia_postal_street.csv
+.firebase/
+*.log
+firestore-debug.log
+data/Wallonia_postal_street.csv

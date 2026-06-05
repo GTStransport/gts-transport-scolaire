@@ -3,28 +3,169 @@ const SESSION_KEY = "gts-session";
 const VIEW_STATE_KEY = "gts-view-state";
 const THEME_KEY = "gts-theme";
 const NOTIFICATION_SEEN_KEY = "gts-notifications-seen";
+const MAINTENANCE_NOTICE_ACK_KEY = "gts-maintenance-notice-ack";
 const OFFLINE_QUEUE_KEY = "gts-offline-queue";
 const OFFLINE_DB_NAME = "gts-offline-db";
 const OFFLINE_QUEUE_STORE = "offlineQueue";
+const APP_VERSION_URL = "/appVersion.json";
+const APP_VERSION_CHECK_INTERVAL_MS = 5 * 60 * 1000;
+const APP_DRAFTS_KEY = "gts-local-drafts";
 const SESSION_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+const MOBILE_UNLOCK_INTERVAL_MS = 8 * 60 * 60 * 1000;
 const SUPPORT_TEMP_ACCESS_DURATION_MS = 30 * 60 * 1000;
+const WEB_PUSH_VAPID_PUBLIC_KEY = "BBYdZGOpyTCLIfSqD9jXSahh6bfLQ1lz38qd-sRs5-djLuOID22OyPGeSGvrjFKrxuJDLkOcR675VHIiYF4E2Bc";
 const LOGO = "/assets/gsm-logo.png";
 const COMPANY_LOGO = "/assets/company-logo.png";
 const SPW_LOGO = "/assets/spw-logo.png";
+const BELGIUM_SCHOOL_BLOCKED_PERIODS = [
+  { label: "Fête de la Communauté française", start: "2026-09-27", end: "2026-09-27" },
+  { label: "Vacances d'automne", start: "2026-10-19", end: "2026-11-01" },
+  { label: "Fête des morts", start: "2026-11-02", end: "2026-11-02" },
+  { label: "Armistice", start: "2026-11-11", end: "2026-11-11" },
+  { label: "Vacances d'hiver", start: "2026-12-21", end: "2027-01-03" },
+  { label: "Mardi gras", start: "2027-02-09", end: "2027-02-09" },
+  { label: "Vacances de détente", start: "2027-02-22", end: "2027-03-07" },
+  { label: "Lundi de Pâques", start: "2027-03-29", end: "2027-03-29" },
+  { label: "Vacances de printemps", start: "2027-04-26", end: "2027-05-09" },
+  { label: "Jeudi de l'Ascension", start: "2027-05-06", end: "2027-05-06" },
+  { label: "Lundi de Pentecôte", start: "2027-05-17", end: "2027-05-17" },
+  { label: "Début des vacances d'été", start: "2027-07-03", end: "2027-07-03" }
+];
 let sessionExpiredMessage = "";
 let lastNotificationSignature = "";
 let offlineQueueMemory = [];
 let offlineSyncTimer = null;
+let offlineAutoSyncTimeout = null;
+let offlineAutoSyncInterval = null;
 let offlineSyncNotice = "";
+let firestoreUnsubscribeFns = [];
+let firestoreMessageUnsubscribeFns = new Map();
+let firestoreSyncStarted = false;
 const addressAutocompleteTimers = new WeakMap();
 const addressAutocompleteCache = new Map();
 const postalCodeAutocompleteCache = new Map();
 let tecStopsDatasetPromise = null;
 let walloniaAddressesDatasetPromise = null;
+let appVersionCheckTimer = null;
+let dashboardClockTimer = null;
+let maintenanceMonitorTimer = null;
+
+function isMaintenanceActive(now = Date.now()) {
+  const schedule = currentMaintenanceSchedule();
+  return schedule.enabled && now >= schedule.startAtMs && now < schedule.endAtMs;
+}
+
+function isMaintenancePlanned(now = Date.now()) {
+  const schedule = currentMaintenanceSchedule();
+  return schedule.enabled && schedule.startAtMs > now;
+}
+
+function currentMaintenanceSchedule() {
+  const status = { ...seed.serviceStatus, ...(data?.serviceStatus || {}) };
+  const startAtMs = new Date(status.maintenanceStartAt || "").getTime();
+  const endAtMs = new Date(status.maintenanceEndAt || "").getTime();
+  return {
+    enabled: status.maintenanceEnabled === true && Number.isFinite(startAtMs) && Number.isFinite(endAtMs) && endAtMs > startAtMs,
+    title: status.maintenanceTitle || "Maintenance planifiée",
+    message: status.maintenanceMessage || status.message || "L’application sera temporairement indisponible pendant la maintenance.",
+    startAt: status.maintenanceStartAt || "",
+    endAt: status.maintenanceEndAt || "",
+    startAtMs,
+    endAtMs
+  };
+}
+
+function maintenanceNoticeId(schedule = currentMaintenanceSchedule()) {
+  return [schedule.startAt, schedule.endAt, schedule.title].filter(Boolean).join("|");
+}
+
+function maintenanceNoticeAckKey(schedule = currentMaintenanceSchedule()) {
+  const userId = state.user?.id || "anonymous";
+  return `${MAINTENANCE_NOTICE_ACK_KEY}:${userId}:${maintenanceNoticeId(schedule)}`;
+}
+
+function maintenanceNoticeAcknowledged(schedule = currentMaintenanceSchedule()) {
+  if (!schedule.enabled || !maintenanceNoticeId(schedule)) return false;
+  return localStorage.getItem(maintenanceNoticeAckKey(schedule)) === "1";
+}
+
+function acknowledgeMaintenanceNotice() {
+  const schedule = currentMaintenanceSchedule();
+  if (schedule.enabled && maintenanceNoticeId(schedule)) {
+    localStorage.setItem(maintenanceNoticeAckKey(schedule), "1");
+  }
+  render();
+}
+
+function shouldShowDashboardMaintenanceNotice(now = Date.now()) {
+  const schedule = currentMaintenanceSchedule();
+  return schedule.enabled && now < schedule.endAtMs && !maintenanceNoticeAcknowledged(schedule);
+}
+
+function shouldShowLoginMaintenanceNotice(now = Date.now()) {
+  const schedule = currentMaintenanceSchedule();
+  const oneHourBefore = schedule.startAtMs - 60 * 60 * 1000;
+  return schedule.enabled && now >= oneHourBefore && now < schedule.endAtMs;
+}
+
+function maintenanceNoticeCard({ login = false } = {}) {
+  const schedule = currentMaintenanceSchedule();
+  const visible = login ? shouldShowLoginMaintenanceNotice() : shouldShowDashboardMaintenanceNotice();
+  if (!visible) return "";
+  const active = isMaintenanceActive();
+  return `<article class="service-status-card warning maintenance-notice-card ${login ? "login-maintenance-notice" : ""}">
+    <div>
+      <p class="eyebrow">${active ? "Maintenance en cours" : "Maintenance planifiée"}</p>
+      <h3><span>●</span> ${esc(schedule.title)}</h3>
+      <p>${esc(schedule.message)}</p>
+      ${sectionRows([
+        ["Début", formatDateTime(schedule.startAt)],
+        ["Fin prévue", formatDateTime(schedule.endAt)]
+      ])}
+      ${login ? "" : `<div class="form-actions"><button class="primary-button compact-action" type="button" data-ack-maintenance-notice>J’ai lu</button></div>`}
+    </div>
+    <b class="badge warning">${active ? "En cours" : "Prévue"}</b>
+  </article>`;
+}
+
+function maintenanceAccessMessage() {
+  const schedule = currentMaintenanceSchedule();
+  const end = schedule.endAt ? ` jusqu’à ${formatDateTime(schedule.endAt)}` : "";
+  return `${schedule.title}. ${schedule.message} Accès bloqué${end}.`;
+}
+
+function canAccessDuringMaintenance(user) {
+  return user?.role === "support" || user?.role === "admin" || user?.role === "system_admin";
+}
+
+function canLoginDuringMaintenance(loginMode) {
+  return ["support", "admin", "spw", "system_admin"].includes(loginMode);
+}
 
 function shouldResetUiFromQuery() {
   const query = new URLSearchParams(window.location.search);
   return query.get("restore") === "y" || query.get("resetUi") === "1";
+}
+
+function requestedScreenFromQuery() {
+  const query = new URLSearchParams(window.location.search);
+  const screen = String(query.get("screen") || "").trim();
+  return ["support", "notice", "settings", "dashboard"].includes(screen) ? screen : "";
+}
+
+function applyRequestedScreenFromQuery() {
+  if (!state.user) return;
+  const requestedScreen = requestedScreenFromQuery();
+  if (!requestedScreen) return;
+  if (requestedScreen === "support" && !canAccessSupportCenter()) return;
+  state.screen = requestedScreen;
+  state.selectedChildId = "";
+  state.editingChildId = "";
+  state.selectedType = "";
+  state.selectedId = "";
+  state.editingType = "";
+  state.editingId = "";
+  state.search = "";
 }
 
 function resetUiStatePreserveData(store) {
@@ -32,7 +173,6 @@ function resetUiStatePreserveData(store) {
   store.interfaceConfig = defaultInterfaceConfig();
   store.themePreference = "auto";
   localStorage.removeItem(VIEW_STATE_KEY);
-  localStorage.removeItem(SESSION_KEY);
   localStorage.removeItem(NOTIFICATION_SEEN_KEY);
   localStorage.setItem(THEME_KEY, "auto");
 }
@@ -63,8 +203,8 @@ const parentTranslations = {
     "access.schoolConcerned": "École concernée si connue",
     "access.message": "Message / précision",
     "access.send": "Envoyer la demande",
-    "nav.dashboard": "Tableau parent",
-    "nav.children": "Mes enfants",
+    "nav.dashboard": "Accueil",
+    "nav.children": "Enfant(s)",
     "nav.messages": "Messages",
     "nav.preferences": "Préférences",
     "nav.contact": "Contact",
@@ -79,6 +219,7 @@ const parentTranslations = {
     "dashboard.driver": "Chauffeur",
     "dashboard.assistant": "Convoyeuse",
     "dashboard.stop": "Arrêt",
+    "dashboard.morningPassage": "Heure de passage matin",
     "dashboard.important": "Infos importantes",
     "dashboard.noAlert": "Aucune alerte",
     "child.info": "Informations",
@@ -217,11 +358,16 @@ function defaultInterfaceConfig() {
         { id: "children", label: "Nombre d'élèves", visible: true, order: 70 },
         { id: "messages", label: "Messages récents", visible: true, order: 80 }
       ],
+      spw: [
+        { id: "messages", label: "Messages", visible: true, order: 10 },
+        { id: "children", label: "Nombre d'élèves", visible: true, order: 20 },
+        { id: "outOfServiceVehicles", label: "Véhicule hors service / retard", visible: true, order: 30 }
+      ],
       driver: [
         { id: "driver", label: "Chauffeur sélectionné", visible: true, order: 10 },
-        { id: "phone", label: "Téléphone chauffeur", visible: true, order: 20 },
+        { id: "phone", label: "Téléphone convoyeuse", visible: true, order: 20 },
         { id: "bus", label: "Numéro identification bus KEOLIS", visible: true, order: 30 },
-        { id: "outOfServiceVehicles", label: "Véhicules hors service", visible: true, order: 40 },
+        { id: "outOfServiceVehicles", label: "Véhicule hors service / retard", visible: true, order: 40 },
         { id: "circuits", label: "Circuit effectué", visible: true, order: 50 },
         { id: "schools", label: "École desservie", visible: true, order: 60 },
         { id: "assistant", label: "Convoyeuse associée", visible: true, order: 70 },
@@ -233,7 +379,7 @@ function defaultInterfaceConfig() {
         { id: "driver", label: "Chauffeur associé", visible: true, order: 20 },
         { id: "vehicle", label: "Numéro véhicule", visible: true, order: 30 },
         { id: "circuit", label: "Numéro de circuit", visible: true, order: 40 },
-        { id: "outOfServiceVehicles", label: "Véhicules hors service", visible: true, order: 50 },
+        { id: "outOfServiceVehicles", label: "Véhicule hors service / retard", visible: true, order: 50 },
         { id: "children", label: "Nombre d'élèves", visible: true, order: 60 },
         { id: "school", label: "École desservie", visible: true, order: 70 },
         { id: "messages", label: "Messages récents", visible: true, order: 80 }
@@ -246,8 +392,9 @@ function defaultInterfaceConfig() {
         { id: "driver", label: "Chauffeur", visible: true, order: 50 },
         { id: "assistant", label: "Convoyeuse", visible: true, order: 60 },
         { id: "stop", label: "Arrêt", visible: true, order: 70 },
-        { id: "important", label: "Infos importantes", visible: true, order: 80 },
-        { id: "messages", label: "Messages récents", visible: true, order: 90 }
+        { id: "morningPassage", label: "Heure de passage matin", visible: true, order: 80 },
+        { id: "important", label: "Infos importantes", visible: true, order: 90 },
+        { id: "messages", label: "Messages récents", visible: true, order: 100 }
       ],
       support: [
         { id: "requests", label: "Demandes", visible: true, order: 10 },
@@ -264,20 +411,35 @@ function defaultInterfaceConfig() {
   };
 }
 
+const defaultSpwContacts = [
+  { id: "spw-leonet-christophe", name: "LEONET Christophe", role: "Responsable administratif du bureau de Liège-Verviers", phone: "04/230 39 01", mobile: "", email: "christophe.leonet@spw.wallonie.be" },
+  { id: "spw-berteau-cecile", name: "BERTEAU Cécile", role: "Gestion administrative du PAC (voir séparation)", phone: "04/229 75 51", mobile: "0479/88 87 16", email: "cecile.berteau@spw.wallonie.be" },
+  { id: "spw-dubon-sandra", name: "DUBON Sandra", role: "Documents ONEM PAC", phone: "04/230 39 03", mobile: "0470/56 09 98", email: "sandra.dubon@spw.wallonie.be" },
+  { id: "spw-hourlay-laurence", name: "HOURLAY Laurence", role: "Gestion des horaires de service + AT", phone: "04/230 39 09", mobile: "0476/60 78 44", email: "laurence.hourlay@spw.wallonie.be" },
+  { id: "spw-lambert-estelle", name: "LAMBERT Estelle", role: "Gestion administrative du PAC (voir séparation) + frais de déplacements PAC (toutes zones)", phone: "04/230 39 05", mobile: "", email: "estelle.lambert@spw.wallonie.be" },
+  { id: "spw-petesch-nadine", name: "PETESCH Nadine", role: "Droit au transport scolaire", phone: "04/230 39 10", mobile: "0479/86 44 73", email: "nadine.petesch@spw.wallonie.be" },
+  { id: "spw-tschir-laurent", name: "TSCHIR Laurent", role: "Gestion administrative du PAC (voir séparation)", phone: "04/230 39 04", mobile: "0473/84 81 18", email: "laurent.tschir@spw.wallonie.be" },
+  { id: "spw-alexandre-fabien", name: "ALEXANDRE Fabien", role: "Manager de proximité", phone: "04/230 39 07", mobile: "0477/60 04 29", email: "fabien.alexandre@spw.wallonie.be" },
+  { id: "spw-basciu-ivana", name: "BASCIU Ivana", role: "Manager de proximité", phone: "04/230 39 08", mobile: "0479/97 78 92", email: "ivana.basciu@spw.wallonie.be" },
+  { id: "spw-carlier-luc", name: "CARLIER Luc", role: "Manager de proximité", phone: "04/230 39 12", mobile: "0474/74 03 55", email: "luc.carlier@spw.wallonie.be" },
+  { id: "spw-bensaid-naim", name: "BENSAID Naim", role: "Manager de proximité + transport interne", phone: "04/230 39 13", mobile: "0471775163", email: "naim.bensaid@spw.wallonie.be" },
+  { id: "spw-cornelis-natacha", name: "CORNELIS Natacha", role: "Manager de proximité", phone: "04/230 39 06", mobile: "", email: "natacha.cornelis@spw.wallonie.be" }
+];
+
 const seed = {
   users: [
     { id: "admin", identifierNumber: "6183", firstName: "Administrateur", lastName: "Système", role: "admin", accessCode: "1901", assignedCircuits: ["C-12", "C-18"], isActive: true, createdBy: "system", createdAt: "2026-05-18T09:00:00.000Z", updatedAt: "2026-05-18T09:00:00.000Z" },
-    { id: "admin-spw", identifierNumber: "2001", firstName: "SPW", lastName: "Transport", role: "admin", accessCode: "2001", assignedCircuits: [], visualTheme: "spw", isActive: true, createdBy: "system", createdAt: "2026-05-18T09:00:00.000Z", updatedAt: "2026-05-18T09:00:00.000Z" },
-    { id: "driver", identifierNumber: "1234", firstName: "Marc", lastName: "Lefèvre", role: "driver", accessCode: "1234", assignedCircuits: ["C-12"], assignedVehicleId: "vehicle-1", hasSncbReplacementAccess: false, isActive: true },
+    { id: "driver", identifierNumber: "1234", firstName: "Marc", lastName: "Lefèvre", role: "driver", accessCode: "1234", assignedCircuits: ["C-12"], assignedVehicleId: "vehicle-1", isActive: true },
     { id: "assistant", identifierNumber: "5678", firstName: "Nadia", lastName: "Lambert", role: "assistant", accessCode: "5678", assignedCircuits: ["C-12", "C-18"], isActive: true },
     { id: "support", identifierNumber: "1990", firstName: "Centre", lastName: "Support", role: "support", accessCode: "1990", assignedCircuits: [], isActive: true }
   ],
+  transportManagers: [],
   parents: [
     { id: "parent-1", firstName: "Claire", lastName: "Moreau", role: "parent", accessCode: "2468", linkedChildrenIds: ["child-1", "child-2"], phone: "+32476123456", email: "claire.moreau@example.com", isActive: true, createdAt: "2026-05-18T09:00:00.000Z", updatedAt: "2026-05-18T09:00:00.000Z" },
     { id: "parent-2", firstName: "Sophie", lastName: "Bernard", role: "parent", accessCode: "1357", linkedChildrenIds: ["child-3"], phone: "+32476111222", email: "sophie.bernard@example.com", isActive: true, createdAt: "2026-05-18T09:00:00.000Z", updatedAt: "2026-05-18T09:00:00.000Z" }
   ],
   drivers: [
-    { id: "driver", firstName: "Marc", lastName: "Lefèvre", phone: "+32470123456", busNumber: "BUS 14", licensePlate: "1-ABC-234", schoolCircuit: "C-12", schoolName: "Institut Sainte-Marie", replacementDriverName: "", hasSncbReplacementAccess: false }
+    { id: "driver", firstName: "Marc", lastName: "Lefèvre", phone: "+32470123456", busNumber: "BUS 14", licensePlate: "1-ABC-234", schoolCircuit: "C-12", schoolName: "Institut Sainte-Marie", replacementDriverName: "" }
   ],
   assistants: [
     { id: "assistant", firstName: "Nadia", lastName: "Lambert", phone: "+32475111222", schoolCircuit: "C-12" }
@@ -327,6 +489,7 @@ const seed = {
   supportRequests: [
     { id: "support-demo-1", userId: "parent-1", userName: "Claire Moreau", userRole: "parent", subject: "Question trajet matin", message: "Bonjour, pouvez-vous confirmer l’heure de passage demain matin ?", status: "pending", createdAt: "2026-05-18T10:00:00.000Z", updatedAt: "2026-05-18T10:00:00.000Z", assignedSupport: "", lastReplyAt: "", context: { childId: "child-1", childName: "Lucas Moreau", schoolName: "Institut Sainte-Marie", circuitNumber: "C-12", busNumber: "BUS 14", driverId: "driver", driverName: "Marc Lefèvre", assistantId: "assistant", assistantName: "Nadia Lambert", userPhone: "+32476123456" }, readBy: ["parent-1"] }
   ],
+  spwContacts: defaultSpwContacts,
   supportMessages: {
     "support-demo-1": [
       { id: "support-msg-1", text: "Bonjour, pouvez-vous confirmer l’heure de passage demain matin ?", authorId: "parent-1", authorName: "Claire Moreau", authorRole: "parent", createdAt: "2026-05-18T10:00:00.000Z", readBy: ["parent-1"] }
@@ -350,6 +513,8 @@ const seed = {
   studentSensitive: [],
   temporarySupportAccess: [],
   temporarySupportAccessLogs: [],
+  supportPermissions: [],
+  supportReports: [],
   replacementRules: [],
   leaveRequests: [],
   poolTransport: [],
@@ -380,6 +545,11 @@ const seed = {
     id: "current",
     status: "operational",
     message: "Tous les services fonctionnent normalement",
+    maintenanceEnabled: false,
+    maintenanceTitle: "Maintenance planifiée",
+    maintenanceMessage: "Une mise à jour est planifiée. L’application sera temporairement indisponible pendant cette période.",
+    maintenanceStartAt: "",
+    maintenanceEndAt: "",
     autoMode: true,
     lastCheckedAt: "2026-05-18T09:00:00.000Z",
     updatedAt: "2026-05-18T09:00:00.000Z",
@@ -387,6 +557,65 @@ const seed = {
   },
   interfaceConfig: defaultInterfaceConfig()
 };
+
+const systemSeedUserIds = new Set(["admin", "support"]);
+const demoRecordIds = {
+  users: new Set(["driver", "assistant"]),
+  parents: new Set(["parent-1", "parent-2"]),
+  drivers: new Set(["driver"]),
+  assistants: new Set(["assistant"]),
+  vehicles: new Set(["vehicle-1"]),
+  schools: new Set(["school-1"]),
+  circuits: new Set(["circuit-12", "circuit-18"]),
+  children: new Set(["child-1", "child-2", "child-3"]),
+  students: new Set(["child-1", "child-2", "child-3"]),
+  parentChangeRequests: new Set(["request-demo-1"]),
+  supportRequests: new Set(["support-demo-1"]),
+  roleAnnouncements: new Set(["announcement-driver-1", "announcement-assistant-1"])
+};
+const demoMessageKeys = new Set(["child-1", "child-2", "child-3", "support-demo-1"]);
+
+function isDemoRecord(collection, item = {}) {
+  if (!item || typeof item !== "object") return false;
+  if (demoRecordIds[collection]?.has(item.id)) return true;
+  if (["drivers", "users"].includes(collection) && item.id === "driver" && item.firstName === "Marc" && item.lastName === "Lefèvre") return true;
+  if (["assistants", "users"].includes(collection) && item.id === "assistant" && item.firstName === "Nadia" && item.lastName === "Lambert") return true;
+  if (collection === "vehicles" && item.busNumber === "BUS 14" && item.licensePlate === "1-ABC-234") return true;
+  if (collection === "schools" && item.name === "Institut Sainte-Marie" && String(item.email || "").includes("sainte-marie.example")) return true;
+  if (collection === "circuits" && ["circuit-12", "circuit-18"].includes(item.id) && item.schoolName === "Institut Sainte-Marie") return true;
+  if (["children", "students"].includes(collection) && ["child-1", "child-2", "child-3"].includes(item.id)) return true;
+  if (collection === "parents" && ["parent-1", "parent-2"].includes(item.id) && String(item.email || "").endsWith("@example.com")) return true;
+  return false;
+}
+
+function withoutDemoRecords(collection, items = []) {
+  return Array.isArray(items) ? items.filter((item) => !isDemoRecord(collection, item)) : [];
+}
+
+function systemSeedUsers() {
+  return seed.users
+    .filter((user) => systemSeedUserIds.has(user.id))
+    .map((user) => ({ ...user, assignedCircuits: [] }));
+}
+
+function removeDemoRecords(target = {}) {
+  Object.entries(demoRecordIds).forEach(([collection, ids]) => {
+    if (Array.isArray(target[collection])) {
+      target[collection] = target[collection].filter((item) => !ids.has(item?.id) && !isDemoRecord(collection, item));
+    }
+  });
+  ["messages", "supportMessages", "directMessageItems", "teamMessageItems", "studentIssueMessages"].forEach((key) => {
+    if (!target[key] || typeof target[key] !== "object") return;
+    demoMessageKeys.forEach((id) => delete target[key][id]);
+  });
+  if (Array.isArray(target.tecStops)) {
+    target.tecStops = target.tecStops.filter((stop) => !String(stop.id || "").startsWith("tec-demo-"));
+  }
+  if (Array.isArray(target.belgianAddresses)) {
+    target.belgianAddresses = target.belgianAddresses.filter((address) => !String(address.id || "").startsWith("addr-"));
+  }
+  return target;
+}
 
 const collectionAliasMap = {
   studentIssues: ["incidents"],
@@ -397,6 +626,7 @@ const collectionAliasMap = {
 
 const firestoreBootstrapCollections = [
   "users",
+  "transportManagers",
   "students",
   "circuits",
   "schools",
@@ -413,6 +643,8 @@ const firestoreBootstrapCollections = [
   "historyLogs",
   "temporarySupportAccess",
   "temporarySupportAccessLogs",
+  "supportPermissions",
+  "spwContacts",
   "connectionLogs",
   "leaveRequests",
   "extraTransports",
@@ -467,6 +699,12 @@ function syncCollectionAliases(target = data) {
       const child = target.children.find((item) => item.id === sensitive.childId || item.id === sensitive.id);
       if (child) Object.assign(child, studentSensitiveFieldsFromDoc(sensitive));
     });
+    target.children.forEach((child) => {
+      child.responsiblePersons = firstNonEmptyPeopleList(child.responsiblePersons, child.guardians);
+      child.guardians = firstNonEmptyPeopleList(child.guardians, child.responsiblePersons);
+      child.authorizedPersons = firstNonEmptyPeopleList(child.authorizedPersons, child.authorizedPickupPersons);
+      child.authorizedPickupPersons = firstNonEmptyPeopleList(child.authorizedPickupPersons, child.authorizedPersons);
+    });
   }
   target.settings = target.settings && typeof target.settings === "object" ? target.settings : {};
   if (!target.settings.parentContact) target.settings.parentContact = target.parentContact;
@@ -484,6 +722,7 @@ let firestoreHealth = {
   lastSyncAt: "",
   errors: 0
 };
+let pendingFirstLoginSession = null;
 let state = {
   user: getSessionUser(),
   screen: "dashboard",
@@ -499,15 +738,23 @@ let state = {
   search: "",
   parentChildId: "",
   parentRequestChildId: "",
+  parentMedicalChildId: "",
   supportFilter: "all",
+  supportSearch: "",
+  supportCategoryFilter: "all",
+  supportPriorityFilter: "all",
+  supportPage: 1,
+  supportPageSize: 20,
   selectedSupportRequestId: "",
   messageChildId: "",
   messagesTab: "children",
   selectedTeamConversationId: "",
   selectedDirectConversationId: "",
+  composingDirectRole: "",
   editingAnnouncementId: "",
   editingAccessType: "",
   editingAccessId: "",
+  editingSpwContactId: "",
   accessCodesTab: "users",
   settingsTab: "admin",
   transportGroupTab: "children",
@@ -529,6 +776,7 @@ let state = {
   loginShowPassword: false,
   activeApp: getSessionApp(),
   outOfServiceVehicleId: "",
+  quickTransferDelayOpen: false,
   editingReplacementRuleId: "",
   requestsTab: "leave",
   requestsFilter: "all",
@@ -537,10 +785,27 @@ let state = {
   historyFilterDate: "",
   loginNotice: "",
   connectionState: navigator.onLine === false ? "offline" : "online",
-  offlineQueueCount: 0
+  offlineQueueCount: 0,
+  appVersion: null,
+  lastKnownAppVersion: localStorage.getItem("gts-current-version") || "",
+  updateAvailable: false,
+  updateCheckError: "",
+  updateCheckedAt: "",
+  notificationDiagnostic: null,
+  viewHistory: [],
+  appLocked: false,
+  appUnlockError: ""
 };
 
+if (pendingFirstLoginSession) {
+  state.firstLoginType = pendingFirstLoginSession.type;
+  state.firstLoginId = pendingFirstLoginSession.id;
+  pendingFirstLoginSession = null;
+}
+state.appLocked = mobileSessionUnlockRequired();
+
 restoreViewState();
+applyRequestedScreenFromQuery();
 applyThemePreference();
 applyParentLanguageDirection();
 
@@ -675,47 +940,49 @@ function loadData() {
         resetUiStatePreserveData(saved);
       }
       const merged = { ...seed, ...saved };
-      ["drivers", "assistants", "vehicles", "schools", "circuits", "parents", "parentChangeRequests", "supportRequests", "replacementRules", "leaveRequests", "poolTransport", "extraSchoolTransport", "vehicleRepairs", "anomalies"].forEach((key) => {
-        if (!Array.isArray(merged[key]) || merged[key].length === 0) merged[key] = filterDeletedRecords(key, seed[key] || [], merged);
+      ["transportManagers", "drivers", "assistants", "vehicles", "schools", "circuits", "parents", "parentChangeRequests", "supportRequests", "spwContacts", "replacementRules", "leaveRequests", "poolTransport", "extraSchoolTransport", "vehicleRepairs", "anomalies"].forEach((key) => {
+        if (!Array.isArray(merged[key])) merged[key] = [];
       });
-      if (!merged.messages || typeof merged.messages !== "object") merged.messages = seed.messages;
-      if (!merged.supportMessages || typeof merged.supportMessages !== "object") merged.supportMessages = seed.supportMessages;
+      if (!merged.messages || typeof merged.messages !== "object") merged.messages = {};
+      if (!merged.supportMessages || typeof merged.supportMessages !== "object") merged.supportMessages = {};
       if (!merged.parentContact || typeof merged.parentContact !== "object") merged.parentContact = { ...seed.parentContact };
       if (!merged.serviceStatus || typeof merged.serviceStatus !== "object") merged.serviceStatus = { ...seed.serviceStatus };
       if (!merged.interfaceConfig || typeof merged.interfaceConfig !== "object") merged.interfaceConfig = defaultInterfaceConfig();
       migrateLocalData(merged);
+      removeDemoRecords(merged);
       syncCollectionAliases(merged);
       syncLinkedData(merged);
       localStorage.setItem(STORE_KEY, JSON.stringify(merged));
       return merged;
     }
   } catch {}
-  migrateLocalData(seed);
-  syncCollectionAliases(seed);
-  syncLinkedData(seed);
-  localStorage.setItem(STORE_KEY, JSON.stringify(seed));
-  return JSON.parse(JSON.stringify(seed));
+  const initial = removeDemoRecords(JSON.parse(JSON.stringify(seed)));
+  migrateLocalData(initial);
+  removeDemoRecords(initial);
+  syncCollectionAliases(initial);
+  syncLinkedData(initial);
+  localStorage.setItem(STORE_KEY, JSON.stringify(initial));
+  return JSON.parse(JSON.stringify(initial));
 }
 
 function migrateLocalData(localData) {
   localData.deletedRecords = localData.deletedRecords || {};
   localData.users = localData.users || [];
-  seed.users.forEach((seedUser) => {
+  if (!Array.isArray(localData.spwContacts)) localData.spwContacts = defaultSpwContacts.map((contact) => ({ ...contact }));
+  localData.users = localData.users.filter((user) => !isLegacySeedSpwAccount(user));
+  localData.transportManagers = Array.isArray(localData.transportManagers) ? localData.transportManagers : [];
+  systemSeedUsers().forEach((seedUser) => {
     if (isDeletedRecord("users", seedUser.id, localData)) return;
     if (!localData.users.some((user) => user.id === seedUser.id || user.accessCode === seedUser.accessCode)) {
       localData.users.push({ ...seedUser });
     }
   });
-  const spwAdmin = localData.users.find((user) => user.id === "admin-spw" || user.accessCode === "2001");
-  if (spwAdmin) {
-    spwAdmin.id = spwAdmin.id || "admin-spw";
-    spwAdmin.role = "admin";
-    spwAdmin.accessCode = "2001";
-    spwAdmin.visualTheme = "spw";
-    spwAdmin.isActive = true;
-  } else {
-    localData.users.push({ ...seed.users.find((user) => user.id === "admin-spw") });
-  }
+  localData.users.forEach((user) => {
+    if (isSpwLikeAccount(user)) {
+      user.role = "admin";
+      user.visualTheme = "spw";
+    }
+  });
   const mainAdmin = localData.users.find((user) => user.id === "admin") || localData.users.find((user) => user.accessCode === "1901");
   if (mainAdmin) {
     mainAdmin.id = "admin";
@@ -727,31 +994,52 @@ function migrateLocalData(localData) {
   } else {
     localData.users.push({ ...seed.users.find((user) => user.id === "admin") });
   }
-  localData.users = localData.users.map((user) => ({
-    ...user,
-    identifier: user.identifier || user.identifierNumber || defaultIdentifierForUser(user),
-    identifierNumber: user.identifierNumber || defaultIdentifierForUser(user),
-    username: user.username || user.identifierNumber || defaultIdentifierForUser(user),
-    firstLoginCompleted: user.firstLoginCompleted !== false,
-    resetRequired: user.resetRequired === true,
-    hasSncbReplacementAccess: user.role === "driver" ? user.hasSncbReplacementAccess === true : user.hasSncbReplacementAccess,
-    isActive: user.isActive !== false,
-    createdBy: user.createdBy || "system",
-    createdAt: user.createdAt || new Date().toISOString(),
-    updatedAt: user.updatedAt || ""
-  }));
+  const usedIdentifiers = new Set();
+  const migrationNow = new Date().toISOString();
+  localData.users = localData.users.map((user) => {
+    const stableIdentifier = stableIdentifierForUser(user, usedIdentifiers);
+    const identityChanged = [user.identifier, user.identifierNumber, user.username].some((value) => value && value !== stableIdentifier)
+      || !user.identifier || !user.identifierNumber || !user.username;
+    return {
+      ...user,
+      identifier: stableIdentifier,
+      identifierNumber: stableIdentifier,
+      username: stableIdentifier,
+      firstLoginCompleted: user.firstLoginCompleted !== false,
+      resetRequired: user.resetRequired === true,
+      isActive: user.isActive !== false,
+      createdBy: user.createdBy || "system",
+      createdAt: user.createdAt || new Date().toISOString(),
+      updatedAt: identityChanged ? migrationNow : (user.updatedAt || "")
+    };
+  });
+  ensureTransportManagerRecords(localData);
+  const fallbackTransportManagerId = defaultTransportManagerId(localData);
+  localData.users = localData.users.map((user) => {
+    if (isTransportManagerUser(user)) return { ...user, transportManagerId: user.transportManagerId || user.id };
+    if (["driver", "assistant"].includes(user.role)) return { ...user, transportManagerId: user.transportManagerId || fallbackTransportManagerId };
+    if (isSpwAccount(user) && user.createdBy && user.createdBy !== "system") return { ...user, transportManagerId: user.transportManagerId || fallbackTransportManagerId };
+    return user;
+  });
+  ensureTransportManagerRecords(localData);
+  removeLegacyAdminGtsAccount(localData);
   localData.drivers = (localData.drivers || []).map((driver) => ({
     ...driver,
+    transportManagerId: driver.transportManagerId || fallbackTransportManagerId,
     replacementDriverName: driver.replacementDriverName || "",
-    hasSncbReplacementAccess: driver.hasSncbReplacementAccess === true
   }));
   localData.tecStops = (localData.tecStops || []).map((stop) => normalizeTecStop(stop)).filter((stop) => stop.id && stop.name);
   localData.belgianAddresses = (localData.belgianAddresses || []).map((address) => normalizeBelgianAddress(address)).filter((address) => address.id && address.street);
   localData.walloniaAddresses = (localData.walloniaAddresses || []).map((address) => normalizeBelgianAddress(address)).filter((address) => address.id && address.street);
   localData.vehicles = (localData.vehicles || []).map((vehicle) => normalizeVehicleOutOfService(vehicle));
+  ["assistants", "vehicles", "schools", "circuits", "parentChangeRequests", "supportRequests", "supportReports", "spwContacts", "replacementRules", "leaveRequests", "poolTransport", "extraSchoolTransport", "vehicleRepairs", "anomalies", "studentIssues", "studentAbsences", "transportTransfers", "transferDelays", "smsAlerts", "roleAnnouncements", "directMessages", "teamMessages", "accessRequests", "pdfExports"].forEach((key) => {
+    if (!Array.isArray(localData[key])) return;
+    localData[key] = localData[key].map((item) => ({ ...item, transportManagerId: item.transportManagerId || fallbackTransportManagerId }));
+  });
   const parents = localData.parents || [];
   localData.parents = parents.map((parent) => ({
     ...parent,
+    transportManagerId: parent.transportManagerId || fallbackTransportManagerId,
     username: parent.username || parent.studentLastNameIdentifier || parent.lastName || "",
     loginChildName: parent.loginChildName || parent.studentLastNameIdentifier || parent.username || "",
     firstLoginCompleted: parent.firstLoginCompleted !== false,
@@ -759,17 +1047,29 @@ function migrateLocalData(localData) {
     isActive: parent.isActive !== false
   }));
   localData.children = (localData.children || []).map((child) => {
-    const linkedParents = parents.filter((parent) => (parent.linkedChildrenIds || []).includes(child.id));
+    const linkedParents = parents.filter((parent) =>
+      (parent.linkedChildrenIds || []).includes(child.id)
+      || (child.parentIds || []).includes(parent.id)
+    );
     const circuit = (localData.circuits || []).find((item) => item.name === child.circuitNumber) || {};
     const vehicle = (localData.vehicles || []).find((item) => item.id === child.vehicleId || item.circuitId === child.circuitNumber) || {};
+    const childDriverIds = uniqueText([
+      ...(Array.isArray(child.driverIds) ? child.driverIds : []),
+      child.driverId,
+      ...(Array.isArray(circuit.driverIds) ? circuit.driverIds : []),
+      circuit.driverId,
+      ...(Array.isArray(vehicle.driverIds) ? vehicle.driverIds : []),
+      vehicle.driverId
+    ]);
     const migratedChild = {
       ...child,
-      driverId: child.driverId || circuit.driverId || "driver",
-      assistantId: child.assistantId || circuit.assistantId || "assistant",
-      vehicleId: child.vehicleId || vehicle.id || "vehicle-1",
+      driverId: child.driverId || childDriverIds[0] || "",
+      driverIds: childDriverIds,
+      assistantId: child.assistantId || circuit.assistantId || "",
+      vehicleId: child.vehicleId || vehicle.id || "",
       pickupCircuitId: circuitRef(child, "pickupCircuitId", child.morningCircuit || child.circuitNumber, localData),
       schoolCircuitId: circuitRef(child, "schoolCircuitId", child.returnCircuit || child.circuitNumber, localData),
-      parentIds: linkedParents.map((parent) => parent.id),
+      parentIds: uniqueText([...(child.parentIds || []), ...linkedParents.map((parent) => parent.id)]),
       parentAccessCode: "",
       parentNotes: child.parentNotes || "",
       transportStatus: child.transportStatus || "Trajet prévu",
@@ -780,12 +1080,13 @@ function migrateLocalData(localData) {
       changesBusAtTransfer: child.changesBusAtTransfer ?? !child.staysInSameBus,
       transferLocation: child.transferLocation || child.transferCircuit || "",
       transferVehicleId: child.transferVehicleId || vehicle.busNumber || "",
-      transferDriverId: child.transferDriverId || (!child.staysInSameBus ? circuit.driverId || "" : ""),
+      transferDriverId: child.transferDriverId || (!child.staysInSameBus ? childDriverIds[0] || "" : ""),
       transferAssistantId: child.transferAssistantId || (!child.staysInSameBus ? circuit.assistantId || "" : ""),
       transferCircuitId: child.transferCircuitId || child.circuitNumber || "",
       transferSchoolCircuitId: child.transferSchoolCircuitId || child.transferCircuitId || "",
       hasTransfer: typeof child.hasTransfer === "boolean" ? child.hasTransfer : child.changesBusAtTransfer === true || child.staysInSameBus === false,
       phone: child.phone || child.childPhone || "",
+      transportManagerId: child.transportManagerId || fallbackTransportManagerId,
       attentionSpeciale: child.attentionSpeciale === true,
       typeAttention: child.typeAttention || "",
       noteAttention: child.noteAttention || "",
@@ -805,8 +1106,10 @@ function migrateLocalData(localData) {
         reason: child.transportExclusion?.reason || child.exclusionReason || "",
         notes: child.transportExclusion?.notes || ""
       },
-      responsiblePersons: Array.isArray(child.responsiblePersons) ? child.responsiblePersons : child.guardians || [],
-      authorizedPersons: Array.isArray(child.authorizedPersons) ? child.authorizedPersons : child.authorizedPickupPersons || [],
+      responsiblePersons: firstNonEmptyPeopleList(child.responsiblePersons, child.guardians),
+      guardians: firstNonEmptyPeopleList(child.guardians, child.responsiblePersons),
+      authorizedPersons: firstNonEmptyPeopleList(child.authorizedPersons, child.authorizedPickupPersons),
+      authorizedPickupPersons: firstNonEmptyPeopleList(child.authorizedPickupPersons, child.authorizedPersons),
       sensitiveStudent: {
         enabled: child.sensitiveStudent?.enabled === true || child.attentionSpeciale === true,
         attentionLevel: child.sensitiveStudent?.attentionLevel || child.niveauAttention || "information",
@@ -826,13 +1129,15 @@ function migrateLocalData(localData) {
     syncMedicalHelpSheet(migratedChild);
     return migratedChild;
   });
-  localData.parents = parents.map((parent) => ({ ...parent, role: "parent", isActive: parent.isActive !== false }));
+  localData.parents = (localData.parents || []).map((parent) => ({ ...parent, transportManagerId: parent.transportManagerId || fallbackTransportManagerId, role: "parent", isActive: parent.isActive !== false }));
   localData.parentChangeRequests = localData.parentChangeRequests || [];
   localData.parentChangeRequests = localData.parentChangeRequests.map((request) => {
     const child = localData.children.find((item) => item.id === request.childId) || {};
     return {
       ...request,
+      transportManagerId: request.transportManagerId || child.transportManagerId || fallbackTransportManagerId,
       driverId: request.driverId || child.driverId || "",
+      driverIds: uniqueText([...(Array.isArray(request.driverIds) ? request.driverIds : []), request.driverId, ...(Array.isArray(child.driverIds) ? child.driverIds : [])]),
       assistantId: request.assistantId || child.assistantId || ""
     };
   });
@@ -877,6 +1182,15 @@ function migrateLocalData(localData) {
   localData.teamMessageItems = localData.teamMessageItems || {};
   localData.directMessages = localData.directMessages || [];
   localData.directMessageItems = localData.directMessageItems || {};
+  localData.directMessages = localData.directMessages.map((conversation) => ({
+    ...conversation,
+    id: conversation.id || conversation.conversationId,
+    conversationId: conversation.conversationId || conversation.id,
+    participants: Array.isArray(conversation.participants) ? conversation.participants : []
+  })).filter((conversation) => conversation.conversationId);
+  Object.entries(localData.directMessageItems).forEach(([conversationId, messages]) => {
+    localData.directMessageItems[conversationId] = Array.isArray(messages) ? messages.filter((message) => message?.id) : [];
+  });
   localData.accessRequests = localData.accessRequests || [];
   localData.notifications = localData.notifications || [];
   localData.replacementRules = localData.replacementRules || [];
@@ -885,6 +1199,20 @@ function migrateLocalData(localData) {
   localData.historyLogs = Array.isArray(localData.historyLogs) ? localData.historyLogs : [];
   localData.temporarySupportAccess = Array.isArray(localData.temporarySupportAccess) ? localData.temporarySupportAccess : [];
   localData.temporarySupportAccessLogs = Array.isArray(localData.temporarySupportAccessLogs) ? localData.temporarySupportAccessLogs : [];
+  localData.supportPermissions = Array.isArray(localData.supportPermissions) ? localData.supportPermissions : [];
+  localData.supportReports = Array.isArray(localData.supportReports) ? localData.supportReports : [];
+  (localData.users || []).filter((user) => user.role === "support").forEach((user) => {
+    user.supportPermissions = { ...defaultSupportPermissions(), ...(user.supportPermissions || {}) };
+    if (!localData.supportPermissions.some((permissions) => permissions.userId === user.id || permissions.id === user.id)) {
+      localData.supportPermissions.push({
+        id: user.id,
+        userId: user.id,
+        ...user.supportPermissions,
+        updatedAt: user.updatedAt || new Date().toISOString(),
+        updatedBy: user.updatedBy || "system"
+      });
+    }
+  });
   expireTemporarySupportAccesses(localData);
   localData.studentMedical = Array.isArray(localData.studentMedical) ? localData.studentMedical : [];
   localData.studentSensitive = Array.isArray(localData.studentSensitive) ? localData.studentSensitive : [];
@@ -918,25 +1246,39 @@ function syncLinkedData(target = data) {
   const vehicles = target.vehicles || [];
   const children = target.children || [];
   circuits.forEach((circuit) => {
+    circuit.transportManagerId = circuit.transportManagerId || defaultTransportManagerId(target);
+    const circuitHasExplicitDrivers = (Array.isArray(circuit.driverIds) && circuit.driverIds.length > 0) || !!circuit.driverId;
+    circuit.driverIds = uniqueText([...(Array.isArray(circuit.driverIds) ? circuit.driverIds : []), circuit.driverId].filter(Boolean));
+    circuit.driverId = circuit.driverId || circuit.driverIds[0] || "";
     const vehicle = vehicles.find((item) => item.id === circuit.vehicleId || item.circuitId === circuit.name);
     if (vehicle) {
+      vehicle.driverIds = uniqueText([...(Array.isArray(vehicle.driverIds) ? vehicle.driverIds : []), vehicle.driverId].filter(Boolean));
+      if (!circuitHasExplicitDrivers) circuit.driverIds = uniqueText([...circuit.driverIds, ...vehicle.driverIds]);
       circuit.vehicleId = vehicle.id;
-      circuit.driverId = circuit.driverId || vehicle.driverId || "";
+      circuit.driverId = circuit.driverId || circuit.driverIds[0] || vehicle.driverId || "";
       circuit.assistantId = circuit.assistantId || vehicle.assistantId || "";
       if (!circuit.schoolName && vehicle.schoolName) circuit.schoolName = vehicle.schoolName;
     }
   });
   vehicles.forEach((vehicle) => {
+    vehicle.transportManagerId = vehicle.transportManagerId || defaultTransportManagerId(target);
+    vehicle.driverIds = uniqueText([...(Array.isArray(vehicle.driverIds) ? vehicle.driverIds : []), vehicle.driverId].filter(Boolean));
+    vehicle.driverId = vehicle.driverId || vehicle.driverIds[0] || "";
     const circuit = circuits.find((item) => item.name === vehicle.circuitId || item.id === vehicle.circuitId || item.vehicleId === vehicle.id);
     if (circuit) {
+      const circuitHasExplicitDrivers = (Array.isArray(circuit.driverIds) && circuit.driverIds.length > 0) || !!circuit.driverId;
+      circuit.driverIds = uniqueText([...(Array.isArray(circuit.driverIds) ? circuit.driverIds : []), circuit.driverId, ...(circuitHasExplicitDrivers ? [] : vehicle.driverIds)].filter(Boolean));
+      circuit.driverId = circuit.driverId || circuit.driverIds[0] || "";
       vehicle.circuitId = circuit.name || vehicle.circuitId;
-      vehicle.driverId = vehicle.driverId || circuit.driverId || "";
+      vehicle.driverIds = circuitHasExplicitDrivers && vehicle.circuitId === circuit.name ? [...circuit.driverIds] : uniqueText([...vehicle.driverIds, ...circuit.driverIds]);
+      vehicle.driverId = vehicle.driverId || vehicle.driverIds[0] || circuit.driverId || "";
       vehicle.assistantId = vehicle.assistantId || circuit.assistantId || "";
       vehicle.schoolName = vehicle.schoolName || circuit.schoolName || "";
       circuit.vehicleId = circuit.vehicleId || vehicle.id;
     }
   });
   children.forEach((child) => {
+    child.transportManagerId = child.transportManagerId || defaultTransportManagerId(target);
     const circuit = circuits.find((item) => item.name === child.circuitNumber || item.id === child.circuitNumber);
     const vehicle = vehicles.find((item) => item.id === child.vehicleId || item.circuitId === child.circuitNumber || item.id === circuit?.vehicleId);
     if (circuit) {
@@ -945,16 +1287,22 @@ function syncLinkedData(target = data) {
       child.schoolCircuitId = child.schoolCircuitId || child.pickupCircuitId || circuit.id || circuit.name || "";
       child.morningCircuit = circuitLabelByRef(child.pickupCircuitId, source) || child.morningCircuit || `${child.circuitNumber} prise en charge`;
       child.returnCircuit = circuitLabelByRef(child.schoolCircuitId, source) || child.returnCircuit || `${child.circuitNumber} vers école`;
-      child.driverId = circuit.driverId || child.driverId || "";
+      child.driverIds = uniqueText([...(Array.isArray(child.driverIds) ? child.driverIds : []), child.driverId, ...(circuit.driverIds || [])].filter(Boolean));
+      child.driverId = child.driverId || child.driverIds[0] || circuit.driverId || "";
       child.assistantId = circuit.assistantId || child.assistantId || "";
       child.vehicleId = circuit.vehicleId || vehicle?.id || child.vehicleId || "";
       child.schoolName = circuit.schoolName || child.schoolName || "";
+      child.transportManagerId = child.transportManagerId || circuit.transportManagerId || "";
     }
     if (vehicle) {
       child.vehicleId = vehicle.id;
-      child.driverId = child.driverId || vehicle.driverId || "";
+      child.driverIds = circuit
+        ? uniqueText([...(circuit.driverIds || []), circuit.driverId].filter(Boolean))
+        : uniqueText([...(Array.isArray(child.driverIds) ? child.driverIds : []), child.driverId, ...(vehicle.driverIds || []), vehicle.driverId].filter(Boolean));
+      child.driverId = child.driverId || child.driverIds[0] || vehicle.driverId || "";
       child.assistantId = child.assistantId || vehicle.assistantId || "";
       child.transferVehicleId = vehicle.busNumber || child.transferVehicleId || "";
+      child.transportManagerId = child.transportManagerId || vehicle.transportManagerId || "";
     }
   });
   (target.parentChangeRequests || []).forEach((request) => {
@@ -962,6 +1310,7 @@ function syncLinkedData(target = data) {
     if (child) {
       request.driverId = child.driverId || request.driverId || "";
       request.assistantId = child.assistantId || request.assistantId || "";
+      request.transportManagerId = request.transportManagerId || child.transportManagerId || "";
     }
   });
   (target.studentIssues || []).forEach((issue) => {
@@ -971,6 +1320,7 @@ function syncLinkedData(target = data) {
       issue.driverId = child.driverId || issue.driverId || "";
       issue.assistantId = child.assistantId || issue.assistantId || "";
       issue.parentIds = child.parentIds || issue.parentIds || [];
+      issue.transportManagerId = issue.transportManagerId || child.transportManagerId || "";
     }
     issue.spwIds = issue.spwIds?.length ? issue.spwIds : (target.users || []).filter((user) => user.role === "admin" && user.visualTheme === "spw").map((user) => user.id);
   });
@@ -993,7 +1343,8 @@ function offlineQueueTypeForCollection(type) {
 
 function loadOfflineQueue() {
   try {
-    return JSON.parse(localStorage.getItem(OFFLINE_QUEUE_KEY)) || [];
+    return (JSON.parse(localStorage.getItem(OFFLINE_QUEUE_KEY)) || [])
+      .filter((item) => !queueItemCollectionNames(item).includes("directMessages"));
   } catch {
     return [];
   }
@@ -1004,6 +1355,102 @@ function saveOfflineQueue(queue = offlineQueueMemory) {
   localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(queue));
   state.offlineQueueCount = queue.filter((item) => item.status !== "synced").length;
   writeOfflineQueueIndexedDb(queue);
+}
+
+function queueItemCollectionNames(item = {}) {
+  const payload = item.payload || {};
+  return [
+    payload.collectionName,
+    ...(payload.collections || []),
+    ...(payload.pathSegments || []).slice(0, 1)
+  ].filter(Boolean);
+}
+
+function isPermissionDeniedQueueItem(item = {}) {
+  return String(item.lastError || "").includes("permission-denied");
+}
+
+function shouldDiscardDeniedQueueItem(item = {}) {
+  if (!isPermissionDeniedQueueItem(item)) return false;
+  const collectionNames = queueItemCollectionNames(item);
+  if (collectionNames.some((name) => ["securityLogs", "loginLogs", "connectionLogs", "historyLogs", "notifications"].includes(name))) return true;
+  if (collectionNames.includes("directMessages")) return true;
+  const operationalCollections = ["users", "drivers", "assistants", "parents", "students", "children", "studentMedical", "studentSensitive", "vehicles", "circuits", "schools", "transportManagers"];
+  if ((isSpwAccount() || isTransportManagerUser()) && collectionNames.some((name) => operationalCollections.includes(name))) return true;
+  if (collectionNames.includes("transportManagers") && isTransportManagerUser()) return true;
+  if (collectionNames.includes("assistants") && ["assistant", "driver"].includes(state.user?.role)) return true;
+  if (collectionNames.includes("drivers") && ["driver", "assistant"].includes(state.user?.role)) return true;
+  if (collectionNames.some((name) => ["students", "children", "vehicles"].includes(name)) && ["driver", "assistant"].includes(state.user?.role)) return true;
+  if (collectionNames.includes("parents") && state.user?.role === "parent") return true;
+  if (collectionNames.includes("privateMessages") && ["parent", "driver", "assistant"].includes(state.user?.role)) return true;
+  if (!collectionNames.includes("users")) return false;
+  const dataRole = item.payload?.data?.role || "";
+  const currentRole = state.user?.role || "";
+  if (["driver", "assistant", "parent"].includes(currentRole)) return true;
+  if (isTransportManagerUser() && ["driver", "assistant", "parent", "admin", "transport_manager"].includes(dataRole)) return true;
+  return ["driver", "assistant"].includes(dataRole)
+    && !item.payload?.data?.accessCode
+    && !item.payload?.data?.accessCodeHash
+    && !item.payload?.data?.passwordHash
+    && !item.payload?.data?.temporaryAccessHash;
+}
+
+function shouldDiscardDeniedPathSet(queueType, pathSegments, payloadData) {
+  return shouldDiscardDeniedQueueItem({
+    lastError: "permission-denied",
+    type: queueType,
+    payload: {
+      operation: "set",
+      pathSegments,
+      id: (pathSegments || []).join("/"),
+      data: payloadData
+    }
+  });
+}
+
+function hasBlockingOfflineConflict() {
+  cleanupNonBlockingOfflineConflicts();
+  return loadOfflineQueue().some((item) => item.status === "conflict" && !shouldDiscardDeniedQueueItem(item));
+}
+
+function cleanupNonBlockingOfflineConflicts() {
+  const queue = loadOfflineQueue();
+  const filtered = queue.filter((item) => {
+    if (queueItemCollectionNames(item).includes("directMessages")) return false;
+    return !(item.status === "conflict" && shouldDiscardDeniedQueueItem(item));
+  });
+  saveOfflineQueue(filtered);
+}
+
+function recoverSupportMessagePermissionConflicts() {
+  let changed = false;
+  const queue = loadOfflineQueue().map((item) => {
+    const path = item.payload?.pathSegments || [];
+    const isSupportMessage = item.status === "conflict"
+      && isPermissionDeniedQueueItem(item)
+      && path[0] === "supportRequests"
+      && path[2] === "messages";
+    if (!isSupportMessage) return item;
+    changed = true;
+    return { ...item, status: "pending", retryCount: 0, lastError: "" };
+  });
+  if (changed) saveOfflineQueue(queue);
+  return changed;
+}
+
+function recoverParentPermissionConflicts() {
+  let changed = false;
+  const queue = loadOfflineQueue().map((item) => {
+    const collections = queueItemCollectionNames(item);
+    const isParentUpdate = item.status === "conflict"
+      && isPermissionDeniedQueueItem(item)
+      && collections.includes("parents");
+    if (!isParentUpdate) return item;
+    changed = true;
+    return { ...item, status: "pending", retryCount: 0, lastError: "" };
+  });
+  if (changed) saveOfflineQueue(queue);
+  return changed;
 }
 
 function openOfflineDb() {
@@ -1039,11 +1486,39 @@ function enqueueOfflineOperation(type, payload = {}) {
   };
   queue.push(item);
   saveOfflineQueue(queue);
+  scheduleOfflineSync(1200);
   if (state.user) render();
   return item;
 }
 
+function hasPendingOfflineQueue() {
+  return loadOfflineQueue().some((item) => item.status !== "synced" && item.status !== "conflict");
+}
+
+function scheduleOfflineSync(delay = 5000) {
+  if (navigator.onLine === false || offlineSyncTimer || offlineAutoSyncTimeout) return;
+  if (!hasPendingOfflineQueue()) return;
+  offlineAutoSyncTimeout = window.setTimeout(() => {
+    offlineAutoSyncTimeout = null;
+    syncOfflineQueue();
+  }, delay);
+}
+
+function removeSyncedQueueItemsForRecord(type, id) {
+  if (!id) return;
+  const collections = firestoreWriteCollections(type);
+  const queue = loadOfflineQueue();
+  const filtered = queue.filter((item) => {
+    const payload = item.payload || {};
+    const itemCollections = payload.collections || [payload.collectionName].filter(Boolean);
+    const sameRecord = payload.id === id && itemCollections.some((name) => collections.includes(name));
+    return !sameRecord || item.status === "conflict";
+  });
+  if (filtered.length !== queue.length) saveOfflineQueue(filtered);
+}
+
 function offlineQueueSummary() {
+  cleanupNonBlockingOfflineConflicts();
   const pending = state.offlineQueueCount || 0;
   const hasConflict = loadOfflineQueue().some((item) => item.status === "conflict");
   if (hasConflict) return ["conflict", "Conflit à vérifier"];
@@ -1053,9 +1528,9 @@ function offlineQueueSummary() {
   return ["online", offlineSyncNotice || "En ligne"];
 }
 
-function offlineStatusBadge() {
+function offlineStatusBadge(extraClass = "") {
   const [tone, label] = offlineQueueSummary();
-  return `<button class="offline-status ${esc(tone)}" type="button" title="État de synchronisation">${esc(label)}</button>`;
+  return `<button class="offline-status ${esc(tone)} ${esc(extraClass)}" type="button" title="État de synchronisation">${esc(label)}</button>`;
 }
 
 function offlineStatusCard() {
@@ -1154,10 +1629,12 @@ function studentMedicalDocForFirestore(child = {}) {
   return {
     id: child.id,
     childId: child.id,
+    transportManagerId: child.transportManagerId || "",
     childName: fullName(child),
     driverId: child.driverId || "",
+    driverIds: driverIdsFromRecord(child),
     assistantId: child.assistantId || "",
-    parentIds: child.parentIds || [],
+    parentIds: uniqueText([...(child.parentIds || []), ...parentListForChild(child).flatMap(personIdentityIds)]),
     ...pickStudentFields(child, studentMedicalKeys),
     updatedAt: child.updatedAt || new Date().toISOString(),
     updatedBy: child.updatedBy || state.user?.id || "system"
@@ -1168,10 +1645,12 @@ function studentSensitiveDocForFirestore(child = {}) {
   return {
     id: child.id,
     childId: child.id,
+    transportManagerId: child.transportManagerId || "",
     childName: fullName(child),
     driverId: child.driverId || "",
+    driverIds: driverIdsFromRecord(child),
     assistantId: child.assistantId || "",
-    parentIds: child.parentIds || [],
+    parentIds: uniqueText([...(child.parentIds || []), ...parentListForChild(child).flatMap(personIdentityIds)]),
     ...pickStudentFields(child, studentSensitiveKeys),
     updatedAt: child.updatedAt || new Date().toISOString(),
     updatedBy: child.updatedBy || state.user?.id || "system"
@@ -1274,15 +1753,21 @@ function queueFirestorePathDelete(queueType, pathSegments) {
 
 async function syncOfflineQueue() {
   if (navigator.onLine === false || offlineSyncTimer) return;
-  const queue = loadOfflineQueue().filter((item) => item.status !== "synced");
+  if (offlineAutoSyncTimeout) {
+    window.clearTimeout(offlineAutoSyncTimeout);
+    offlineAutoSyncTimeout = null;
+  }
+  const currentQueue = loadOfflineQueue();
+  const conflicts = currentQueue.filter((item) => item.status === "conflict");
+  const queue = currentQueue.filter((item) => item.status !== "synced" && item.status !== "conflict");
   if (!queue.length) {
-    saveOfflineQueue([]);
+    saveOfflineQueue(conflicts);
     return;
   }
   state.connectionState = "syncing";
   render();
   offlineSyncTimer = true;
-  const nextQueue = [];
+  const nextQueue = [...conflicts];
   for (const item of queue) {
     try {
       await writeQueuedFirestoreOperation(item);
@@ -1291,6 +1776,7 @@ async function syncOfflineQueue() {
     } catch (error) {
       item.retryCount = Number(item.retryCount || 0) + 1;
       item.lastError = firestoreSyncErrorMessage(error);
+      if (shouldDiscardDeniedQueueItem(item)) continue;
       item.status = shouldKeepOfflineConflict(error, item.retryCount) ? "conflict" : "pending";
       nextQueue.push(item);
       console.warn("Synchronisation différée impossible.", error);
@@ -1305,6 +1791,7 @@ async function syncOfflineQueue() {
       ? `${nextQueue.length} donnée${nextQueue.length > 1 ? "s" : ""} en attente`
       : "Synchronisation terminée";
   render();
+  if (nextQueue.length) scheduleOfflineSync(15000);
   window.setTimeout(() => {
     offlineSyncNotice = "";
     if (state.user) render();
@@ -1322,6 +1809,7 @@ function retryOfflineConflicts() {
 }
 
 function offlineConflictDetails() {
+  cleanupNonBlockingOfflineConflicts();
   const waitingItems = loadOfflineQueue().filter((item) => item.status !== "synced");
   if (!waitingItems.length) return "Aucune donnée en attente.";
   return waitingItems.map((item, index) => {
@@ -1331,17 +1819,165 @@ function offlineConflictDetails() {
 }
 
 function initOfflineMode() {
+  cleanupNonBlockingOfflineConflicts();
+  const recoveredSupportMessages = recoverSupportMessagePermissionConflicts();
+  const recoveredParents = recoverParentPermissionConflicts();
   offlineQueueMemory = loadOfflineQueue();
   saveOfflineQueue(offlineQueueMemory);
+  if (recoveredSupportMessages || recoveredParents) scheduleOfflineSync(800);
   window.addEventListener("online", () => {
     state.connectionState = "syncing";
-    syncOfflineQueue();
+    scheduleOfflineSync(500);
+    checkAppVersion({ silent: true });
   });
   window.addEventListener("offline", () => {
     state.connectionState = "offline";
     if (state.user) render();
   });
-  if (navigator.onLine !== false) syncOfflineQueue();
+  if (navigator.onLine !== false) scheduleOfflineSync(800);
+  offlineAutoSyncInterval = window.setInterval(() => {
+    if (navigator.onLine !== false && hasPendingOfflineQueue()) scheduleOfflineSync(1000);
+  }, 10000);
+}
+
+async function fetchAppVersion() {
+  const response = await fetch(`${APP_VERSION_URL}?t=${Date.now()}`, {
+    cache: "no-store",
+    headers: { "Cache-Control": "no-cache" }
+  });
+  if (!response.ok) throw new Error(`Version indisponible (${response.status})`);
+  return response.json();
+}
+
+async function checkAppVersion(options = {}) {
+  try {
+    const versionInfo = await fetchAppVersion();
+    if (!versionInfo?.version) return;
+    const previousVersion = state.appVersion?.version || state.lastKnownAppVersion || localStorage.getItem("gts-current-version") || "";
+    state.appVersion = normalizeAppVersionInfo(versionInfo);
+    state.updateCheckedAt = new Date().toISOString();
+    state.updateCheckError = "";
+    if (!previousVersion) {
+      state.lastKnownAppVersion = state.appVersion.version;
+      localStorage.setItem("gts-current-version", state.appVersion.version);
+    } else if (previousVersion !== state.appVersion.version) {
+      state.updateAvailable = true;
+      const refreshKey = `gts-version-refresh-${state.appVersion.version}`;
+      if (!sessionStorage.getItem(refreshKey) && !unsavedWorkReason()) {
+        sessionStorage.setItem(refreshKey, "1");
+        localStorage.setItem("gts-current-version", state.appVersion.version);
+        await refreshApplicationNow();
+        return;
+      }
+    }
+    if (state.user && (!options.silent || (state.updateAvailable && state.screen === "settings"))) render();
+  } catch (error) {
+    state.updateCheckError = error?.message || "Vérification version indisponible";
+    state.updateCheckedAt = new Date().toISOString();
+    if (state.user && (!options.silent || state.screen === "settings")) render();
+  }
+}
+
+function normalizeAppVersionInfo(info = {}) {
+  return {
+    version: String(info.version || "Non renseignée"),
+    updatedAt: String(info.updatedAt || ""),
+    changes: Array.isArray(info.changes) ? info.changes.filter(Boolean) : []
+  };
+}
+
+function startAppVersionMonitoring() {
+  checkAppVersion({ silent: true });
+  if (appVersionCheckTimer) clearInterval(appVersionCheckTimer);
+  appVersionCheckTimer = setInterval(() => checkAppVersion({ silent: true }), APP_VERSION_CHECK_INTERVAL_MS);
+}
+
+function unsavedWorkReason() {
+  const pendingQueue = loadOfflineQueue().filter((item) => item.status !== "synced");
+  if (pendingQueue.length) return `${pendingQueue.length} donnée${pendingQueue.length > 1 ? "s" : ""} en attente de synchronisation.`;
+  if (state.editingChildId || state.editingType || state.editingAccessType || state.editingAnnouncementId || state.selectedSupportRequestId || state.parentRequestChildId || state.parentMedicalChildId) {
+    return "Une fiche ou une demande est en cours de modification.";
+  }
+  const activeDraft = Object.values(loadLocalDrafts()).some((draft) => {
+    const values = draft?.values && typeof draft.values === "object" ? draft.values : draft;
+    return values && Object.values(values).some((value) => String(value || "").trim());
+  });
+  if (activeDraft) return "Des brouillons locaux existent encore.";
+  return "";
+}
+
+function loadLocalDrafts() {
+  try {
+    return JSON.parse(localStorage.getItem(APP_DRAFTS_KEY)) || {};
+  } catch {
+    return {};
+  }
+}
+
+function saveFormDraft(form) {
+  if (!form || form.closest(".login-screen") || form.closest(".premium-login-screen") || form.closest(".app-version-card")) return;
+  const key = formDraftKey(form);
+  if (!key) return;
+  const values = {};
+  new FormData(form).forEach((value, name) => {
+    values[name] = value;
+  });
+  const drafts = loadLocalDrafts();
+  drafts[key] = { values, updatedAt: new Date().toISOString() };
+  localStorage.setItem(APP_DRAFTS_KEY, JSON.stringify(drafts));
+}
+
+function clearFormDraft(form) {
+  const key = formDraftKey(form);
+  if (!key) return;
+  const drafts = loadLocalDrafts();
+  delete drafts[key];
+  localStorage.setItem(APP_DRAFTS_KEY, JSON.stringify(drafts));
+}
+
+function formDraftKey(form) {
+  if (!form || form.closest(".login-screen") || form.closest(".premium-login-screen") || form.closest(".app-version-card")) return "";
+  return form.id || form.dataset.type || form.dataset.childForm || form.dataset.supportRequestForm || form.dataset.parentRequestForm || form.dataset.transportRequestForm || "";
+}
+
+function bindLocalDraftAutosave() {
+  document.querySelectorAll("form").forEach((form) => {
+    if (form.dataset.draftBound === "1") return;
+    form.dataset.draftBound = "1";
+    form.addEventListener("input", () => saveFormDraft(form));
+    form.addEventListener("change", () => saveFormDraft(form));
+    form.addEventListener("submit", () => window.setTimeout(() => clearFormDraft(form), 0));
+  });
+}
+
+async function activateWaitingServiceWorker() {
+  if (!("serviceWorker" in navigator)) return;
+  const registration = await navigator.serviceWorker.getRegistration();
+  if (registration?.waiting) {
+    registration.waiting.postMessage({ type: "SKIP_WAITING" });
+  }
+}
+
+async function refreshApplicationNow() {
+  const reason = unsavedWorkReason();
+  if (reason) return alert(`Des modifications ne sont pas encore enregistrées.\n${reason}`);
+  try {
+    await activateWaitingServiceWorker();
+    if ("caches" in window) {
+      const keys = await caches.keys();
+      await Promise.all(keys.filter((key) => key.startsWith("gts-")).map((key) => caches.delete(key)));
+    }
+  } catch (error) {
+    console.warn("Actualisation cache impossible", error);
+  }
+  if (state.appVersion?.version) localStorage.setItem("gts-current-version", state.appVersion.version);
+  window.location.reload();
+}
+
+function postponeAppUpdate() {
+  state.updateAvailable = false;
+  if (state.appVersion?.version) state.lastKnownAppVersion = state.appVersion.version;
+  render();
 }
 
 async function saveChildToFirestore(child) {
@@ -1359,7 +1995,11 @@ async function saveChildToFirestore(child) {
       return operation.merge === false ? setDoc(ref, operation.payload) : setDoc(ref, operation.payload, { merge: true });
     }));
   } catch (error) {
-    operations.forEach((operation) => queueFirestorePathSet(operation.queueType, operation.path, operation.payload, { merge: operation.merge }));
+    const permissionDenied = String(error?.code || "").includes("permission-denied");
+    operations.forEach((operation) => {
+      if (permissionDenied && shouldDiscardDeniedPathSet(operation.queueType, operation.path, operation.payload)) return;
+      queueFirestorePathSet(operation.queueType, operation.path, operation.payload, { merge: operation.merge });
+    });
     console.warn("Firestore indisponible, localStorage conserve la fiche élève.", error);
   }
 }
@@ -1404,18 +2044,25 @@ async function saveChildMessageToFirestore(childId, message) {
   if (navigator.onLine === false) {
     queueFirestorePathSet("message", ["privateMessages", conversation.conversationId], conversation);
     queueFirestorePathSet("message", ["privateMessages", conversation.conversationId, "messages", message.id], { ...message, offlineStatus: "pending" });
-    return;
+    return false;
   }
   try {
     const { db } = await import("./src/firebaseConfig.js");
-    if (!db) return;
+    if (!db) return false;
     const { doc, setDoc } = await import("firebase/firestore");
     await setDoc(doc(db, "privateMessages", conversation.conversationId), conversation, { merge: true });
     await setDoc(doc(db, "privateMessages", conversation.conversationId, "messages", message.id), message, { merge: true });
+    return true;
   } catch (error) {
+    if (String(error?.code || "").includes("permission-denied")) {
+      console.warn("Message privé refusé par Firestore, conservé seulement en local.", error);
+      return false;
+    }
     queueFirestorePathSet("message", ["privateMessages", conversation.conversationId], conversation);
     queueFirestorePathSet("message", ["privateMessages", conversation.conversationId, "messages", message.id], { ...message, offlineStatus: "pending" });
     console.warn("Firestore indisponible, message privé conservé en localStorage.", error);
+    alert(`Message non synchronisé avec Firestore : ${error?.code || error?.message || "erreur inconnue"}`);
+    return false;
   }
 }
 
@@ -1514,18 +2161,21 @@ async function saveTeamMessageToFirestore(conversation, message) {
   if (navigator.onLine === false) {
     queueFirestorePathSet("message", ["teamMessages", conversation.conversationId], conversation);
     queueFirestorePathSet("message", ["teamMessages", conversation.conversationId, "messages", message.id], { ...message, offlineStatus: "pending" });
-    return;
+    return false;
   }
   try {
     const { db } = await import("./src/firebaseConfig.js");
-    if (!db) return;
+    if (!db) return false;
     const { doc, setDoc } = await import("firebase/firestore");
     await setDoc(doc(db, "teamMessages", conversation.conversationId), conversation, { merge: true });
     await setDoc(doc(db, "teamMessages", conversation.conversationId, "messages", message.id), message, { merge: true });
+    return true;
   } catch (error) {
     queueFirestorePathSet("message", ["teamMessages", conversation.conversationId], conversation);
     queueFirestorePathSet("message", ["teamMessages", conversation.conversationId, "messages", message.id], { ...message, offlineStatus: "pending" });
     console.warn("Firestore indisponible, message équipe conservé en localStorage.", error);
+    alert(`Message non synchronisé avec Firestore : ${error?.code || error?.message || "erreur inconnue"}`);
+    return false;
   }
 }
 
@@ -1541,35 +2191,118 @@ async function deleteTeamMessageFromFirestore(conversationId, messageId, convers
   }
 }
 
+async function deleteTeamConversationFromFirestore(conversation) {
+  const conversationId = conversation?.conversationId;
+  if (!conversationId) return;
+  const tombstone = {
+    ...conversation,
+    conversationId,
+    lastMessage: "",
+    lastMessageAt: "",
+    deletedAt: conversation.deletedAt || new Date().toISOString(),
+    deletedById: conversation.deletedById || state.user?.id || ""
+  };
+  const localMessages = data.teamMessageItems?.[conversationId] || [];
+  if (navigator.onLine === false) {
+    queueFirestorePathSet("message", ["teamMessages", conversationId], tombstone);
+    localMessages.forEach((message) => queueFirestorePathDelete("message", ["teamMessages", conversationId, "messages", message.id]));
+    return;
+  }
+  try {
+    const { db } = await import("./src/firebaseConfig.js");
+    if (!db) return;
+    const { collection, doc, getDocs, writeBatch } = await import("firebase/firestore");
+    const messagesSnapshot = await getDocs(collection(db, "teamMessages", conversationId, "messages"));
+    const batch = writeBatch(db);
+    messagesSnapshot.forEach((messageDoc) => batch.delete(messageDoc.ref));
+    batch.set(doc(db, "teamMessages", conversationId), tombstone, { merge: true });
+    await batch.commit();
+  } catch (error) {
+    console.warn("Firestore indisponible, suppression conversation équipe conservée en localStorage.", error);
+  }
+}
+
 async function saveDirectMessageToFirestore(conversation, message) {
   if (navigator.onLine === false) {
-    queueFirestorePathSet("message", ["directMessages", conversation.conversationId], conversation);
-    queueFirestorePathSet("message", ["directMessages", conversation.conversationId, "messages", message.id], { ...message, offlineStatus: "pending" });
+    queueFirestorePathSet("message", ["directMessageEvents", message.id], directMessageEventPayload(conversation, { ...message, offlineStatus: "pending" }));
+    return false;
+  }
+  try {
+    const { db, functions } = await import("./src/firebaseConfig.js");
+    if (!db) return false;
+    const { doc, setDoc } = await import("firebase/firestore");
+    if (functions) {
+      try {
+        const { httpsCallable } = await import("firebase/functions");
+        const sendDirectMessageCallable = httpsCallable(functions, "sendDirectMessage");
+        await sendDirectMessageCallable({ conversation, message });
+        return true;
+      } catch (callableError) {
+        console.warn("Fonction serveur message direct indisponible, tentative Firestore directe.", callableError);
+      }
+    }
+    await setDoc(doc(db, "directMessageEvents", message.id), directMessageEventPayload(conversation, message), { merge: true });
+    return true;
+  } catch (error) {
+    queueFirestorePathSet("message", ["directMessageEvents", message.id], directMessageEventPayload(conversation, { ...message, offlineStatus: "pending" }));
+    console.warn("Firestore indisponible, message direct conservé en localStorage.", error);
+    alert(`Message non synchronisé avec Firestore : ${error?.code || error?.message || "erreur inconnue"}`);
+    return false;
+  }
+}
+
+function directMessageEventPayload(conversation, message) {
+  return {
+    id: message.id,
+    conversationId: conversation.conversationId,
+    conversation: { ...conversation, id: conversation.id || conversation.conversationId },
+    message,
+    visibleIds: [...new Set([...(conversation.participants || []), conversation.senderId, conversation.recipientId, message.authorId].filter(Boolean))],
+    visibleRoles: [...new Set([conversation.senderRole, conversation.recipientRole, message.authorRole].filter(Boolean))],
+    transportManagerId: conversation.transportManagerId || message.transportManagerId || transportManagerIdForUser(state.user),
+    createdAt: message.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+}
+
+async function deleteDirectMessageFromFirestore(conversationId, messageId, conversation) {
+  return;
+}
+
+async function deleteDirectConversationFromFirestore(conversation) {
+  const conversationId = conversation?.conversationId;
+  if (!conversationId) return;
+  const tombstone = {
+    ...conversation,
+    conversationId,
+    lastMessage: "",
+    lastMessageAt: "",
+    deletedAt: conversation.deletedAt || new Date().toISOString(),
+    deletedById: conversation.deletedById || state.user?.id || ""
+  };
+  if (navigator.onLine === false) {
+    queueFirestorePathSet("message", ["directConversationDeletes", `${state.user?.id || "user"}_${conversationId}`], directConversationDeletePayload(conversationId, tombstone));
     return;
   }
   try {
     const { db } = await import("./src/firebaseConfig.js");
     if (!db) return;
     const { doc, setDoc } = await import("firebase/firestore");
-    await setDoc(doc(db, "directMessages", conversation.conversationId), conversation, { merge: true });
-    await setDoc(doc(db, "directMessages", conversation.conversationId, "messages", message.id), message, { merge: true });
+    await setDoc(doc(db, "directConversationDeletes", `${state.user?.id || "user"}_${conversationId}`), directConversationDeletePayload(conversationId, tombstone), { merge: true });
   } catch (error) {
-    queueFirestorePathSet("message", ["directMessages", conversation.conversationId], conversation);
-    queueFirestorePathSet("message", ["directMessages", conversation.conversationId, "messages", message.id], { ...message, offlineStatus: "pending" });
-    console.warn("Firestore indisponible, message direct conservé en localStorage.", error);
+    console.warn("Firestore indisponible, suppression conversation directe conservée en localStorage.", error);
   }
 }
 
-async function deleteDirectMessageFromFirestore(conversationId, messageId, conversation) {
-  try {
-    const { db } = await import("./src/firebaseConfig.js");
-    if (!db) return;
-    const { doc, deleteDoc, setDoc } = await import("firebase/firestore");
-    await deleteDoc(doc(db, "directMessages", conversationId, "messages", messageId));
-    if (conversation) await setDoc(doc(db, "directMessages", conversationId), conversation, { merge: true });
-  } catch (error) {
-    console.warn("Firestore indisponible, suppression message direct conservée en localStorage.", error);
-  }
+function directConversationDeletePayload(conversationId, conversation = {}) {
+  return {
+    id: `${state.user?.id || "user"}_${conversationId}`,
+    conversationId,
+    userId: state.user?.id || "",
+    userRole: state.user?.role || "",
+    transportManagerId: conversation.transportManagerId || transportManagerIdForUser(state.user),
+    deletedAt: conversation.deletedAt || new Date().toISOString()
+  };
 }
 
 async function saveLoginLogToFirestore(log) {
@@ -1584,11 +2317,20 @@ async function saveLoginLogToFirestore(log) {
 }
 
 async function saveSecurityLogToFirestore(log) {
-  return saveCollectionItemToFirestore("securityLogs", log);
+  try {
+    const { db } = await import("./src/firebaseConfig.js");
+    if (!db) return;
+    const { doc, setDoc } = await import("firebase/firestore");
+    await setDoc(doc(db, "securityLogs", log.id), log, { merge: true });
+  } catch (error) {
+    console.warn("Firestore a refusé le journal sécurité, conservé uniquement en localStorage.", error);
+  }
 }
 
 async function saveTemporarySupportAccessToFirestore(access) {
-  return saveCollectionItemToFirestore("temporarySupportAccess", access);
+  const firestoreAccess = { ...access, code: "******" };
+  delete firestoreAccess.displayCode;
+  return saveCollectionItemToFirestore("temporarySupportAccess", firestoreAccess);
 }
 
 async function saveTemporarySupportAccessLogToFirestore(log) {
@@ -1632,18 +2374,97 @@ async function saveServiceStatusToFirestore(status) {
   }
 }
 
-async function saveNotificationToFirestore(notification) {
+async function refreshPublicServiceStatus() {
   try {
     const { db } = await import("./src/firebaseConfig.js");
     if (!db) return;
+    const { doc, getDoc } = await import("firebase/firestore");
+    const snapshot = await getDoc(doc(db, "serviceStatus", "current"));
+    if (!snapshot.exists()) return;
+    data.serviceStatus = { ...seed.serviceStatus, ...snapshot.data(), id: "current" };
+    saveData();
+  } catch (error) {
+    console.warn("État maintenance public indisponible.", error);
+  }
+}
+
+async function saveNotificationToFirestore(notification) {
+  if (navigator.onLine === false) {
+    queueFirestorePathSet("update_data", ["notifications", notification.id], notification);
+    return;
+  }
+  try {
+    const { db } = await import("./src/firebaseConfig.js");
+    if (!db) throw new Error("Firestore non initialisé");
     const { doc, setDoc } = await import("firebase/firestore");
     await setDoc(doc(db, "notifications", notification.id), notification, { merge: true });
   } catch (error) {
+    queueFirestorePathSet("update_data", ["notifications", notification.id], notification);
     console.warn("Firestore indisponible, notification conservée en localStorage.", error);
   }
 }
 
+async function saveUserProfilePatchToFirestore(collectionName, userId, patch) {
+  if (!collectionName || !userId || !patch) return;
+  try {
+    const { db } = await import("./src/firebaseConfig.js");
+    if (!db) throw new Error("Firestore non initialisé");
+    const { doc, setDoc } = await import("firebase/firestore");
+    await setDoc(doc(db, collectionName, userId), patch, { merge: true });
+  } catch (error) {
+    devPushLog("mise à jour profil notification impossible", error);
+  }
+}
+
+async function markFirestoreDocumentRead(pathSegments, fallbackData = {}, queueType = "update_data") {
+  if (!state.user?.id || !pathSegments?.length) return;
+  const payload = {
+    ...fallbackData,
+    readBy: [...new Set([...(fallbackData.readBy || []), state.user.id])]
+  };
+  if (navigator.onLine === false) {
+    queueFirestorePathSet(queueType, pathSegments, payload);
+    return;
+  }
+  try {
+    const { db } = await import("./src/firebaseConfig.js");
+    if (!db) throw new Error("Firestore non initialisé");
+    const { doc, setDoc, arrayUnion } = await import("firebase/firestore");
+    await setDoc(doc(db, ...pathSegments), { ...fallbackData, readBy: arrayUnion(state.user.id) }, { merge: true });
+  } catch (error) {
+    queueFirestorePathSet(queueType, pathSegments, payload);
+    console.warn("Firestore indisponible, statut lu conservé en localStorage.", error);
+  }
+}
+
+function upsertLocalNotificationRead(notification) {
+  if (!state.user?.id || !notification?.id) return null;
+  data.notifications = data.notifications || [];
+  const index = data.notifications.findIndex((item) => item.id === notification.id);
+  const existing = index >= 0 ? data.notifications[index] : {};
+  const next = {
+    ...notification,
+    ...existing,
+    id: notification.id,
+    userId: notification.userId || existing.userId || ((notification.recipientRoles || existing.recipientRoles || []).length ? "" : state.user.id),
+    role: notification.role || existing.role || state.user.role,
+    readBy: [...new Set([...(existing.readBy || []), ...(notification.readBy || []), state.user.id])]
+  };
+  if (index >= 0) data.notifications[index] = next;
+  else data.notifications.unshift(next);
+  data.notifications = data.notifications.slice(0, 300);
+  return next;
+}
+
+async function markNotificationReadInFirestore(notification) {
+  const saved = upsertLocalNotificationRead(notification);
+  if (!saved) return;
+  saveData();
+  await markFirestoreDocumentRead(["notifications", saved.id], saved, "update_data");
+}
+
 async function saveCollectionItemToFirestore(type, item) {
+  applyTransportManagerScopeToRecord(type, item);
   const collections = firestoreWriteCollections(type);
   const queueType = offlineQueueTypeForCollection(type);
   if (navigator.onLine === false) {
@@ -1652,12 +2473,24 @@ async function saveCollectionItemToFirestore(type, item) {
   }
   try {
     const { db } = await import("./src/firebaseConfig.js");
-    if (!db) return;
+    if (!db) throw new Error("Firestore non initialisé");
     const { doc, setDoc } = await import("firebase/firestore");
     await Promise.all(
       collections.map((collectionName) => setDoc(doc(db, collectionName, item.id), item, { merge: true }))
     );
+    removeSyncedQueueItemsForRecord(type, item.id);
   } catch (error) {
+    if (String(error?.code || "").includes("permission-denied") && shouldDiscardDeniedQueueItem({
+      lastError: "permission-denied",
+      payload: { operation: "set", collectionName: collections[0], collections, id: item.id, data: item }
+    })) {
+      console.warn("Modification non autorisée par Firestore, conservée seulement en local.", error);
+      return;
+    }
+    if (String(error?.code || "").includes("permission-denied") && ["users", "parents"].includes(type) && (["driver", "assistant", "parent"].includes(state.user?.role) || isTransportManagerUser())) {
+      console.warn("Modification compte non autorisée par Firestore, conservée seulement en local.", error);
+      return;
+    }
     enqueueOfflineOperation(queueType, { operation: "set", collectionName: collections[0], collections, id: item.id, data: item });
     console.warn("Firestore indisponible, modification conservée en localStorage.", error);
   }
@@ -1665,6 +2498,7 @@ async function saveCollectionItemToFirestore(type, item) {
 
 function firestoreBootstrapItems(collectionName) {
   const now = new Date().toISOString();
+  if (collectionName === "transportManagers") return data.transportManagers || [];
   if (collectionName === "students") return (data.children || []).map(publicStudentForFirestore);
   if (collectionName === "studentMedical") return (data.children || []).map(studentMedicalDocForFirestore);
   if (collectionName === "studentSensitive") return (data.children || []).map(studentSensitiveDocForFirestore);
@@ -1674,6 +2508,21 @@ function firestoreBootstrapItems(collectionName) {
   if (collectionName === "vehicleReports") return data.vehicleRepairs || [];
   if (collectionName === "temporarySupportAccess") return data.temporarySupportAccess || [];
   if (collectionName === "temporarySupportAccessLogs") return data.temporarySupportAccessLogs || [];
+  if (collectionName === "supportPermissions") {
+    const permissionDocs = data.supportPermissions || [];
+    const existing = new Set(permissionDocs.map((permissions) => permissions.userId || permissions.id).filter(Boolean));
+    const generated = (data.users || [])
+      .filter((user) => user.role === "support" && !existing.has(user.id))
+      .map((user) => ({
+        id: user.id,
+        userId: user.id,
+        ...defaultSupportPermissions(),
+        ...(user.supportPermissions || {}),
+        updatedAt: user.updatedAt || now,
+        updatedBy: user.updatedBy || "system"
+      }));
+    return [...permissionDocs, ...generated];
+  }
   if (collectionName === "messages") {
     return Object.entries(data.messages || {}).flatMap(([childId, messages]) =>
       (messages || []).map((message, index) => ({
@@ -1705,15 +2554,15 @@ async function bootstrapFirestoreCollections() {
     const now = new Date().toISOString();
     await Promise.all(firestoreBootstrapCollections.map(async (collectionName) => {
       const snapshot = await getDocs(collection(db, collectionName));
-      const hasRealDocument = snapshot.docs.some((docSnap) => docSnap.id !== "__meta__");
+      const hasRealDocument = snapshot.docs.some((docSnap) => !["__meta__", "_meta"].includes(docSnap.id));
       if (hasRealDocument) return;
       const items = firestoreBootstrapItems(collectionName).filter((item) => item?.id);
       if (items.length) {
         await Promise.all(items.map((item) => setDoc(doc(db, collectionName, item.id), item, { merge: true })));
         return;
       }
-      await setDoc(doc(db, collectionName, "__meta__"), {
-        id: "__meta__",
+      await setDoc(doc(db, collectionName, "_meta"), {
+        id: "_meta",
         collectionName,
         system: true,
         createdAt: now,
@@ -1735,10 +2584,18 @@ async function deleteCollectionItemFromFirestore(type, id) {
   }
   try {
     const { db } = await import("./src/firebaseConfig.js");
-    if (!db) return;
+    if (!db) throw new Error("Firestore non initialisé");
     const { doc, deleteDoc } = await import("firebase/firestore");
     await Promise.all(collections.map((collectionName) => deleteDoc(doc(db, collectionName, id))));
+    removeSyncedQueueItemsForRecord(type, id);
   } catch (error) {
+    if (String(error?.code || "").includes("permission-denied") && shouldDiscardDeniedQueueItem({
+      lastError: "permission-denied",
+      payload: { operation: "delete", collectionName: collections[0], collections, id }
+    })) {
+      console.warn("Suppression non autorisée par Firestore, conservée seulement en local.", error);
+      return;
+    }
     enqueueOfflineOperation(offlineQueueTypeForCollection(type), { operation: "delete", collectionName: collections[0], collections, id });
     console.warn("Firestore indisponible, suppression locale conservée.", error);
   }
@@ -1746,13 +2603,15 @@ async function deleteCollectionItemFromFirestore(type, id) {
 
 async function startFirestoreRealtimeSync() {
   try {
-    const { db } = await import("./src/firebaseConfig.js");
-    if (!db) return;
+    const { auth, db } = await import("./src/firebaseConfig.js");
+    if (!db || !auth?.currentUser || firestoreSyncStarted) return;
+    firestoreSyncStarted = true;
     firestoreHealth.available = true;
-    const { collection, doc, onSnapshot } = await import("firebase/firestore");
-    await bootstrapFirestoreCollections();
+    const { collection, doc, documentId, onSnapshot, query, where } = await import("firebase/firestore");
+    if (isPrimaryAdmin()) await bootstrapFirestoreCollections();
     const firestoreCollections = [
       "users",
+      "transportManagers",
       "parents",
       "drivers",
       "assistants",
@@ -1761,6 +2620,7 @@ async function startFirestoreRealtimeSync() {
       "circuits",
       "children",
       "studentIssues",
+      "supportRequests",
       "roleAnnouncements",
       "teamMessages",
       "directMessages",
@@ -1771,9 +2631,10 @@ async function startFirestoreRealtimeSync() {
       "studentMedical",
       "studentSensitive",
       "smsAlerts",
-      "notifications",
       "temporarySupportAccess",
       "temporarySupportAccessLogs",
+      "supportPermissions",
+      "supportReports",
       "replacementRules",
       "leaveRequests",
       "poolTransport",
@@ -1790,11 +2651,14 @@ async function startFirestoreRealtimeSync() {
       seenCollections.add(canonical);
       firestoreWriteCollections(canonical).forEach((collectionName) => seenCollections.add(collectionName));
     });
-    [...seenCollections].forEach((type) => {
-      onSnapshot(collection(db, type), (snapshot) => {
+	    [...seenCollections].forEach((type) => {
+      const sourceRefs = firestoreCollectionSources(db, type, collection, query, where, documentId, auth);
+      if (!sourceRefs.length) return;
+      sourceRefs.forEach((sourceRef) => {
+      const unsubscribe = onSnapshot(sourceRef, (snapshot) => {
         firestoreHealth.lastSyncAt = new Date().toISOString();
         const remoteItems = snapshot.docs
-          .filter((docSnap) => docSnap.id !== "__meta__")
+          .filter((docSnap) => !["__meta__", "_meta"].includes(docSnap.id))
           .map((docSnap) => ({ id: docSnap.id, ...docSnap.data() }));
         if (!remoteItems.length && Array.isArray(data[type]) && data[type].length > 0) {
           return;
@@ -1805,17 +2669,125 @@ async function startFirestoreRealtimeSync() {
           data[targetType] = [];
         } else {
           data[targetType] = mergeRemoteCollection(targetType, data[targetType], remoteItems, data);
+          if (targetType === "supportRequests" || targetType === "studentIssues") {
+            remoteItems.forEach((item) => registerNestedMessageListener(db, targetType, item.id, onSnapshot, collection));
+          }
         }
         syncCollectionAliases(data);
+        removeDemoRecords(data);
         syncLinkedData(data);
+        removeLegacyAdminGtsAccount(data);
         saveData();
         if (state.user) render();
       }, (error) => {
         firestoreHealth.errors += 1;
         console.warn(`Synchronisation ${type} indisponible.`, error);
       });
+	      firestoreUnsubscribeFns.push(unsubscribe);
+      });
+	    });
+	    const mergeNotificationSnapshot = (snapshot) => {
+	      firestoreHealth.lastSyncAt = new Date().toISOString();
+	      const remoteItems = snapshot.docs
+	        .filter((docSnap) => !["__meta__", "_meta"].includes(docSnap.id))
+	        .map((docSnap) => ({ id: docSnap.id, ...docSnap.data() }));
+	      data.notifications = mergeRemoteCollection("notifications", data.notifications, remoteItems, data);
+	      saveData();
+	      if (state.user) render();
+	    };
+	    firestoreUnsubscribeFns.push(onSnapshot(query(collection(db, "notifications"), where("userId", "==", state.user.id)), mergeNotificationSnapshot, (error) => {
+	      firestoreHealth.errors += 1;
+	      console.warn("Synchronisation notifications utilisateur indisponible.", error);
+	    }));
+	    const recipientRole = notificationRecipientRole();
+	    if (recipientRole) {
+	      firestoreUnsubscribeFns.push(onSnapshot(query(collection(db, "notifications"), where("recipientRoles", "array-contains", recipientRole)), mergeNotificationSnapshot, (error) => {
+	        firestoreHealth.errors += 1;
+	        console.warn("Synchronisation notifications par rôle indisponible.", error);
+	      }));
+	    }
+	    ["privateMessages", "directMessages", "teamMessages"].forEach((collectionName) => {
+      currentUserIdentityIds().forEach((participantId) => {
+        firestoreUnsubscribeFns.push(onSnapshot(query(collection(db, collectionName), where("participants", "array-contains", participantId)), (snapshot) => {
+          firestoreHealth.lastSyncAt = new Date().toISOString();
+          mergeConversationDocuments(collectionName, snapshot.docs);
+          snapshot.docs.forEach((docSnap) => registerConversationMessageListener(db, collectionName, docSnap.id, onSnapshot, collection));
+          saveData();
+          if (state.user) render();
+        }, (error) => {
+          firestoreHealth.errors += 1;
+          console.warn(`Synchronisation conversations ${collectionName} indisponible.`, error);
+        }));
+        if (collectionName === "directMessages") {
+          ["senderId", "recipientId"].forEach((fieldName) => {
+            firestoreUnsubscribeFns.push(onSnapshot(query(collection(db, collectionName), where(fieldName, "==", participantId)), (snapshot) => {
+              firestoreHealth.lastSyncAt = new Date().toISOString();
+              mergeConversationDocuments(collectionName, snapshot.docs);
+              snapshot.docs.forEach((docSnap) => registerConversationMessageListener(db, collectionName, docSnap.id, onSnapshot, collection));
+              saveData();
+              if (state.user) render();
+            }, (error) => {
+              firestoreHealth.errors += 1;
+              console.warn(`Synchronisation conversations directes ${fieldName} indisponible.`, error);
+            }));
+          });
+        }
+      });
+      if (collectionName === "directMessages" && ["driver", "assistant"].includes(state.user?.role)) {
+        ["senderRole", "recipientRole"].forEach((fieldName) => {
+          firestoreUnsubscribeFns.push(onSnapshot(query(collection(db, collectionName), where(fieldName, "==", state.user.role)), (snapshot) => {
+            firestoreHealth.lastSyncAt = new Date().toISOString();
+            mergeConversationDocuments(collectionName, snapshot.docs);
+            snapshot.docs.forEach((docSnap) => registerConversationMessageListener(db, collectionName, docSnap.id, onSnapshot, collection));
+            saveData();
+            if (state.user) render();
+          }, (error) => {
+            firestoreHealth.errors += 1;
+            console.warn(`Synchronisation conversations directes ${fieldName} rôle indisponible.`, error);
+          }));
+        });
+      }
     });
-    onSnapshot(doc(db, "settings", "parentContact"), (snapshot) => {
+    currentUserIdentityIds().forEach((participantId) => {
+      firestoreUnsubscribeFns.push(onSnapshot(query(collection(db, "directMessageEvents"), where("visibleIds", "array-contains", participantId)), (snapshot) => {
+        firestoreHealth.lastSyncAt = new Date().toISOString();
+        mergeDirectMessageEvents(snapshot.docs);
+        saveData();
+        if (state.user) render();
+      }, (error) => {
+        firestoreHealth.errors += 1;
+        console.warn("Synchronisation événements messages directs indisponible.", error);
+      }));
+    });
+    if (["driver", "assistant"].includes(state.user?.role)) {
+      firestoreUnsubscribeFns.push(onSnapshot(query(collection(db, "directMessageEvents"), where("visibleRoles", "array-contains", state.user.role)), (snapshot) => {
+        firestoreHealth.lastSyncAt = new Date().toISOString();
+        mergeDirectMessageEvents(snapshot.docs);
+        saveData();
+        if (state.user) render();
+      }, (error) => {
+        firestoreHealth.errors += 1;
+        console.warn("Synchronisation événements messages directs par rôle indisponible.", error);
+      }));
+    }
+    if (state.user?.id && ["driver", "assistant"].includes(state.user?.role)) {
+      firestoreUnsubscribeFns.push(onSnapshot(query(collection(db, "directConversationDeletes"), where("userId", "==", state.user.id)), (snapshot) => {
+        firestoreHealth.lastSyncAt = new Date().toISOString();
+        snapshot.docs.forEach((docSnap) => {
+          const item = docSnap.data();
+          if (!item?.conversationId) return;
+          rememberDeletedDirectConversation(item.conversationId);
+          data.directMessages = (data.directMessages || []).filter((conversation) => conversation.conversationId !== item.conversationId);
+          if (data.directMessageItems) data.directMessageItems[item.conversationId] = [];
+        });
+        saveData();
+        if (state.user) render();
+      }, (error) => {
+        firestoreHealth.errors += 1;
+        console.warn("Synchronisation suppressions conversations directes indisponible.", error);
+      }));
+    }
+    firestoreUnsubscribeFns.push(onSnapshot(doc(db, "settings", "parentContact"), (snapshot) => {
       firestoreHealth.lastSyncAt = new Date().toISOString();
       if (!snapshot.exists()) return;
       data.parentContact = { ...seed.parentContact, ...snapshot.data() };
@@ -1824,8 +2796,8 @@ async function startFirestoreRealtimeSync() {
     }, (error) => {
       firestoreHealth.errors += 1;
       console.warn("Synchronisation contact parent indisponible.", error);
-    });
-    onSnapshot(doc(db, "appSettings", "interfaceConfig"), (snapshot) => {
+    }));
+    firestoreUnsubscribeFns.push(onSnapshot(doc(db, "appSettings", "interfaceConfig"), (snapshot) => {
       firestoreHealth.lastSyncAt = new Date().toISOString();
       if (!snapshot.exists()) return;
       data.interfaceConfig = mergeInterfaceConfig(snapshot.data());
@@ -1834,8 +2806,8 @@ async function startFirestoreRealtimeSync() {
     }, (error) => {
       firestoreHealth.errors += 1;
       console.warn("Synchronisation personnalisation interface indisponible.", error);
-    });
-    onSnapshot(doc(db, "serviceStatus", "current"), (snapshot) => {
+    }));
+    firestoreUnsubscribeFns.push(onSnapshot(doc(db, "serviceStatus", "current"), (snapshot) => {
       firestoreHealth.lastSyncAt = new Date().toISOString();
       if (!snapshot.exists()) return;
       data.serviceStatus = { ...seed.serviceStatus, ...snapshot.data(), id: "current" };
@@ -1844,24 +2816,260 @@ async function startFirestoreRealtimeSync() {
     }, (error) => {
       firestoreHealth.errors += 1;
       console.warn("Synchronisation état des services indisponible.", error);
-    });
+    }));
   } catch (error) {
+    firestoreSyncStarted = false;
     firestoreHealth.available = false;
     firestoreHealth.errors += 1;
     console.warn("Firestore temps réel indisponible, localStorage reste actif.", error);
   }
 }
 
+function stopFirestoreRealtimeSync() {
+  firestoreUnsubscribeFns.forEach((unsubscribe) => {
+    try {
+      unsubscribe();
+    } catch {}
+  });
+  firestoreMessageUnsubscribeFns.forEach((unsubscribe) => {
+    try {
+      unsubscribe();
+    } catch {}
+  });
+  firestoreMessageUnsubscribeFns.clear();
+  firestoreUnsubscribeFns = [];
+  firestoreSyncStarted = false;
+}
+
+async function bindFirebaseAuthRealtimeSync() {
+  try {
+    const { auth } = await import("./src/firebaseConfig.js");
+    if (!auth) return;
+    const { onAuthStateChanged } = await import("firebase/auth");
+    onAuthStateChanged(auth, (firebaseUser) => {
+      if (firebaseUser) {
+        (async () => {
+          const restored = await hydrateSessionFromFirebaseAuth();
+          if (restored) {
+            startFirestoreRealtimeSync();
+            render();
+          }
+        })();
+      } else {
+        stopFirestoreRealtimeSync();
+        if (state.user) {
+          const session = currentSession();
+          if (session?.id === state.user.id) {
+            localStorage.setItem(SESSION_KEY, JSON.stringify({
+              ...session,
+              lastActivityAt: Date.now(),
+              userSnapshot: sessionUserSnapshot(state.user)
+            }));
+          } else {
+            localStorage.removeItem(SESSION_KEY);
+          }
+        }
+        if (state.user?.supportAssistance) {
+          finishSupportAssistanceSession(state.user, "ended");
+        }
+      }
+    });
+  } catch (error) {
+    console.warn("Suivi Firebase Auth indisponible.", error);
+  }
+}
+
 function mergeRemoteCollection(type, localItems = [], remoteItems = [], source = null) {
   const merged = new Map();
-  (localItems || []).forEach((item) => {
-    if (item?.id) merged.set(item.id, item);
+  withoutDemoRecords(type, localItems || []).forEach((item) => {
+    const itemId = item?.id || item?.conversationId;
+    if (itemId) merged.set(itemId, { ...item, id: item.id || itemId });
   });
-  (remoteItems || []).forEach((item) => {
+  withoutDemoRecords(type, remoteItems || []).forEach((item) => {
     if (isDeletedRecord(type, item?.id, source)) return;
-    if (item?.id) merged.set(item.id, { ...(merged.get(item.id) || {}), ...item });
+    const itemId = item?.id || item?.conversationId;
+    if (!itemId) return;
+    const existing = merged.get(itemId) || {};
+    merged.set(itemId, newerRecord(type, existing, { ...item, id: item.id || itemId }));
   });
   return Array.from(merged.values());
+}
+
+function mergeMessageArray(localMessages = [], remoteMessages = []) {
+  const merged = new Map();
+  (Array.isArray(localMessages) ? localMessages : []).forEach((message) => {
+    if (message?.id) merged.set(message.id, message);
+  });
+  (Array.isArray(remoteMessages) ? remoteMessages : []).forEach((message) => {
+    if (!message?.id) return;
+    const existing = merged.get(message.id) || {};
+    merged.set(message.id, newerRecord("messages", existing, message));
+  });
+  return [...merged.values()].sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0));
+}
+
+function mergeFirestoreMessageGroup(snapshot) {
+  const grouped = {
+    privateMessages: {},
+    directMessages: {},
+    teamMessages: {},
+    supportRequests: {},
+    studentIssues: {}
+  };
+  snapshot.docs.forEach((docSnap) => {
+    const parentDoc = docSnap.ref.parent.parent;
+    const collectionName = parentDoc?.parent?.id || "";
+    const conversationId = parentDoc?.id || "";
+    if (!collectionName || !conversationId || !grouped[collectionName]) return;
+    grouped[collectionName][conversationId] = grouped[collectionName][conversationId] || [];
+    grouped[collectionName][conversationId].push({ id: docSnap.id, ...docSnap.data() });
+  });
+  Object.entries(grouped.privateMessages).forEach(([conversationId, messages]) => {
+    const childId = messages.find((message) => message.childId)?.childId || conversationId.replace(/^child-/, "");
+    if (!childId) return;
+    data.messages[childId] = mergeMessageArray(data.messages?.[childId], messages.map((message) => ({ ...message, childId })));
+  });
+  Object.entries(grouped.directMessages).forEach(([conversationId, messages]) => {
+    data.directMessageItems[conversationId] = mergeMessageArray(data.directMessageItems?.[conversationId], messages);
+  });
+  Object.entries(grouped.teamMessages).forEach(([conversationId, messages]) => {
+    data.teamMessageItems[conversationId] = mergeMessageArray(data.teamMessageItems?.[conversationId], messages);
+  });
+  Object.entries(grouped.supportRequests).forEach(([requestId, messages]) => {
+    data.supportMessages[requestId] = mergeMessageArray(data.supportMessages?.[requestId], messages);
+  });
+  Object.entries(grouped.studentIssues).forEach(([issueId, messages]) => {
+    data.studentIssueMessages[issueId] = mergeMessageArray(data.studentIssueMessages?.[issueId], messages);
+  });
+}
+
+function mergeDirectMessageEvents(docs = []) {
+  docs.forEach((docSnap) => {
+    const event = { id: docSnap.id, ...docSnap.data() };
+    const conversation = event.conversation || {};
+    const message = event.message || {};
+    const conversationId = event.conversationId || conversation.conversationId || message.conversationId || "";
+    if (!conversationId || !message.id) return;
+    if (isDirectConversationDeletedForCurrentUser(conversationId)) return;
+    const storedConversation = {
+      ...conversation,
+      id: conversation.id || conversationId,
+      conversationId,
+      transportManagerId: conversation.transportManagerId || event.transportManagerId || transportManagerIdForUser(state.user),
+      lastMessage: conversation.lastMessage || message.text || "",
+      lastMessageAt: conversation.lastMessageAt || message.createdAt || event.createdAt || "",
+      updatedAt: conversation.updatedAt || event.updatedAt || message.createdAt || event.createdAt || ""
+    };
+    upsertDirectConversation(storedConversation);
+    data.directMessageItems[conversationId] = mergeMessageArray(data.directMessageItems?.[conversationId], [message]);
+  });
+}
+
+function mergeConversationMessages(collectionName, conversationId, remoteMessages = []) {
+  if (collectionName === "privateMessages") {
+    const childId = remoteMessages.find((message) => message.childId)?.childId || conversationId.replace(/^child-/, "");
+    if (!childId) return;
+    data.messages[childId] = mergeMessageArray(data.messages?.[childId], remoteMessages.map((message) => ({ ...message, childId })));
+    return;
+  }
+  if (collectionName === "directMessages") {
+    if (isDirectConversationDeletedForCurrentUser(conversationId)) {
+      data.directMessageItems[conversationId] = [];
+      return;
+    }
+    if ((data.directMessages || []).some((conversation) => conversation.conversationId === conversationId && conversation.deletedAt)) {
+      data.directMessageItems[conversationId] = [];
+      return;
+    }
+    data.directMessageItems[conversationId] = mergeMessageArray(data.directMessageItems?.[conversationId], remoteMessages);
+    return;
+  }
+  if (collectionName === "teamMessages") {
+    if ((data.teamMessages || []).some((conversation) => conversation.conversationId === conversationId && conversation.deletedAt)) {
+      data.teamMessageItems[conversationId] = [];
+      return;
+    }
+    data.teamMessageItems[conversationId] = mergeMessageArray(data.teamMessageItems?.[conversationId], remoteMessages);
+    return;
+  }
+}
+
+function mergeConversationDocuments(collectionName, docs = []) {
+  const remoteItems = docs
+    .filter((docSnap) => !["__meta__", "_meta"].includes(docSnap.id))
+    .map((docSnap) => ({ id: docSnap.id, conversationId: docSnap.id, ...docSnap.data() }));
+  if (!remoteItems.length) return;
+  if (collectionName === "directMessages") {
+    data.directMessages = mergeRemoteCollection("directMessages", data.directMessages, remoteItems, data)
+      .filter((conversation) => !isDirectConversationDeletedForCurrentUser(conversation.conversationId));
+    remoteItems.filter((item) => item.deletedAt).forEach((item) => { data.directMessageItems[item.conversationId] = []; });
+  }
+  if (collectionName === "teamMessages") {
+    data.teamMessages = mergeRemoteCollection("teamMessages", data.teamMessages, remoteItems, data);
+    remoteItems.filter((item) => item.deletedAt).forEach((item) => { data.teamMessageItems[item.conversationId] = []; });
+  }
+}
+
+function registerConversationMessageListener(db, collectionName, conversationId, onSnapshot, collection) {
+  const key = `${collectionName}:${conversationId}`;
+  if (!conversationId || firestoreMessageUnsubscribeFns.has(key)) return;
+  const unsubscribe = onSnapshot(collection(db, collectionName, conversationId, "messages"), (snapshot) => {
+    firestoreHealth.lastSyncAt = new Date().toISOString();
+    const remoteMessages = snapshot.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() }));
+    mergeConversationMessages(collectionName, conversationId, remoteMessages);
+    saveData();
+    if (state.user) render();
+  }, (error) => {
+    firestoreHealth.errors += 1;
+    console.warn(`Synchronisation messages ${collectionName}/${conversationId} indisponible.`, error);
+  });
+  firestoreMessageUnsubscribeFns.set(key, unsubscribe);
+}
+
+function registerNestedMessageListener(db, collectionName, documentId, onSnapshot, collection) {
+  const key = `${collectionName}:${documentId}`;
+  if (!documentId || firestoreMessageUnsubscribeFns.has(key)) return;
+  const unsubscribe = onSnapshot(collection(db, collectionName, documentId, "messages"), (snapshot) => {
+    firestoreHealth.lastSyncAt = new Date().toISOString();
+    const remoteMessages = snapshot.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() }));
+    if (collectionName === "supportRequests") {
+      data.supportMessages[documentId] = mergeMessageArray(data.supportMessages?.[documentId], remoteMessages);
+    }
+    if (collectionName === "studentIssues") {
+      data.studentIssueMessages[documentId] = mergeMessageArray(data.studentIssueMessages?.[documentId], remoteMessages);
+    }
+    saveData();
+    if (state.user) render();
+  }, (error) => {
+    firestoreHealth.errors += 1;
+    console.warn(`Synchronisation messages ${collectionName}/${documentId} indisponible.`, error);
+  });
+  firestoreMessageUnsubscribeFns.set(key, unsubscribe);
+}
+
+function recordTimestampValue(item = {}) {
+  return new Date(item.updatedAt || item.accessCodeUpdatedAt || item.createdAt || 0).getTime() || 0;
+}
+
+function unstableIdentifierValue(item = {}) {
+  const identifier = item.identifier || item.identifierNumber || item.username || "";
+  return !!identifier && !!item.accessCode && normalizeLoginValue(identifier) === normalizeLoginValue(item.accessCode);
+}
+
+function newerRecord(type, localItem = {}, remoteItem = {}) {
+  const localTime = recordTimestampValue(localItem);
+  const remoteTime = recordTimestampValue(remoteItem);
+  const merged = localTime > remoteTime
+    ? { ...remoteItem, ...localItem }
+    : remoteTime > localTime
+      ? { ...localItem, ...remoteItem }
+      : { ...localItem, ...remoteItem };
+  if (type === "users" && localItem.identifier && (!remoteItem.identifier || unstableIdentifierValue(remoteItem))) {
+    merged.identifier = localItem.identifier;
+    merged.identifierNumber = localItem.identifierNumber || localItem.identifier;
+    merged.username = localItem.username || localItem.identifier;
+  }
+  return merged;
 }
 
 function deletedRecordSet(type, source = null) {
@@ -1885,6 +3093,21 @@ function rememberDeletedRecord(type, id) {
   data.deletedRecords[type] = Array.from(new Set([...(data.deletedRecords[type] || []), id]));
 }
 
+function directConversationDeleteKey(user = state.user) {
+  return `directConversations:${user?.id || "anonymous"}`;
+}
+
+function rememberDeletedDirectConversation(conversationId) {
+  if (!conversationId) return;
+  rememberDeletedRecord(directConversationDeleteKey(), conversationId);
+}
+
+function isDirectConversationDeletedForCurrentUser(conversationId, source = data) {
+  if (!conversationId) return false;
+  return deletedRecordSet(directConversationDeleteKey(), source).has(conversationId)
+    || deletedRecordSet("directConversations", source).has(conversationId);
+}
+
 function currentSession() {
   try {
     return JSON.parse(localStorage.getItem(SESSION_KEY)) || null;
@@ -1893,18 +3116,125 @@ function currentSession() {
   }
 }
 
+function isMobileOrTabletDevice() {
+  const ua = navigator.userAgent || "";
+  const isiPadLike = navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1;
+  const coarsePointer = window.matchMedia?.("(pointer: coarse)")?.matches === true;
+  const compactViewport = window.matchMedia?.("(max-width: 1180px)")?.matches === true;
+  return /Android|iPhone|iPad|iPod|Mobile|Tablet/i.test(ua) || isiPadLike || (coarsePointer && compactViewport);
+}
+
+function persistentMobileSessionEnabled(session = currentSession()) {
+  return !!session?.id && session.supportAssistance !== true && (session.persistentMobile === true || isMobileOrTabletDevice());
+}
+
+function mobileSessionUnlockRequired(session = currentSession()) {
+  if (!persistentMobileSessionEnabled(session)) return false;
+  return Date.now() - Number(session.lastUnlockedAt || session.createdAt || session.lastActivityAt || 0) >= MOBILE_UNLOCK_INTERVAL_MS;
+}
+
+function updateCurrentSession(patch = {}) {
+  const session = currentSession();
+  if (!session?.id) return null;
+  const next = { ...session, ...patch };
+  localStorage.setItem(SESSION_KEY, JSON.stringify(next));
+  return next;
+}
+
+function markSessionUnlocked() {
+  updateCurrentSession({ lastUnlockedAt: Date.now(), lastActivityAt: Date.now(), appLocked: false });
+  state.appLocked = false;
+  state.appUnlockError = "";
+}
+
+function webAuthnBufferFromString(value) {
+  return Uint8Array.from(String(value || ""), (char) => char.charCodeAt(0)).buffer;
+}
+
+function webAuthnCredentialStorageKey() {
+  return `gts-device-unlock-credential-${state.user?.id || "current"}`;
+}
+
+function bufferToBase64Url(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function base64UrlToBuffer(value = "") {
+  const base64 = String(value).replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
+  const binary = atob(base64);
+  return Uint8Array.from(binary, (char) => char.charCodeAt(0)).buffer;
+}
+
+async function unlockWithDeviceAuthenticator() {
+  if (!window.PublicKeyCredential || !navigator.credentials?.create || !navigator.credentials?.get) {
+    throw new Error("Authentification appareil indisponible");
+  }
+  const available = await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable?.();
+  if (available === false) throw new Error("Face ID / Touch ID indisponible");
+  const storedCredentialId = localStorage.getItem(webAuthnCredentialStorageKey());
+  if (storedCredentialId) {
+    await navigator.credentials.get({
+      publicKey: {
+        challenge: crypto.getRandomValues(new Uint8Array(32)),
+        allowCredentials: [{ type: "public-key", id: base64UrlToBuffer(storedCredentialId) }],
+        userVerification: "required",
+        timeout: 60000
+      }
+    });
+    return;
+  }
+  const credential = await navigator.credentials.create({
+    publicKey: {
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      rp: { name: "GTS Connect" },
+      user: {
+        id: webAuthnBufferFromString(state.user?.id || "gts-user"),
+        name: state.user?.identifier || state.user?.identifierNumber || state.user?.email || state.user?.id || "utilisateur",
+        displayName: fullName(state.user) || "Utilisateur GTS"
+      },
+      pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
+      authenticatorSelection: {
+        authenticatorAttachment: "platform",
+        userVerification: "required",
+        residentKey: "discouraged"
+      },
+      timeout: 60000,
+      attestation: "none"
+    }
+  });
+  if (credential?.rawId) localStorage.setItem(webAuthnCredentialStorageKey(), bufferToBase64Url(credential.rawId));
+}
+
+async function unlockWithAppCode(code = "") {
+  const entered = String(code || "").trim();
+  if (!entered) throw new Error("Code obligatoire");
+  const user = state.user || {};
+  const candidates = [user.accessCode, user.temporaryAccessCode].filter(Boolean).map(normalizeLoginValue);
+  if (candidates.includes(normalizeLoginValue(entered))) return;
+  if (user.accessCodeHash || user.passwordHash) {
+    const hashed = await hashSecret(entered);
+    if ([user.accessCodeHash, user.passwordHash].includes(hashed)) return;
+  }
+  throw new Error("Code incorrect");
+}
+
 function getSessionUser() {
   try {
     const session = currentSession();
     if (!session?.id) return null;
     if (session.supportAssistance === true && Number(session.assistanceExpiresAt || 0) <= Date.now()) {
+      const localData = loadData();
+      finishSupportAssistanceSession(session, "expired", localData);
       localStorage.removeItem(SESSION_KEY);
       sessionExpiredMessage = "Accès support temporaire expiré";
       return null;
     }
-    if (!session.lastActivityAt) {
-      localStorage.setItem(SESSION_KEY, JSON.stringify({ ...session, lastActivityAt: Date.now() }));
-    } else if (Date.now() - session.lastActivityAt > SESSION_TIMEOUT_MS) {
+    if (!session.lastActivityAt || (persistentMobileSessionEnabled(session) && !session.lastUnlockedAt)) {
+      localStorage.setItem(SESSION_KEY, JSON.stringify({ ...session, lastActivityAt: Date.now(), lastUnlockedAt: session.lastUnlockedAt || Date.now(), persistentMobile: persistentMobileSessionEnabled(session) }));
+    } else if (!persistentMobileSessionEnabled(session) && Date.now() - session.lastActivityAt > SESSION_TIMEOUT_MS) {
       localStorage.removeItem(SESSION_KEY);
       sessionExpiredMessage = "Session expirée après 2 heures d’inactivité";
       return null;
@@ -1913,17 +3243,55 @@ function getSessionUser() {
     if (session.supportAssistance === true && session.assistanceAccessId) {
       const access = (localData.temporarySupportAccess || []).find((item) => item.id === session.assistanceAccessId);
       if (!access || ["revoked", "expired"].includes(access.status)) {
+        if (access?.status === "expired") finishSupportAssistanceSession(session, "expired", localData);
         localStorage.removeItem(SESSION_KEY);
         sessionExpiredMessage = access?.status === "revoked" ? "Accès support temporaire révoqué" : "Accès support temporaire expiré";
         return null;
       }
     }
     const user = localData.users.find((item) => item.id === session.id) || localData.parents.find((parent) => parent.id === session.id && parent.isActive !== false) || null;
-    if (!user || user.isActive === false || (user.role === "admin" && user.isActive !== true)) return null;
+    if (!user) {
+      const snapshot = session.userSnapshot;
+      if (snapshot?.id === session.id && snapshot.role === session.role) {
+        if (requiresFirstLoginCodeSetup(snapshot)) {
+          pendingFirstLoginSession = { type: snapshot.role === "parent" ? "parents" : "users", id: snapshot.id };
+          localStorage.removeItem(SESSION_KEY);
+          return null;
+        }
+        return snapshot;
+      }
+      return null;
+    }
+    if (user.isActive === false || (user.role === "admin" && user.isActive !== true)) return null;
+    if (requiresFirstLoginCodeSetup(user)) {
+      pendingFirstLoginSession = { type: user.role === "parent" ? "parents" : "users", id: user.id };
+      localStorage.removeItem(SESSION_KEY);
+      return null;
+    }
     return user;
   } catch {
     return null;
   }
+}
+
+function sessionUserSnapshot(user = {}) {
+  return {
+    id: user.id || "",
+    firebaseUid: user.firebaseUid || "",
+    role: user.role || "",
+    firstName: user.firstName || "",
+    lastName: user.lastName || "",
+    companyName: user.companyName || "",
+    visualTheme: user.visualTheme || "",
+    identifier: user.identifier || "",
+    identifierNumber: user.identifierNumber || "",
+    linkedChildrenIds: user.linkedChildrenIds || [],
+    assignedCircuits: user.assignedCircuits || [],
+    assignedVehicleId: user.assignedVehicleId || "",
+    assignedSchool: user.assignedSchool || "",
+    isPrimaryTransportManager: user.isPrimaryTransportManager === true,
+    isActive: user.isActive !== false
+  };
 }
 
 function saveSession(user) {
@@ -1943,7 +3311,12 @@ function saveSession(user) {
     id: user.id,
     role: user.role,
     activeApp: state.activeApp || "",
+    createdAt: previous?.createdAt || Date.now(),
     lastActivityAt: Date.now(),
+    lastUnlockedAt: Date.now(),
+    persistentMobile: isMobileOrTabletDevice(),
+    appLocked: false,
+    userSnapshot: sessionUserSnapshot(user),
     ...assistance
   }));
 }
@@ -1954,6 +3327,7 @@ function saveSupportAssistanceSession(owner, supportUser, access) {
     role: owner.role,
     activeApp: "gts",
     lastActivityAt: Date.now(),
+    userSnapshot: sessionUserSnapshot(owner),
     supportAssistance: true,
     assistanceAccessId: access.id,
     assistanceOwnerId: owner.id,
@@ -1981,10 +3355,115 @@ function supportAssistanceMutationBlocked() {
   return true;
 }
 
+function currentViewSnapshot() {
+  return {
+    screen: state.screen || "dashboard",
+    selectedChildId: state.selectedChildId || "",
+    editingChildId: state.editingChildId || "",
+    selectedType: state.selectedType || "",
+    selectedId: state.selectedId || "",
+    editingType: state.editingType || "",
+    editingId: state.editingId || "",
+    activeFilter: state.activeFilter || null,
+    search: state.search || "",
+    parentChildId: state.parentChildId || "",
+    messagesTab: state.messagesTab || "children",
+    transportGroupTab: state.transportGroupTab || "children",
+    securityGroupTab: state.securityGroupTab || "users",
+    settingsTab: state.settingsTab || "admin",
+    accessCodesTab: state.accessCodesTab || "users",
+    requestsTab: state.requestsTab || "leave",
+    requestsFilter: state.requestsFilter || "all"
+  };
+}
+
+function viewSnapshotKey(snapshot = currentViewSnapshot()) {
+  return JSON.stringify(snapshot);
+}
+
+function rememberCurrentView() {
+  if (!state.user) return;
+  const snapshot = currentViewSnapshot();
+  const stack = state.viewHistory || [];
+  if (stack.length && viewSnapshotKey(stack[stack.length - 1]) === viewSnapshotKey(snapshot)) return;
+  state.viewHistory = [...stack, snapshot].slice(-30);
+}
+
+function restoreViewSnapshot(snapshot = {}) {
+  state.screen = snapshot.screen || "dashboard";
+  state.selectedChildId = snapshot.selectedChildId || "";
+  state.editingChildId = snapshot.editingChildId || "";
+  state.selectedType = snapshot.selectedType || "";
+  state.selectedId = snapshot.selectedId || "";
+  state.editingType = snapshot.editingType || "";
+  state.editingId = snapshot.editingId || "";
+  state.activeFilter = snapshot.activeFilter || null;
+  state.search = snapshot.search || "";
+  state.parentChildId = snapshot.parentChildId || "";
+  state.messagesTab = snapshot.messagesTab || state.messagesTab;
+  state.transportGroupTab = snapshot.transportGroupTab || state.transportGroupTab;
+  state.securityGroupTab = snapshot.securityGroupTab || state.securityGroupTab;
+  state.settingsTab = snapshot.settingsTab || state.settingsTab;
+  state.accessCodesTab = snapshot.accessCodesTab || state.accessCodesTab;
+  state.requestsTab = snapshot.requestsTab || state.requestsTab;
+  state.requestsFilter = snapshot.requestsFilter || state.requestsFilter;
+}
+
+function pageBackButton() {
+  if (!state.user || !canGoBackView()) return "";
+  if (state.screen === "dashboard") return "";
+  if (state.selectedChildId || state.editingChildId || state.selectedType || state.editingType) return "";
+  return `<div class="page-back-row"><button class="secondary-button compact-action" type="button" data-back-view>← Retour</button></div>`;
+}
+
+function canGoBackView() {
+  if ((state.viewHistory || []).length) return true;
+  if (state.editingChildId || state.selectedChildId || state.editingType || state.selectedType || state.editingAccessId || state.selectedSupportRequestId || state.parentRequestChildId || state.parentMedicalChildId) return true;
+  return !!state.user && state.screen !== "dashboard";
+}
+
+function goBackView() {
+  const stack = state.viewHistory || [];
+  const previous = stack.pop();
+  state.viewHistory = stack;
+  if (previous) {
+    restoreViewSnapshot(previous);
+  } else {
+    restoreDefaultBackView();
+  }
+  render();
+}
+
+function restoreDefaultBackView() {
+  state.selectedChildId = "";
+  state.editingChildId = "";
+  state.selectedType = "";
+  state.selectedId = "";
+  state.editingType = "";
+  state.editingId = "";
+  state.editingAccessType = "";
+  state.editingAccessId = "";
+  state.selectedSupportRequestId = "";
+  state.parentRequestChildId = "";
+  state.parentMedicalChildId = "";
+  if (["drivers", "assistants", "vehicles", "schools", "circuits", "children"].includes(state.screen) && isTransportManagerUser()) {
+    state.transportGroupTab = state.screen;
+    state.screen = "transportGroup";
+    return;
+  }
+  if (["users", "loginLogs", "admins", "parentCodes"].includes(state.screen) && isTransportManagerUser()) {
+    state.securityGroupTab = state.screen === "parentCodes" ? "users" : state.screen;
+    state.screen = "securityGroup";
+    return;
+  }
+  resetDashboardContext();
+  state.screen = "dashboard";
+}
+
 function getSessionApp() {
   try {
     const session = JSON.parse(localStorage.getItem(SESSION_KEY));
-    return ["gts", "sncb"].includes(session?.activeApp) ? session.activeApp : "";
+    return session?.activeApp === "gts" ? "gts" : "";
   } catch {
     return "";
   }
@@ -2022,7 +3501,7 @@ function restoreViewState() {
   try {
     const saved = JSON.parse(localStorage.getItem(VIEW_STATE_KEY));
     if (!saved || saved.userId !== state.user.id) return;
-    state.activeApp = isSupportAssistanceSession() ? "gts" : ["gts", "sncb"].includes(saved.activeApp) ? saved.activeApp : state.activeApp;
+    state.activeApp = "gts";
     state.screen = saved.screen || state.screen;
     state.selectedChildId = saved.selectedChildId || "";
     state.selectedType = saved.selectedType || "";
@@ -2040,32 +3519,433 @@ function restoreViewState() {
   }
 }
 
-function canChooseApplication(user = state.user) {
-  return !!user && canAccessSncbApp(user);
-}
-
 function isPrimaryAdminUser(user) {
-  return user?.role === "admin" && (user?.id === "admin" || user?.identifierNumber === "6183");
+  return (user?.role === "admin" || user?.role === "system_admin") && (user?.id === "admin" || user?.identifierNumber === "6183");
 }
 
 function isSpwAccount(user = state.user) {
-  return user?.role === "admin" && user?.visualTheme === "spw";
+  return user?.role === "spw" || (user?.role === "admin" && user?.visualTheme === "spw");
+}
+
+function isSpwLikeAccount(user = {}) {
+  const identifier = normalizeLoginValue([user.identifier, user.identifierNumber, user.username].filter(Boolean)[0] || "");
+  return isSpwAccount(user)
+    || user.id === "admin-spw"
+    || String(user.id || "").startsWith("spw-")
+    || identifier.startsWith("spw");
 }
 
 function isTransportManagerUser(user = state.user) {
-  return user?.role === "admin" && !isPrimaryAdminUser(user) && !isSpwAccount(user);
+  return user?.role === "transport_manager" || (user?.role === "admin" && !isPrimaryAdminUser(user) && !isSpwAccount(user));
+}
+
+function userIdentityIds(user = state.user) {
+  const profile = linkedTransportProfileForUser(user);
+  return [...new Set([user?.id, user?.firebaseUid, user?.profileId, profile?.id, profile?.firebaseUid].filter(Boolean))];
+}
+
+function currentUserIdentityIds() {
+  return userIdentityIds(state.user);
+}
+
+function currentUserInList(values = []) {
+  const ids = currentUserIdentityIds();
+  return Array.isArray(values) && ids.some((id) => values.includes(id));
+}
+
+function personIdentityIds(person = {}) {
+  const linkedUser = linkedUserForTransportPerson(person);
+  return [...new Set([person.id, person.firebaseUid, person.userId, person.profileId, linkedUser?.id, linkedUser?.firebaseUid, linkedUser?.profileId].filter(Boolean))];
+}
+
+function linkedUserForTransportPerson(person = {}) {
+  const role = person.role
+    || ((data.drivers || []).some((driver) => driver.id === person.id) ? "driver" : "")
+    || ((data.assistants || []).some((assistant) => assistant.id === person.id) ? "assistant" : "");
+  if (!role) return null;
+  const users = (data.users || []).filter((user) => user.role === role);
+  return users.find((user) => user.id === person.id || user.firebaseUid === person.firebaseUid)
+    || users.find((user) => normalizePhoneValue(user.phone) && normalizePhoneValue(user.phone) === normalizePhoneValue(person.phone))
+    || users.find((user) => normalizeLoginValue(fullName(user)) && normalizeLoginValue(fullName(user)) === normalizeLoginValue(fullName(person)))
+    || null;
+}
+
+function linkedTransportProfileForUser(user = {}) {
+  if (!["driver", "assistant"].includes(user?.role)) return null;
+  const profiles = user.role === "driver" ? data.drivers || [] : data.assistants || [];
+  return profiles.find((profile) => profile.id === user.profileId || profile.id === user.id || profile.firebaseUid === user.firebaseUid)
+    || profiles.find((profile) => normalizePhoneValue(profile.phone) && normalizePhoneValue(profile.phone) === normalizePhoneValue(user.phone))
+    || profiles.find((profile) => normalizeLoginValue(fullName(profile)) && normalizeLoginValue(fullName(profile)) === normalizeLoginValue(fullName(user)))
+    || null;
+}
+
+function roleMatchesLoginRole(user = {}, loginMode = "") {
+  if (!user) return false;
+  const role = String(loginMode || "").trim();
+  if (!role) return false;
+  if (role === "system_admin") return isPrimaryAdminUser(user);
+  if (role === "transport_manager") return isTransportManagerUser(user);
+  if (role === "spw") return isSpwAccount(user);
+  if (role === "support") return user.role === "support";
+  return user.role === role;
+}
+
+function getUserByUidFromCache(uid, userData = data) {
+  if (!uid) return null;
+  const users = userData?.users || [];
+  const parents = userData?.parents || [];
+  return users.find((user) => user.id === uid && user.isActive !== false)
+    || parents.find((parent) => parent.id === uid && parent.isActive !== false)
+    || null;
+}
+
+async function findUserByFirebaseUid(uid) {
+  const localMatch = getUserByUidFromCache(uid, data);
+  if (localMatch) return localMatch;
+  try {
+    const { db } = await import("./src/firebaseConfig.js");
+    if (!db) return null;
+    const { collection, doc, getDoc, query, where, getDocs } = await import("firebase/firestore");
+    for (const collectionName of ["users", "parents"]) {
+      const directDoc = await getDoc(doc(db, collectionName, uid));
+      if (directDoc.exists()) {
+        const record = { id: directDoc.id, ...directDoc.data() };
+        if (collectionName === "parents") record.role = record.role || "parent";
+        return record;
+      }
+    }
+    devSkippedFirestoreRead("transportManagers", "connexion: les comptes gestionnaires sont lus via users");
+    for (const collectionName of ["users", "parents"]) {
+      const remoteSnapshot = await getDocs(query(collection(db, collectionName), where("firebaseUid", "==", uid)));
+      if (!remoteSnapshot.empty) {
+        const docSnap = remoteSnapshot.docs[0];
+        const record = { id: docSnap.id, ...docSnap.data() };
+        if (collectionName === "parents") record.role = record.role || "parent";
+        return record;
+      }
+    }
+  } catch (error) {
+    console.warn("Erreur récupération compte Firebase.", error);
+  }
+  return null;
+}
+
+async function hydrateSessionFromFirebaseAuth() {
+  try {
+    const { auth } = await import("./src/firebaseConfig.js");
+    if (!auth) return false;
+    const currentFirebaseUser = auth.currentUser;
+    if (!currentFirebaseUser) return false;
+    const account = await findUserByFirebaseUid(currentFirebaseUser.uid);
+    if (!account) return false;
+    const user = upsertAuthenticatedAccount({ user: account, uid: currentFirebaseUser.uid });
+    if (!user) return false;
+    if (requiresFirstLoginCodeSetup(user)) {
+      state.user = null;
+      state.activeApp = "gts";
+      state.firstLoginType = user.role === "parent" ? "parents" : "users";
+      state.firstLoginId = user.id;
+      localStorage.removeItem(SESSION_KEY);
+      return true;
+    }
+    state.user = user;
+    state.activeApp = "gts";
+    applyRequestedScreenFromQuery();
+    saveSession(user);
+    return true;
+  } catch (error) {
+    console.warn("Impossible de restaurer la session Firebase au démarrage.", error);
+    return false;
+  }
+}
+
+function requiresFirstLoginCodeSetup(user = {}) {
+  return user?.isTemporaryCode === true || user?.firstLoginCompleted === false || user?.resetRequired === true;
+}
+
+function transportManagerIdForUser(user = state.user) {
+  if (!user) return "";
+  if (isTransportManagerUser(user)) return user.transportManagerId || user.id || "";
+  return user.transportManagerId || "";
+}
+
+function defaultTransportManagerId(store = data) {
+  const managerUser = (store.users || []).find((user) => isTransportManagerUser(user));
+  return managerUser?.transportManagerId || managerUser?.id || (store.transportManagers || [])[0]?.id || "";
+}
+
+function transportManagerRecordFromUser(user = {}, now = new Date().toISOString()) {
+  const id = user.transportManagerId || user.id;
+  return {
+    id,
+    companyName: user.companyName || user.name || "",
+    firstName: user.firstName || "",
+    lastName: user.lastName || "",
+    phone: user.phone || "",
+    email: user.email || "",
+    identifier: user.identifier || user.identifierNumber || user.username || "",
+    identifierNumber: user.identifierNumber || user.identifier || user.username || "",
+    accessCode: user.temporaryAccessCode || user.accessCode || "",
+    isTemporaryCode: user.isTemporaryCode === true || user.firstLoginCompleted === false || user.resetRequired === true,
+    isActive: user.isActive !== false,
+    createdAt: user.createdAt || now,
+    createdBy: user.createdBy || "system",
+    updatedAt: user.updatedAt || now,
+    updatedBy: user.updatedBy || user.createdBy || "system"
+  };
+}
+
+function ensureTransportManagerRecords(store = data) {
+  store.transportManagers = Array.isArray(store.transportManagers) ? store.transportManagers : [];
+  (store.users || []).forEach((user) => {
+    if (!isTransportManagerUser(user)) return;
+    user.transportManagerId = user.transportManagerId || user.id;
+    const existing = store.transportManagers.find((manager) => manager.id === user.transportManagerId);
+    const managerRecord = transportManagerRecordFromUser(user);
+    if (existing) Object.assign(existing, { ...managerRecord, ...existing, id: user.transportManagerId });
+    else store.transportManagers.push(managerRecord);
+  });
+  return store.transportManagers;
+}
+
+const transportScopedCollections = new Set([
+  "users", "children", "students", "parents", "drivers", "assistants", "vehicles", "schools", "circuits",
+  "parentChangeRequests", "replacementRules", "leaveRequests", "poolTransport", "extraSchoolTransport",
+  "vehicleRepairs", "anomalies", "studentIssues", "studentAbsences", "transportTransfers", "transferDelays",
+  "smsAlerts", "studentMedical", "studentSensitive", "roleAnnouncements", "directMessages", "teamMessages", "accessRequests", "pdfExports"
+]);
+
+function shouldScopeCollectionByTransportManager(type) {
+  return transportScopedCollections.has(firestoreCanonicalCollection(type));
+}
+
+function transportManagerIdForNewRecord(fallbackUser = state.user) {
+  return transportManagerIdForUser(fallbackUser) || defaultTransportManagerId(data);
+}
+
+function applyTransportManagerScopeToRecord(type, record, fallbackUser = state.user) {
+  if (!record || typeof record !== "object") return record;
+  if (!shouldScopeCollectionByTransportManager(type)) return record;
+  if (firestoreCanonicalCollection(type) === "users") {
+    if (isPrimaryAdminUser(record) || record.role === "support") return record;
+    if (isTransportManagerUser(record)) record.transportManagerId = record.transportManagerId || record.id;
+    else record.transportManagerId = record.transportManagerId || transportManagerIdForNewRecord(fallbackUser);
+    return record;
+  }
+  if (!record.transportManagerId) record.transportManagerId = transportManagerIdForNewRecord(fallbackUser);
+  return record;
+}
+
+function recordBelongsToTransportManager(record = {}, managerId = transportManagerIdForUser()) {
+  if (!managerId) return true;
+  return !record.transportManagerId || record.transportManagerId === managerId;
+}
+
+function scopeRecordsForCurrentTransportManager(type, items = []) {
+  const managerId = transportManagerIdForUser();
+  if (!managerId || !shouldScopeCollectionByTransportManager(type)) return items || [];
+  return (items || []).filter((item) => recordBelongsToTransportManager(item, managerId));
+}
+
+function devSkippedFirestoreRead(type, reason = "") {
+  if (typeof import.meta !== "undefined" && import.meta.env?.DEV) {
+    console.debug(`[Firestore] Lecture ignorée: ${type}${reason ? ` - ${reason}` : ""}`);
+  }
+}
+
+function chunkFirestoreInValues(values = [], size = 10) {
+  const clean = uniqueText(values).filter(Boolean);
+  const chunks = [];
+  for (let index = 0; index < clean.length; index += size) chunks.push(clean.slice(index, index + size));
+  return chunks;
+}
+
+function assignedSchoolNamesForCurrentUser() {
+  return uniqueText([
+    state.user?.assignedSchool,
+    ...(Array.isArray(state.user?.assignedSchools) ? state.user.assignedSchools : []),
+    ...String(state.user?.assignedSchool || "").split(",")
+  ].map((value) => String(value || "").trim()).filter(Boolean));
+}
+
+function assignedSchoolNamesFromRecord(record = {}) {
+  return uniqueText([
+    record.schoolName,
+    record.assignedSchool,
+    ...(Array.isArray(record.schoolNames) ? record.schoolNames : []),
+    ...(Array.isArray(record.assignedSchools) ? record.assignedSchools : []),
+    ...String(record.schoolName || "").split(","),
+    ...String(record.assignedSchool || "").split(",")
+  ].map((value) => String(value || "").trim()).filter(Boolean));
+}
+
+function crewScopedFirestoreSources(db, type, collection, query, where, documentId) {
+  if (!["driver", "assistant"].includes(state.user?.role)) return null;
+  const circuitChunks = chunkFirestoreInValues(state.user.assignedCircuits || []);
+  const schoolChunks = chunkFirestoreInValues(assignedSchoolNamesForCurrentUser());
+  const managerId = transportManagerIdForUser(state.user);
+  const sources = [];
+  if (type === "drivers") {
+    if (managerId) sources.push(query(collection(db, type), where("transportManagerId", "==", managerId)));
+    sources.push(query(collection(db, type), where("id", "==", state.user.id)));
+    circuitChunks.forEach((chunk) => sources.push(query(collection(db, type), where("schoolCircuit", "in", chunk))));
+    return sources;
+  }
+  if (type === "assistants") {
+    if (managerId) sources.push(query(collection(db, type), where("transportManagerId", "==", managerId)));
+    if (state.user.role === "assistant") sources.push(query(collection(db, type), where("id", "==", state.user.id)));
+    circuitChunks.forEach((chunk) => sources.push(query(collection(db, type), where("schoolCircuit", "in", chunk))));
+    return sources;
+  }
+  if (type === "parents") {
+    return [collection(db, type)];
+  }
+  if (type === "children" || type === "students") {
+    if (managerId) sources.push(query(collection(db, type), where("transportManagerId", "==", managerId)));
+    if (state.user.role === "driver") sources.push(query(collection(db, type), where("driverId", "==", state.user.id)));
+    if (state.user.role === "driver") sources.push(query(collection(db, type), where("driverIds", "array-contains", state.user.id)));
+    if (state.user.role === "assistant") sources.push(query(collection(db, type), where("assistantId", "==", state.user.id)));
+    circuitChunks.forEach((chunk) => {
+      sources.push(query(collection(db, type), where("circuitNumber", "in", chunk)));
+      sources.push(query(collection(db, type), where("pickupCircuitId", "in", chunk)));
+      sources.push(query(collection(db, type), where("schoolCircuitId", "in", chunk)));
+      sources.push(query(collection(db, type), where("transferSchoolCircuitId", "in", chunk)));
+    });
+    return sources;
+  }
+  if (type === "vehicles") {
+    if (state.user.role === "driver") sources.push(query(collection(db, type), where("driverId", "==", state.user.id)));
+    if (state.user.role === "assistant") sources.push(query(collection(db, type), where("assistantId", "==", state.user.id)));
+    circuitChunks.forEach((chunk) => sources.push(query(collection(db, type), where("circuitId", "in", chunk))));
+    return sources;
+  }
+  if (type === "circuits") {
+    circuitChunks.forEach((chunk) => {
+      sources.push(query(collection(db, type), where("name", "in", chunk)));
+      sources.push(query(collection(db, type), where(documentId(), "in", chunk)));
+    });
+    return sources;
+  }
+  if (type === "schools") {
+    schoolChunks.forEach((chunk) => sources.push(query(collection(db, type), where("name", "in", chunk))));
+    return sources;
+  }
+  return null;
+}
+
+function firestoreCollectionSources(db, type, collection, query, where, documentId, auth) {
+  if (["privateMessages", "teamMessages", "directMessages"].includes(type)) {
+    devSkippedFirestoreRead(type, "lecture globale interdite, requête participants utilisée");
+    return [];
+  }
+  if (["securityLogs", "loginLogs", "connectionLogs"].includes(type)) {
+    if (!isPrimaryAdmin()) {
+      devSkippedFirestoreRead(type, "réservé administrateur système");
+      return [];
+    }
+    return [collection(db, type)];
+  }
+  if (["studentMedical", "studentSensitive"].includes(type)) {
+    if (isSpwAccount()) return [collection(db, type)];
+    if (state.user?.role === "parent") {
+      const sources = currentUserIdentityIds().map((id) => query(collection(db, type), where("parentIds", "array-contains", id)));
+      chunkFirestoreInValues(state.user.linkedChildrenIds || []).forEach((chunk) => {
+        sources.push(query(collection(db, type), where(documentId(), "in", chunk)));
+      });
+      return sources;
+    }
+    if (state.user?.role === "driver") return [query(collection(db, type), where("driverId", "==", state.user.id))];
+    if (state.user?.role === "assistant") return [query(collection(db, type), where("assistantId", "==", state.user.id))];
+    devSkippedFirestoreRead(type, "données élèves sensibles non autorisées pour ce rôle");
+    return [];
+  }
+  if (type === "supportPermissions") {
+    if (isPrimaryAdmin()) return [collection(db, type)];
+    if (isSupport()) return [query(collection(db, type), where("userId", "==", state.user.id))];
+    devSkippedFirestoreRead(type, "permissions support non nécessaires pour ce rôle");
+    return [];
+  }
+  if (type === "supportRequests") {
+    if (isParent()) {
+      devSkippedFirestoreRead(type, "centre support non accessible aux parents");
+      return [];
+    }
+    if (isSupport() || isPrimaryAdmin()) return [collection(db, type)];
+    if (state.user?.id) return [query(collection(db, type), where("userId", "==", state.user.id))];
+    devSkippedFirestoreRead(type, "utilisateur absent");
+    return [];
+  }
+  if (type === "supportReports") {
+    if (isSupport() || isPrimaryAdmin()) return [collection(db, type)];
+    devSkippedFirestoreRead(type, "rapports support réservés au support");
+    return [];
+  }
+  if (type === "notificationPermissions") {
+    if (!state.user?.id) {
+      devSkippedFirestoreRead(type, "utilisateur absent");
+      return [];
+    }
+    return [query(collection(db, type), where("userId", "==", state.user.id))];
+  }
+  if (type === "users") {
+    if (isTransportManagerUser() || isSpwAccount()) {
+      const managerId = transportManagerIdForUser(state.user);
+      if (!managerId) {
+        devSkippedFirestoreRead(type, "transportManagerId absent");
+        return [];
+      }
+      return [query(collection(db, type), where("transportManagerId", "==", managerId))];
+    }
+    if (["driver", "assistant"].includes(state.user?.role)) {
+      return [query(collection(db, type), where("firebaseUid", "==", auth.currentUser.uid))];
+    }
+    if (!isPrimaryAdmin()) return [query(collection(db, type), where("firebaseUid", "==", auth.currentUser.uid))];
+  }
+  const crewSources = crewScopedFirestoreSources(db, type, collection, query, where, documentId);
+  if (crewSources) {
+    if (!crewSources.length) devSkippedFirestoreRead(type, "aucune affectation chauffeur/convoyeuse disponible");
+    return crewSources;
+  }
+  return [collection(db, type)];
+}
+
+function isPrimaryTransportManagerProfile(user = {}) {
+  if (!isTransportManagerUser(user)) return false;
+  const text = normalizeTextSearch([user.companyName, user.firstName, user.lastName, user.name].filter(Boolean).join(" "));
+  return user.isPrimaryTransportManager === true || text.includes("keolis satracom") || (text.includes("keolis") && text.includes("satracom"));
+}
+
+function isLegacyAdminGtsAccount(user = {}) {
+  if (!isTransportManagerUser(user)) return false;
+  const name = normalizeTextSearch([user.firstName, user.lastName, user.companyName, user.name].filter(Boolean).join(" "));
+  const id = normalizeTextSearch(user.id || "");
+  return id === "admin-gts" || id === "gts-admin" || name === "admin gts" || name === "gestionnaire gts";
+}
+
+function isLegacySeedSpwAccount(user = {}) {
+  const name = normalizeTextSearch([user.firstName, user.lastName, user.name].filter(Boolean).join(" "));
+  return user.id === "admin-spw"
+    || (name === "spw transport" && (user.identifierNumber === "2001" || user.identifier === "2001" || user.accessCode === "2001"));
+}
+
+function removeLegacyAdminGtsAccount(store = data) {
+  const users = store.users || [];
+  const managers = users.filter((user) => isTransportManagerUser(user));
+  const legacyIds = new Set(managers.filter(isLegacyAdminGtsAccount).map((user) => user.id));
+  const hasRealManager = managers.some((user) => !legacyIds.has(user.id));
+  if (!legacyIds.size || !hasRealManager) return false;
+  store.users = users.filter((user) => !legacyIds.has(user.id));
+  store.transportManagers = (store.transportManagers || []).filter((manager) => !legacyIds.has(manager.id));
+  legacyIds.forEach((id) => {
+    rememberDeletedRecord("users", id, store);
+    deleteCollectionItemFromFirestore("users", id);
+    deleteCollectionItemFromFirestore("transportManagers", id);
+  });
+  return true;
 }
 
 function canManageAssistantAccounts(user = state.user) {
   return isSpwAccount(user);
-}
-
-function canAccessSncbApp(user = state.user) {
-  if (!user) return false;
-  if (isTransportManagerUser(user)) return true;
-  if (user.role !== "driver") return false;
-  const driver = data.drivers.find((item) => item.id === user.id) || {};
-  return user.hasSncbReplacementAccess === true || driver.hasSncbReplacementAccess === true;
 }
 
 function canAccessRequestsModule() {
@@ -2074,19 +3954,289 @@ function canAccessRequestsModule() {
   return state.user?.role === "driver" || isTransportManagerUser() || isSupport();
 }
 
-function chooseApplication(app) {
-  if (app === "sncb" && !canAccessSncbApp()) return;
-  state.activeApp = app === "sncb" ? "sncb" : "gts";
-  saveSession(state.user);
-  resetViewState();
-  render();
-}
-
 function notificationPreferences() {
   return {
     enabled: state.user?.notificationsEnabled !== false,
     sound: state.user?.notificationSoundEnabled !== false
   };
+}
+
+function devPushLog(message, detail) {
+  if (typeof import.meta !== "undefined" && import.meta.env?.DEV) {
+    if (detail !== undefined) console.debug(`[FCM] ${message}`, detail);
+    else console.debug(`[FCM] ${message}`);
+  }
+}
+
+function currentPushPlatform() {
+  const ua = navigator.userAgent || "";
+  const isStandalone = window.matchMedia?.("(display-mode: standalone)")?.matches || navigator.standalone === true;
+  if (/iPad|iPhone|iPod/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)) {
+    return isStandalone ? "ios-pwa" : "ios-browser";
+  }
+  if (/Android/i.test(ua)) return isStandalone ? "android-pwa" : "android-browser";
+  return isStandalone ? "pwa" : "browser";
+}
+
+function fcmVapidKey() {
+  return import.meta.env?.VITE_FIREBASE_VAPID_KEY || window.GTS_FIREBASE_CONFIG?.vapidKey || "";
+}
+
+function pushSupportedByBrowser() {
+  return "Notification" in window && "serviceWorker" in navigator && "PushManager" in window;
+}
+
+function urlBase64ToUint8Array(base64String) {
+  const padding = "=".repeat((4 - base64String.length % 4) % 4);
+  const base64 = `${base64String}${padding}`.replace(/-/g, "+").replace(/_/g, "/");
+  const rawData = window.atob(base64);
+  return Uint8Array.from([...rawData].map((char) => char.charCodeAt(0)));
+}
+
+function notificationFcmType(notification = {}) {
+  if (notification.type === "delay") return "delay";
+  if (notification.type === "vehicle_out_of_service") return "vehicle_out_of_service";
+  if (notification.type === "parent_request" || notification.type === "access_request") return "parent_request";
+  if (["message", "team_or_private_message", "support_message"].includes(notification.type)) return "message";
+  return notification.type || "general";
+}
+
+function enrichPushNotification(notification = {}) {
+  return {
+    ...notification,
+    fcmType: notification.fcmType || notificationFcmType(notification)
+  };
+}
+
+async function saveFcmTokenToUserProfile(token) {
+  if (!state.user?.id || !token) return;
+  const collectionName = state.user.role === "parent" ? "parents" : "users";
+  const profile = data[collectionName]?.find((item) => item.id === state.user.id);
+  if (!profile) return;
+  const tokenEntry = {
+    token,
+    platform: currentPushPlatform(),
+    userAgent: navigator.userAgent || "",
+    updatedAt: new Date().toISOString()
+  };
+  const existingTokens = Array.isArray(profile.fcmTokens) ? profile.fcmTokens : [];
+  profile.fcmTokens = [tokenEntry, ...existingTokens.filter((item) => item?.token !== token)].slice(0, 5);
+  profile.fcmToken = token;
+  profile.fcmPlatform = tokenEntry.platform;
+  profile.fcmUpdatedAt = tokenEntry.updatedAt;
+  profile.updatedAt = tokenEntry.updatedAt;
+  state.user = profile;
+  saveSession(profile);
+  saveData();
+  await saveUserProfilePatchToFirestore(collectionName, profile.id, {
+    fcmToken: profile.fcmToken,
+    fcmTokens: profile.fcmTokens,
+    fcmPlatform: profile.fcmPlatform,
+    fcmUpdatedAt: profile.fcmUpdatedAt,
+    updatedAt: profile.updatedAt
+  });
+}
+
+async function saveWebPushSubscriptionToUserProfile(subscription) {
+  if (!state.user?.id || !subscription) return;
+  const collectionName = state.user.role === "parent" ? "parents" : "users";
+  const list = data[collectionName] || [];
+  const profile = list.find((item) => item.id === state.user.id) || state.user;
+  const subscriptionJson = subscription.toJSON();
+  const subscriptionEntry = {
+    ...subscriptionJson,
+    platform: currentPushPlatform(),
+    userAgent: navigator.userAgent || "",
+    updatedAt: new Date().toISOString()
+  };
+  const existingSubscriptions = Array.isArray(profile.webPushSubscriptions) ? profile.webPushSubscriptions : [];
+  profile.webPushSubscriptions = [
+    subscriptionEntry,
+    ...existingSubscriptions.filter((item) => item?.endpoint !== subscriptionEntry.endpoint)
+  ].slice(0, 5);
+  profile.webPushUpdatedAt = subscriptionEntry.updatedAt;
+  profile.updatedAt = subscriptionEntry.updatedAt;
+  state.user = profile;
+  if (!list.some((item) => item.id === profile.id)) list.push(profile);
+  saveSession(profile);
+  saveData();
+  await saveUserProfilePatchToFirestore(collectionName, profile.id, {
+    webPushSubscriptions: profile.webPushSubscriptions,
+    webPushUpdatedAt: profile.webPushUpdatedAt,
+    updatedAt: profile.updatedAt
+  });
+}
+
+async function ensureStandardWebPushSubscription(registration) {
+  if (!registration?.pushManager || !WEB_PUSH_VAPID_PUBLIC_KEY) return false;
+  try {
+    const existing = await registration.pushManager.getSubscription();
+    const subscription = existing || await registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(WEB_PUSH_VAPID_PUBLIC_KEY)
+    });
+    await saveWebPushSubscriptionToUserProfile(subscription);
+    devPushLog("abonnement Web Push enregistré", { platform: currentPushPlatform() });
+    return true;
+  } catch (error) {
+    devPushLog("abonnement Web Push impossible", error);
+    return false;
+  }
+}
+
+async function ensureFirebasePushNotificationsFromUserAction() {
+  if (!state.user) return false;
+  if (!pushSupportedByBrowser()) {
+    devPushLog(`notifications push non supportées (${currentPushPlatform()})`);
+    return false;
+  }
+  if (Notification.permission === "denied") {
+    devPushLog("permission notification refusée par le navigateur");
+    return false;
+  }
+  const permission = Notification.permission === "granted" ? "granted" : await Notification.requestPermission();
+  if (permission !== "granted") {
+    devPushLog("permission notification non accordée", permission);
+    return false;
+  }
+  const vapidKey = fcmVapidKey();
+  if (!vapidKey) devPushLog("clé VAPID absente: tentative FCM avec la configuration Firebase par défaut");
+  let standardPushReady = false;
+  try {
+    const registration = await navigator.serviceWorker.register("/firebase-messaging-sw.js");
+    await registration.update?.();
+    if (currentPushPlatform() === "ios-pwa") {
+      standardPushReady = await ensureStandardWebPushSubscription(registration);
+      if (standardPushReady) return true;
+    }
+    const { messagingPromise } = await import("./src/firebaseConfig.js");
+    const messaging = await messagingPromise;
+    if (!messaging) {
+      devPushLog("Firebase Messaging non supporté par ce navigateur");
+      return standardPushReady;
+    }
+    const { getToken, onMessage } = await import("firebase/messaging");
+    const tokenOptions = { serviceWorkerRegistration: registration };
+    if (vapidKey) tokenOptions.vapidKey = vapidKey;
+    const token = await getToken(messaging, tokenOptions);
+    if (!token) {
+      devPushLog("aucun token FCM retourné");
+      return standardPushReady;
+    }
+    await saveFcmTokenToUserProfile(token);
+    if (!window.__gtsFcmForegroundListenerRegistered) {
+      window.__gtsFcmForegroundListenerRegistered = true;
+      onMessage(messaging, (payload) => {
+        devPushLog("notification foreground reçue", payload);
+        const title = payload.notification?.title || payload.data?.title || "Notification";
+        const body = payload.notification?.body || payload.data?.body || "";
+        if (Notification.permission === "granted" && document.visibilityState !== "visible") {
+          registration.showNotification(title, {
+            body,
+            icon: "/assets/icon-192.png",
+            badge: "/assets/icon-192.png",
+            data: payload.data || {}
+          });
+        }
+      });
+    }
+    devPushLog("token FCM enregistré", { platform: currentPushPlatform() });
+    return true;
+  } catch (error) {
+    devPushLog("initialisation FCM impossible", error);
+    return standardPushReady;
+  }
+}
+
+function currentUserNotificationProfile() {
+  if (!state.user?.id) return state.user || {};
+  const collectionName = state.user.role === "parent" ? "parents" : "users";
+  return data[collectionName]?.find((item) => item.id === state.user.id) || state.user || {};
+}
+
+function notificationDiagnosticRows() {
+  const profile = currentUserNotificationProfile();
+  const subscriptions = Array.isArray(profile.webPushSubscriptions) ? profile.webPushSubscriptions : [];
+  const fcmTokens = tokenListForDiagnostic(profile);
+  const latest = state.notificationDiagnostic || {};
+  const test = latest.test || {};
+  return [
+    ["Plateforme", currentPushPlatform()],
+    ["Permission", typeof Notification === "undefined" ? "API absente" : Notification.permission],
+    ["Support navigateur", pushSupportedByBrowser() ? "oui" : "non"],
+    ["Abonnement local", latest.localSubscription === true ? "oui" : latest.localSubscription === false ? "non" : "non vérifié"],
+    ["Endpoint Apple local", latest.localEndpointApple === true ? "oui" : latest.localEndpointApple === false ? "non" : "non vérifié"],
+    ["Abonnements Firestore", String(subscriptions.length)],
+    ["Endpoints Apple Firestore", String(subscriptions.filter((item) => String(item?.endpoint || "").includes("web.push.apple.com")).length)],
+    ["Tokens FCM Firestore", String(fcmTokens.length)],
+    ["Dernier test serveur", test.checkedAt ? `${test.profileCount || 0} profil(s), ${test.appleWebPushSubscriptionCount || 0} Apple Web Push, ${test.fcmTokenCount || 0} FCM` : "aucun"]
+  ];
+}
+
+function tokenListForDiagnostic(profile = {}) {
+  const tokens = [];
+  if (profile.fcmToken) tokens.push(profile.fcmToken);
+  if (Array.isArray(profile.fcmTokens)) {
+    profile.fcmTokens.forEach((entry) => {
+      if (typeof entry === "string") tokens.push(entry);
+      else if (entry?.token) tokens.push(entry.token);
+    });
+  }
+  return [...new Set(tokens.filter(Boolean))];
+}
+
+async function refreshNotificationDiagnostic() {
+  const diagnostic = {
+    checkedAt: new Date().toISOString(),
+    platform: currentPushPlatform(),
+    permission: typeof Notification === "undefined" ? "missing" : Notification.permission,
+    support: pushSupportedByBrowser(),
+    localSubscription: false,
+    localEndpointApple: false
+  };
+  try {
+    if ("serviceWorker" in navigator) {
+      const registration = await navigator.serviceWorker.getRegistration("/firebase-messaging-sw.js")
+        || await navigator.serviceWorker.getRegistration();
+      const subscription = await registration?.pushManager?.getSubscription?.();
+      const endpoint = subscription?.endpoint || "";
+      diagnostic.localSubscription = !!subscription;
+      diagnostic.localEndpointApple = endpoint.includes("web.push.apple.com");
+    }
+  } catch (error) {
+    diagnostic.error = error?.message || String(error);
+  }
+  state.notificationDiagnostic = { ...(state.notificationDiagnostic || {}), ...diagnostic };
+  return diagnostic;
+}
+
+async function runPushNotificationTest() {
+  const ready = await ensureFirebasePushNotificationsFromUserAction();
+  await refreshNotificationDiagnostic();
+  if (!ready) {
+    alert(currentPushPlatform() === "ios-browser"
+      ? "Sur iPhone, ouvrez l’app installée sur l’écran d’accueil avec Safari. Les notifications ne fonctionnent pas depuis Opera ou Safari onglet."
+      : "Les notifications ne sont pas autorisées sur cet appareil ou ce navigateur.");
+    return;
+  }
+  try {
+    const { functions } = await import("./src/firebaseConfig.js");
+    if (!functions) throw new Error("Firebase Functions indisponible.");
+    const { httpsCallable } = await import("firebase/functions");
+    const response = await httpsCallable(functions, "testCurrentUserPush")();
+    const result = { ...(response?.data || {}), checkedAt: new Date().toISOString() };
+    state.notificationDiagnostic = { ...(state.notificationDiagnostic || {}), test: result };
+    const totalTargets = (result.fcmTokenCount || 0) + (result.webPushSubscriptionCount || 0);
+    alert(totalTargets > 0
+      ? `Test envoyé. Profils: ${result.profileCount || 0}. Apple Web Push: ${result.appleWebPushSubscriptionCount || 0}. FCM: ${result.fcmTokenCount || 0}.`
+      : "Aucun abonnement push trouvé pour ce compte. Réactivez les notifications sur cet appareil puis relancez le test.");
+  } catch (error) {
+    state.notificationDiagnostic = {
+      ...(state.notificationDiagnostic || {}),
+      test: { checkedAt: new Date().toISOString(), error: error?.message || String(error) }
+    };
+    alert(`Test notification impossible: ${error?.message || error}`);
+  }
 }
 
 function seenNotificationKeys() {
@@ -2106,6 +4256,54 @@ function saveSeenNotificationKeys(keys) {
   } catch {}
 }
 
+function storedNotificationFor(notificationId) {
+  return (data.notifications || []).find((item) => item.id === notificationId) || null;
+}
+
+function notificationReadByCurrentUser(notification) {
+  if (!state.user?.id || !notification?.id) return false;
+  const stored = storedNotificationFor(notification.id);
+  if (stored) return (stored.readBy || []).includes(state.user.id);
+  return seenNotificationKeys().has(notification.id);
+}
+
+function notificationRecipientRole(user = state.user) {
+  if (!user) return "";
+  if (isTransportManagerUser(user)) return "transport_manager";
+  if (["driver", "assistant"].includes(user.role)) return user.role;
+  return "";
+}
+
+function canReadDelayNotification(notification) {
+  if (!notification || notification.type !== "delay") return false;
+  if (isSupport() || isSpwAccount() || isPrimaryAdmin() || isParent()) return false;
+  const recipientRole = notificationRecipientRole();
+  return !!recipientRole && (notification.recipientRoles || []).includes(recipientRole);
+}
+
+function delayNotificationsForCurrentUser() {
+  if (isSupport() || isSpwAccount() || isPrimaryAdmin() || isParent()) return [];
+  const recipientRole = notificationRecipientRole();
+  if (!["driver", "assistant", "transport_manager"].includes(recipientRole)) return [];
+  const byId = new Map();
+  (data.notifications || [])
+    .filter(canReadDelayNotification)
+    .forEach((notification) => byId.set(notification.entityId || notification.key || notification.id, notification));
+  (data.transferDelays || [])
+    .filter((delay) => delay.status === "active")
+    .forEach((delay) => {
+      const key = delay.id;
+      const existing = byId.get(key) || delayNotificationForId(delay.id);
+      byId.set(key, {
+        ...delayNotificationForTransfer(delay),
+        ...(existing || {}),
+        status: delay.status || "active",
+        readBy: existing?.readBy || []
+      });
+    });
+  return [...byId.values()].filter((notification) => notification.status === "active");
+}
+
 function derivedNotifications() {
   if (!state.user || !notificationPreferences().enabled) return [];
   const notifications = [];
@@ -2116,8 +4314,10 @@ function derivedNotifications() {
     read: false,
     createdAt: item.createdAt || new Date().toISOString(),
     link: item.link || "dashboard",
-    ...item
+    ...enrichPushNotification(item)
   });
+
+  supportAssistanceNotificationsForCurrentUser().forEach(add);
 
   dashboardRecentMessages().filter((message) => message.unread).slice(0, 6).forEach((message) => {
     add({
@@ -2154,6 +4354,16 @@ function derivedNotifications() {
       link: "vehicles"
     });
   });
+
+  delayNotificationsForCurrentUser().forEach((notification) => add({
+    ...notification,
+    key: notification.key || notification.entityId || notification.id,
+    title: notification.title || "Retard signalé",
+    message: notification.message || "Retard transport signalé",
+    icon: notification.icon || "!",
+    createdAt: notification.createdAt,
+    link: notification.link || "transfers"
+  }));
 
   resolvedOutOfServiceVehiclesForCurrentUser().forEach((vehicle) => {
     add({
@@ -2251,9 +4461,43 @@ function derivedNotifications() {
   return notifications.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
 }
 
+function supportAssistanceNotificationsForCurrentUser() {
+  if (!state.user || isSupportAssistanceSession()) return [];
+  return (data.temporarySupportAccess || [])
+    .filter((access) => access.ownerUserId === state.user.id)
+    .flatMap((access) => {
+      const items = [];
+      if (access.status === "used" && access.usedAt) {
+        items.push({
+          type: "support_assistance_connected",
+          key: `${access.id}-${access.usedAt}`,
+          title: "Support connecté",
+          message: `${access.supportUserName || "Le support"} consulte votre interface en assistance.`,
+          icon: "●",
+          createdAt: access.usedAt,
+          link: "settings"
+        });
+      }
+      if (["ended", "expired", "revoked"].includes(access.status)) {
+        const endedAt = access.endedAt || access.revokedAt || access.updatedAt || access.expiresAt;
+        if (endedAt) {
+          items.push({
+            type: "support_assistance_disconnected",
+            key: `${access.id}-${access.status}-${endedAt}`,
+            title: access.status === "revoked" ? "Accès support révoqué" : "Support déconnecté",
+            message: access.status === "expired" ? "La session assistance support a expiré." : "La session assistance support est terminée.",
+            icon: "○",
+            createdAt: endedAt,
+            link: "settings"
+          });
+        }
+      }
+      return items;
+    });
+}
+
 function currentUnreadNotifications() {
-  const seen = seenNotificationKeys();
-  return derivedNotifications().filter((notification) => !seen.has(notification.id));
+  return derivedNotifications().filter((notification) => !notificationReadByCurrentUser(notification));
 }
 
 function notificationToast() {
@@ -2276,7 +4520,10 @@ function sessionLooksValidForHealth() {
   if (!state.user) return true;
   try {
     const session = JSON.parse(localStorage.getItem(SESSION_KEY));
-    return !!session?.user && Date.now() - Number(session.lastActivityAt || 0) <= SESSION_TIMEOUT_MS;
+    const hasSessionUser = session?.id === state.user.id || session?.userSnapshot?.id === state.user.id || session?.user?.id === state.user.id;
+    if (!hasSessionUser) return false;
+    if (persistentMobileSessionEnabled(session)) return !mobileSessionUnlockRequired(session);
+    return Date.now() - Number(session.lastActivityAt || 0) <= SESSION_TIMEOUT_MS;
   } catch {
     return false;
   }
@@ -2302,8 +4549,8 @@ async function runServiceHealthCheck(options = {}) {
     checks.firebase = false;
     checks.firestore = false;
   }
-  const lastSyncMs = firestoreHealth.lastSyncAt ? Date.now() - new Date(firestoreHealth.lastSyncAt).getTime() : Infinity;
-  checks.sync = checks.firestore && firestoreHealth.available && lastSyncMs < 90 * 1000 && firestoreHealth.errors < 8;
+  const blockingConflict = hasBlockingOfflineConflict();
+  checks.sync = checks.firestore && !blockingConflict;
   const elapsed = performance.now() - startedAt;
   let status = "operational";
   let message = "Tous les services fonctionnent normalement";
@@ -2316,24 +4563,137 @@ async function runServiceHealthCheck(options = {}) {
   } else if (!checks.data || !checks.messaging || !checks.session) {
     status = "incident";
     message = "Un service essentiel de l’application est indisponible.";
-  } else if (!checks.sync || elapsed > 2500 || firestoreHealth.errors > 0) {
+  } else if (blockingConflict || !checks.sync || elapsed > 2500) {
     status = "degraded";
-    message = !checks.sync ? "Synchronisation Firestore partielle ou en attente." : "Certaines fonctions peuvent être ralenties.";
+    message = blockingConflict ? "Une donnée locale doit être vérifiée avant synchronisation." : !checks.sync ? "Synchronisation Firestore partielle ou en attente." : "Certaines fonctions peuvent être ralenties.";
+  }
+  if (status === "operational") {
+    firestoreHealth.available = true;
+    firestoreHealth.errors = 0;
+    firestoreHealth.lastSyncAt = now;
   }
   serviceHealth = { status, message, updatedAt: now, checks };
-  data.serviceStatus = { ...seed.serviceStatus, ...(data.serviceStatus || {}), id: "current", lastCheckedAt: now };
+  data.serviceStatus = {
+    ...seed.serviceStatus,
+    ...(data.serviceStatus || {}),
+    id: "current",
+    status,
+    message,
+    autoMode: true,
+    lastCheckedAt: now,
+    updatedAt: now,
+    updatedBy: data.serviceStatus?.updatedBy || "verification"
+  };
   saveData();
+  saveServiceStatusToFirestore(data.serviceStatus);
   if (!options.silent && state.user) render();
   return serviceHealth;
 }
 
 function startServiceHealthMonitoring() {
-  return;
+  const runAutomaticCheck = () => {
+    if (!state.user || (!isPrimaryAdmin() && !isSupport())) return;
+    if (data.serviceStatus?.autoMode === false) return;
+    runServiceHealthCheck({ silent: true }).catch((error) => console.warn("Vérification automatique indisponible.", error));
+  };
+  window.setTimeout(runAutomaticCheck, 5000);
+  window.setInterval(runAutomaticCheck, 5 * 60 * 1000);
+}
+
+function mobileSwipeEnabled() {
+  return window.matchMedia?.("(pointer: coarse)")?.matches || window.innerWidth < 900;
+}
+
+function editableSwipeTarget(target) {
+  return !!target.closest?.("input, textarea, select, button, a, [contenteditable='true'], .signature-pad");
+}
+
+function activeTabButton(selector) {
+  return [...document.querySelectorAll(selector)].find((button) => button.classList.contains("active")) || null;
+}
+
+function clickSiblingTab(selector, direction) {
+  const buttons = [...document.querySelectorAll(selector)].filter((button) => !button.disabled);
+  if (buttons.length < 2) return false;
+  const active = activeTabButton(selector) || buttons[0];
+  const index = buttons.indexOf(active);
+  const nextIndex = index + direction;
+  if (nextIndex < 0 || nextIndex >= buttons.length) return false;
+  buttons[nextIndex].click();
+  return true;
+}
+
+function scrollChildDetailSection(direction) {
+  if (state.screen !== "child") return false;
+  const sections = [...document.querySelectorAll(".child-detail .detail-grid > article")];
+  if (sections.length < 2) return false;
+  const viewportTop = window.scrollY + 120;
+  let index = sections.findIndex((section, sectionIndex) => {
+    const next = sections[sectionIndex + 1];
+    return section.offsetTop <= viewportTop && (!next || next.offsetTop > viewportTop);
+  });
+  if (index < 0) index = 0;
+  const target = sections[Math.max(0, Math.min(sections.length - 1, index + direction))];
+  if (!target || target === sections[index]) return false;
+  target.scrollIntoView({ behavior: "smooth", block: "start" });
+  return true;
+}
+
+function handleMobileSwipe(direction) {
+  if (!mobileSwipeEnabled()) return false;
+  if (state.screen === "messages") {
+    if (direction < 0 && clickSiblingTab("[data-message-tab]", 1)) return true;
+    if (direction > 0 && clickSiblingTab("[data-message-tab]", -1)) return true;
+    if (direction > 0 && (state.messageChildId || state.selectedDirectConversationId || state.selectedTeamConversationId)) {
+      state.messageChildId = "";
+      state.selectedDirectConversationId = "";
+      state.selectedTeamConversationId = "";
+      render();
+      return true;
+    }
+  }
+  if (state.screen === "transportGroup") return clickSiblingTab("[data-transport-group-tab]", direction < 0 ? 1 : -1);
+  if (state.screen === "securityGroup") return clickSiblingTab("[data-security-group-tab]", direction < 0 ? 1 : -1);
+  if (state.screen === "settings") return clickSiblingTab("[data-settings-tab]", direction < 0 ? 1 : -1);
+  if (state.screen === "requests") return clickSiblingTab("[data-requests-tab]", direction < 0 ? 1 : -1);
+  if (state.screen === "users") return clickSiblingTab("[data-access-tab]", direction < 0 ? 1 : -1);
+  if (state.screen === "parentChildren") return clickSiblingTab("[data-parent-child]", direction < 0 ? 1 : -1);
+  return scrollChildDetailSection(direction < 0 ? 1 : -1);
+}
+
+function bindSwipeNavigation() {
+  let startX = 0;
+  let startY = 0;
+  let startTarget = null;
+  document.addEventListener("touchstart", (event) => {
+    if (!mobileSwipeEnabled() || event.touches.length !== 1) return;
+    startTarget = event.target;
+    if (editableSwipeTarget(startTarget)) {
+      startTarget = null;
+      return;
+    }
+    startX = event.touches[0].clientX;
+    startY = event.touches[0].clientY;
+  }, { passive: true });
+  document.addEventListener("touchend", (event) => {
+    if (!startTarget || !mobileSwipeEnabled() || event.changedTouches.length !== 1) return;
+    const dx = event.changedTouches[0].clientX - startX;
+    const dy = event.changedTouches[0].clientY - startY;
+    startTarget = null;
+    if (Math.abs(dx) < 60 || Math.abs(dx) < Math.abs(dy) * 1.35) return;
+    handleMobileSwipe(dx < 0 ? -1 : 1);
+  }, { passive: true });
 }
 
 function currentServiceStatus() {
   const saved = { ...seed.serviceStatus, ...(data.serviceStatus || {}) };
-  const status = { ...saved, autoMode: false };
+  const status = { ...saved };
+  if (isMaintenanceActive()) {
+    status.status = "incident";
+    status.message = currentMaintenanceSchedule().message;
+  } else if (isMaintenancePlanned() && status.status === "operational") {
+    status.message = currentMaintenanceSchedule().message;
+  }
   if (!["operational", "degraded", "incident"].includes(status.status)) status.status = "operational";
   status.message = status.message || serviceStatusMeta(status.status).message;
   status.updatedAt = status.updatedAt || new Date().toISOString();
@@ -2342,36 +4702,84 @@ function currentServiceStatus() {
 
 function serviceStatusMeta(status) {
   return {
-    operational: { label: "Tout fonctionne", short: "Tous les services fonctionnent normalement", message: "Application opérationnelle, synchronisation active, messagerie active.", icon: "●", className: "ok" },
+    operational: { label: "Normal", short: "Tous les services fonctionnent normalement", message: "Application opérationnelle, synchronisation active, messagerie active.", icon: "●", className: "ok" },
     degraded: { label: "Perturbation", short: "Certaines fonctions peuvent être ralenties", message: "Synchronisation partielle ou problème mineur en cours.", icon: "●", className: "warning" },
     incident: { label: "Incident", short: "Un service est actuellement indisponible", message: "Problème important ou maintenance en cours.", icon: "●", className: "danger" }
-  }[status] || { label: "Tout fonctionne", short: "Tous les services fonctionnent normalement", message: "", icon: "●", className: "ok" };
+  }[status] || { label: "Normal", short: "Tous les services fonctionnent normalement", message: "", icon: "●", className: "ok" };
 }
 
 function serviceStatusHeaderBadge() {
   const status = currentServiceStatus();
+  if (status.status === "operational" && !isMaintenancePlanned()) return "";
   const meta = serviceStatusMeta(status.status);
-  return `<span class="service-status-badge ${esc(meta.className)}" title="${esc(status.message)}"><b>${esc(meta.icon)}</b>${esc(meta.label)}</span>`;
+  const schedule = currentMaintenanceSchedule();
+  const label = isMaintenancePlanned() ? "Maintenance prévue" : meta.label;
+  const className = isMaintenancePlanned() ? "warning" : meta.className;
+  return `<span class="service-status-badge ${esc(className)}" title="${esc(status.message)}"><b>${esc(meta.icon)}</b>${esc(label)}</span>`;
 }
 
 function serviceStatusDashboardCard() {
   const status = currentServiceStatus();
+  const schedule = currentMaintenanceSchedule();
+  const showMaintenance = (isMaintenancePlanned() || isMaintenanceActive()) && !maintenanceNoticeAcknowledged(schedule);
+  if (status.status === "operational" && !showMaintenance) return "";
   const meta = serviceStatusMeta(status.status);
-  return `<article class="service-status-card ${esc(meta.className)}">
+  const isActiveMaintenance = showMaintenance && isMaintenanceActive();
+  const className = showMaintenance ? "warning" : meta.className;
+  return `<article class="service-status-card ${esc(className)}">
     <div>
-      <p class="eyebrow">État des services</p>
-      <h3><span>${esc(meta.icon)}</span> ${esc(status.message || meta.short)}</h3>
-      <p>${esc(meta.message)}</p>
+      <p class="eyebrow">${esc(showMaintenance ? "Maintenance" : "État des services")}</p>
+      <h3><span>${esc(meta.icon)}</span> ${esc(showMaintenance ? schedule.title : status.message || meta.short)}</h3>
+      <p>${esc(showMaintenance ? schedule.message : meta.message)}</p>
+      ${showMaintenance ? sectionRows([
+        ["Début", formatDateTime(schedule.startAt)],
+        ["Fin prévue", formatDateTime(schedule.endAt)],
+        ["Accès pendant maintenance", "admin et support uniquement"]
+      ]) : ""}
+      ${showMaintenance ? `<div class="form-actions"><button class="primary-button compact-action" type="button" data-ack-maintenance-notice>J’ai lu</button></div>` : ""}
       <small>${status.autoMode === false ? "Dernière mise à jour" : "Dernière vérification"} : ${esc(formatDateTime(status.lastCheckedAt || status.updatedAt))}</small>
     </div>
-    <b class="badge ${esc(meta.className)}">${esc(meta.label)}</b>
+    <b class="badge ${esc(className)}">${esc(showMaintenance ? (isActiveMaintenance ? "En cours" : "Planifiée") : meta.label)}</b>
   </article>`;
 }
 
+function isoToDateTimeLocal(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "";
+  const pad = (number) => String(number).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function dateTimeLocalToIso(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : "";
+}
+
 function technicalErrorCount() {
+  return Number(firestoreHealth.errors || 0);
+}
+
+function failedLoginCount() {
   const failedLogins = (data.loginLogs || []).filter((log) => log.loginStatus && !["réussie", "reussie"].includes(log.loginStatus)).length;
+  return failedLogins;
+}
+
+function securityAlertCount() {
   const failedSecurity = (data.securityLogs || []).filter((log) => ["failed", "blocked", "error"].includes(log.status)).length;
-  return failedLogins + failedSecurity + Number(firestoreHealth.errors || 0);
+  return failedSecurity;
+}
+
+function supportEmailIssueCount() {
+  const requestFailures = (data.supportRequests || []).filter((request) =>
+    ["failed", "skipped"].includes(request.emailNotificationStatus)
+    || ["failed", "skipped"].includes(request.requesterConfirmationEmailStatus)
+  ).length;
+  const replyFailures = Object.values(data.supportMessages || {}).flat().filter((message) =>
+    ["failed", "skipped"].includes(message.emailToRequesterStatus)
+  ).length;
+  return requestFailures + replyFailures;
 }
 
 function firestoreStatusLabel() {
@@ -2389,7 +4797,10 @@ function primaryAdminDashboard() {
       ${metric("Total convoyeuses", (data.assistants || []).length)}
       ${metric("Total parents", (data.parents || []).length)}
       ${metric("Total circuits", (data.circuits || []).length)}
-      ${metric("Erreurs techniques", technicalErrorCount())}
+      ${metricButton("Erreurs techniques", technicalErrorCount(), "technical-errors")}
+      ${metricButton("Connexions refusées", failedLoginCount(), "failed-logins")}
+      ${metricButton("Alertes sécurité", securityAlertCount(), "security-alerts")}
+      ${metricButton("E-mails support", supportEmailIssueCount(), "support-email-audit")}
     </div>
     <article class="info-card">
       <h3>Statut technique</h3>
@@ -2404,13 +4815,178 @@ function primaryAdminDashboard() {
   </section>`;
 }
 
+function failedLoginLogs() {
+  return [...(data.loginLogs || [])]
+    .filter((log) => log.loginStatus && !["réussie", "reussie"].includes(log.loginStatus))
+    .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+}
+
+function securityAlertLogs() {
+  return [...(data.securityLogs || [])]
+    .filter((log) => ["failed", "blocked", "error"].includes(log.status))
+    .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+}
+
+function monitoringDetailView(type) {
+  if (!isPrimaryAdmin() && !isSupport()) return dashboard();
+  const backScreen = isSupport() ? "systemMonitoring" : "dashboard";
+  const title = {
+    "technical-errors": "Erreurs techniques",
+    "failed-logins": "Connexions refusées",
+    "security-alerts": "Alertes sécurité",
+    "support-email-audit": "E-mails support"
+  }[type] || "Supervision";
+  return `<section class="view-stack">
+    <div class="section-title action-title">
+      <div><p class="eyebrow">Supervision</p><h2>${esc(title)}</h2></div>
+      <button class="secondary-button compact-action" type="button" data-screen="${esc(backScreen)}">Retour</button>
+    </div>
+    ${type === "technical-errors" ? technicalErrorsDetailPanel() : type === "failed-logins" ? failedLoginsDetailPanel() : type === "support-email-audit" ? supportEmailAuditPanel() : securityAlertsDetailPanel()}
+  </section>`;
+}
+
+function technicalErrorsDetailPanel() {
+  return `<article class="info-card">
+    <h3>Détail technique</h3>
+    ${sectionRows([
+      ["Erreurs Firebase / Firestore", technicalErrorCount()],
+      ["Statut Firebase / Firestore", firestoreStatusLabel()],
+      ["Dernière synchronisation", firestoreHealth.lastSyncAt ? formatDateTime(firestoreHealth.lastSyncAt) : "Non synchronisé"],
+      ["Connexion internet", navigator.onLine === false ? "hors ligne" : "en ligne"],
+      ["État service affiché", serviceStatusMeta(currentServiceStatus().status).label]
+    ])}
+    <p class="muted">Ce compteur concerne uniquement les erreurs de synchronisation ou d’accès Firebase / Firestore détectées pendant la session. Les connexions refusées et alertes sécurité sont séparées.</p>
+  </article>`;
+}
+
+function failedLoginsDetailPanel() {
+  const logs = failedLoginLogs().slice(0, 100);
+  return `<article class="info-card">
+    <div class="action-title">
+      <h3>Tentatives refusées</h3>
+      ${logs.length ? `<button class="danger-button compact-action" type="button" id="clear-failed-logins">Effacer connexions refusées</button>` : ""}
+    </div>
+    <div class="quick-list-inner">
+      ${logs.map(monitoringLoginLogRow).join("") || `<p class="muted">Aucune connexion refusée.</p>`}
+    </div>
+  </article>`;
+}
+
+function securityAlertsDetailPanel() {
+  const logs = securityAlertLogs().slice(0, 100);
+  return `<article class="info-card">
+    <h3>Alertes sécurité</h3>
+    <div class="quick-list-inner">
+      ${logs.map(monitoringSecurityLogRow).join("") || `<p class="muted">Aucune alerte sécurité.</p>`}
+    </div>
+  </article>`;
+}
+
+function supportEmailAuditPanel() {
+  const requestIssues = (data.supportRequests || []).filter((request) =>
+    ["failed", "skipped"].includes(request.emailNotificationStatus)
+    || ["failed", "skipped"].includes(request.requesterConfirmationEmailStatus)
+  );
+  const replyIssues = Object.entries(data.supportMessages || {}).flatMap(([requestId, messages]) =>
+    (messages || [])
+      .filter((message) => ["failed", "skipped"].includes(message.emailToRequesterStatus))
+      .map((message) => ({ requestId, message }))
+  );
+  return `<article class="info-card">
+    <h3>Audit e-mails support</h3>
+    ${sectionRows([
+      ["Demandes avec e-mail non envoyé", requestIssues.length],
+      ["Réponses avec e-mail non envoyé", replyIssues.length],
+      ["Destinataire support", "support@gts-connect.be"]
+    ])}
+    <div class="quick-list-inner">
+      ${requestIssues.map((request) => `<div class="message-item">
+        <strong>${esc(supportTicketNumber(request))} - ${esc(request.subject || "Demande support")}</strong>
+        ${sectionRows([
+          ["Notification support", request.emailNotificationStatus || "non renseigné"],
+          ["Confirmation demandeur", request.requesterConfirmationEmailStatus || "non renseigné"],
+          ["Raison", request.emailNotificationReason || request.requesterConfirmationEmailReason || request.emailNotificationError || request.requesterConfirmationEmailError || "Non renseignée"],
+          ["Dernier contrôle", formatDateTime(request.emailNotificationCheckedAt)]
+        ])}
+        <div class="form-actions"><button class="secondary-button compact-action" type="button" data-resend-support-email="${esc(request.id)}" data-resend-support-email-kind="request">Renvoyer e-mails ticket</button></div>
+      </div>`).join("")}
+      ${replyIssues.map(({ requestId, message }) => {
+        const request = (data.supportRequests || []).find((item) => item.id === requestId) || { id: requestId };
+        return `<div class="message-item">
+          <strong>${esc(supportTicketNumber(request))} - réponse non envoyée</strong>
+          ${sectionRows([
+            ["Auteur", message.authorName],
+            ["Statut", message.emailToRequesterStatus || "non renseigné"],
+            ["Raison", message.emailToRequesterReason || message.emailToRequesterError || "Non renseignée"],
+            ["Dernier contrôle", formatDateTime(message.emailToRequesterCheckedAt)]
+          ])}
+          <div class="form-actions"><button class="secondary-button compact-action" type="button" data-resend-support-email="${esc(requestId)}" data-resend-support-message="${esc(message.id)}" data-resend-support-email-kind="reply">Renvoyer réponse</button></div>
+        </div>`;
+      }).join("")}
+      ${!requestIssues.length && !replyIssues.length ? `<p class="muted">Aucune erreur d’e-mail support détectée.</p>` : ""}
+    </div>
+  </article>`;
+}
+
+function monitoringLoginLogRow(log) {
+  return `<div class="message-item">
+    <strong>${esc(isPrimaryAdmin() ? "Connexion utilisateur" : log.userName || "Utilisateur inconnu")}</strong>
+    ${sectionRows([
+      ["Rôle", log.userRoleLabel || roleLabel(log.userRole)],
+      ["Date", formatDateTime(log.createdAt)],
+      ["Appareil", log.deviceInfo],
+      ["Navigateur", browserLabel(log.browserInfo)],
+      ["Statut", log.loginStatus || "refusée"]
+    ])}
+  </div>`;
+}
+
+function monitoringSecurityLogRow(log) {
+  return `<div class="message-item">
+    <strong>${esc(isPrimaryAdmin() ? "Action sécurité" : log.userName || "Compte non identifié")}</strong>
+    ${sectionRows([
+      ["Action", securityActionLabel(log.action)],
+      ["Rôle", roleLabel(log.userRole)],
+      ["Statut", log.status],
+      ["Date", formatDateTime(log.createdAt)],
+      ["Appareil", log.deviceInfo],
+      ["Navigateur", browserLabel(log.browserInfo)]
+    ])}
+  </div>`;
+}
+
+function securityActionLabel(action = "") {
+  return {
+    password_reset_success: "Réinitialisation réussie",
+    password_reset_failed: "Réinitialisation refusée",
+    password_reset_blocked: "Réinitialisation bloquée",
+    first_login_completed: "Première connexion terminée",
+    temporary_code_generated: "Code temporaire généré",
+    access_code_changed: "Code personnel modifié"
+  }[action] || action || "Action non renseignée";
+}
+
+function clearFailedLoginLogs() {
+  if (!isPrimaryAdmin() && !isSupport()) return alert("Action non autorisée.");
+  const logs = failedLoginLogs();
+  if (!logs.length) return;
+  if (!confirm(`Effacer ${logs.length} connexion(s) refusée(s) ? Les connexions réussies restent conservées.`)) return;
+  const ids = new Set(logs.map((log) => log.id).filter(Boolean));
+  data.loginLogs = (data.loginLogs || []).filter((log) => !ids.has(log.id));
+  syncCollectionAliases(data);
+  saveData();
+  ids.forEach((id) => deleteCollectionItemFromFirestore("loginLogs", id));
+  render();
+}
+
 function processNotifications() {
   if (!state.user || !notificationPreferences().enabled) return;
+  syncSeenNotificationsToFirestore();
   const notifications = currentUnreadNotifications();
   const signature = notifications.map((notification) => notification.id).join("|");
   if (!notifications.length || signature === lastNotificationSignature) return;
   lastNotificationSignature = signature;
-  const notification = notifications[0];
+  const notification = enrichPushNotification(notifications[0]);
   data.notifications = data.notifications || [];
   if (!data.notifications.some((item) => item.id === notification.id)) {
     data.notifications.unshift(notification);
@@ -2443,17 +5019,60 @@ function playNotificationSound() {
   } catch {}
 }
 
-function saveNotificationPreference(key, value) {
+async function clearPushRegistrations() {
+  try {
+    const registration = await navigator.serviceWorker?.getRegistration?.("/firebase-messaging-sw.js");
+    const subscription = await registration?.pushManager?.getSubscription?.();
+    await subscription?.unsubscribe?.();
+  } catch (error) {
+    devPushLog("désabonnement Web Push impossible", error);
+  }
+  try {
+    const { messagingPromise } = await import("./src/firebaseConfig.js");
+    const messaging = await messagingPromise;
+    if (!messaging) return;
+    const { deleteToken } = await import("firebase/messaging");
+    await deleteToken(messaging);
+  } catch (error) {
+    devPushLog("suppression token FCM impossible", error);
+  }
+}
+
+async function saveNotificationPreference(key, value) {
   if (!state.user) return;
   const collection = state.user.role === "parent" ? "parents" : "users";
   const record = data[collection].find((item) => item.id === state.user.id);
-  if (!record) return;
-  record[key] = value;
-  record.updatedAt = new Date().toISOString();
-  state.user = record;
-  saveSession(record);
+  const target = record || state.user;
+  target[key] = value;
+  target.updatedAt = new Date().toISOString();
+  const patch = { [key]: value, updatedAt: target.updatedAt };
+  if (key === "notificationsEnabled" && value === false) {
+    await clearPushRegistrations();
+    Object.assign(target, {
+      fcmToken: "",
+      fcmTokens: [],
+      fcmPlatform: "",
+      fcmUpdatedAt: "",
+      webPushSubscriptions: [],
+      webPushUpdatedAt: ""
+    });
+    Object.assign(patch, {
+      fcmToken: "",
+      fcmTokens: [],
+      fcmPlatform: "",
+      fcmUpdatedAt: "",
+      webPushSubscriptions: [],
+      webPushUpdatedAt: ""
+    });
+  }
+  state.user = target;
+  if (record) {
+    const index = data[collection].findIndex((item) => item.id === record.id);
+    if (index >= 0) data[collection][index] = target;
+  }
+  saveSession(target);
   saveData();
-  saveCollectionItemToFirestore(collection, record);
+  await saveUserProfilePatchToFirestore(collection, target.id, patch);
   render();
 }
 
@@ -2462,6 +5081,7 @@ function markCurrentNotificationsSeen() {
   const seen = seenNotificationKeys();
   currentUnreadNotifications().forEach((notification) => {
     seen.add(notification.id);
+    markNotificationReadInFirestore(notification);
     if (notification.type === "replacement_rule" && notification.entityId) {
       acknowledgeReplacementRule(notification.entityId, { silent: true });
     }
@@ -2470,8 +5090,18 @@ function markCurrentNotificationsSeen() {
   lastNotificationSignature = "";
 }
 
+function syncSeenNotificationsToFirestore() {
+  if (!state.user || navigator.onLine === false) return;
+  const seen = seenNotificationKeys();
+  if (!seen.size) return;
+  derivedNotifications()
+    .filter((notification) => seen.has(notification.id) && !storedNotificationFor(notification.id)?.readBy?.includes(state.user.id))
+    .forEach((notification) => markNotificationReadInFirestore(notification));
+}
+
 function updateSessionActivity() {
   if (!state.user) return;
+  if (state.appLocked) return;
   try {
     const session = currentSession();
     if (!session?.id) return;
@@ -2479,7 +5109,14 @@ function updateSessionActivity() {
       expireSession("Accès support temporaire expiré");
       return;
     }
-    localStorage.setItem(SESSION_KEY, JSON.stringify({ ...session, role: state.user.role, activeApp: state.activeApp || session.activeApp || "", lastActivityAt: Date.now() }));
+    localStorage.setItem(SESSION_KEY, JSON.stringify({
+      ...session,
+      role: state.user.role,
+      activeApp: state.activeApp || session.activeApp || "",
+      lastActivityAt: Date.now(),
+      persistentMobile: session.persistentMobile === true || isMobileOrTabletDevice(),
+      userSnapshot: sessionUserSnapshot(state.user)
+    }));
   } catch {}
 }
 
@@ -2492,6 +5129,12 @@ function checkSessionInactivity() {
       expireSession("Accès support temporaire expiré");
       return true;
     }
+    if (mobileSessionUnlockRequired(session)) {
+      state.appLocked = true;
+      renderAppUnlock();
+      return true;
+    }
+    if (persistentMobileSessionEnabled(session)) return false;
     if (Date.now() - (session.lastActivityAt || 0) <= SESSION_TIMEOUT_MS) return false;
     expireSession();
     return true;
@@ -2501,10 +5144,28 @@ function checkSessionInactivity() {
 }
 
 function expireSession(message = "Session expirée après 2 heures d’inactivité") {
+  const session = currentSession();
+  if (session?.supportAssistance === true) {
+    finishSupportAssistanceSession(session, Number(session.assistanceExpiresAt || 0) <= Date.now() ? "expired" : "ended");
+  }
+  signOutFirebaseAuth();
   localStorage.removeItem(SESSION_KEY);
   resetViewState();
   state.user = null;
-  renderLogin(message);
+  if (legalPageForCurrentPath()) render();
+  else renderLogin(message);
+}
+
+async function signOutFirebaseAuth() {
+  try {
+    stopFirestoreRealtimeSync();
+    const { auth } = await import("./src/firebaseConfig.js");
+    if (!auth) return;
+    const { signOut } = await import("firebase/auth");
+    await signOut(auth);
+  } catch (error) {
+    console.warn("Déconnexion Firebase Auth indisponible.", error);
+  }
 }
 
 function esc(value) {
@@ -2525,7 +5186,7 @@ function slugify(value) {
 }
 
 function roleLabel(role) {
-  return { admin: "Gestionnaire de transport", driver: "Chauffeur", assistant: "Convoyeuse", parent: "Parent", support: "Support" }[role] || "Utilisateur";
+  return { admin: "Gestionnaire de transport", transport_manager: "Gestionnaire de transport", spw: "SPW", driver: "Chauffeur", assistant: "Convoyeuse", parent: "Parent", support: "Support" }[role] || "Utilisateur";
 }
 
 function accountRoleLabel(user = {}) {
@@ -2602,19 +5263,36 @@ function visibleChildren() {
   if (isPrimaryAdmin()) return [];
   if (state.user.role === "parent") {
     const linked = new Set(state.user.linkedChildrenIds || []);
-    return data.children.filter((child) => linked.has(child.id) || (child.parentIds || []).includes(state.user.id));
+    return data.children
+      .filter((child) => recordBelongsToTransportManager(child, transportManagerIdForUser(state.user)))
+      .filter((child) => linked.has(child.id) || (child.parentIds || []).includes(state.user.id));
   }
   if (state.user.role === "admin") {
-    if (!state.activeFilter) return data.children;
-    return relatedSetForFilter().children;
+    const items = !state.activeFilter ? data.children : relatedSetForFilter().children;
+    return scopeRecordsForCurrentTransportManager("children", items || []);
   }
-  return data.children.filter((child) => userCanAccessChildByTransport(state.user, child));
+  return data.children
+    .filter((child) => recordBelongsToTransportManager(child, transportManagerIdForUser(state.user)))
+    .filter((child) => userCanAccessChildByTransport(state.user, child));
 }
 
 function userCanAccessChildByTransport(user, child) {
   if (!user || !child) return false;
+  if (!recordBelongsToTransportManager(child, transportManagerIdForUser(user))) return false;
   const allowed = new Set(user.assignedCircuits || []);
-  const childCircuitRefs = [
+  const childCircuitRefs = childCircuitReferences(child);
+  const matchesCircuit = childCircuitRefs.some((ref) => allowed.has(ref));
+  const linkedCircuit = childLinkedCircuits(child).some((circuit) =>
+    (user.role === "driver" && driverIdsFromRecord(circuit).includes(user.id)) ||
+    (user.role === "assistant" && circuit.assistantId === user.id)
+  );
+  const matchesDirectRole = (user.role === "driver" && driverIdsFromRecord(child).includes(user.id))
+    || (user.role === "assistant" && child.assistantId === user.id);
+  return matchesCircuit || linkedCircuit || matchesDirectRole;
+}
+
+function childCircuitReferences(child = {}) {
+  return uniqueText([
     child.circuitNumber,
     child.pickupCircuitId,
     child.schoolCircuitId,
@@ -2622,11 +5300,17 @@ function userCanAccessChildByTransport(user, child) {
     child.returnCircuit,
     childPickupCircuitLabel(child),
     childSchoolCircuitLabel(child)
-  ].filter(Boolean);
-  const matchesCircuit = childCircuitRefs.some((ref) => allowed.has(ref));
-  const matchesDirectRole = (user.role === "driver" && child.driverId === user.id)
-    || (user.role === "assistant" && child.assistantId === user.id);
-  return matchesCircuit || matchesDirectRole;
+  ].filter(Boolean));
+}
+
+function childLinkedCircuits(child = {}) {
+  const refs = childCircuitReferences(child);
+  return scopeRecordsForCurrentTransportManager("circuits", data.circuits || [])
+    .filter((circuit) =>
+      refs.includes(circuit.id) ||
+      refs.includes(circuit.name) ||
+      refs.includes(circuitOptionLabel(circuit))
+    );
 }
 
 function visibleCollection(type) {
@@ -2635,30 +5319,44 @@ function visibleCollection(type) {
   if (isPrimaryAdmin()) return [];
   if (state.user.role === "parent") return [];
   if (state.user.role === "admin") {
-    if (!state.activeFilter) return data[type] || [];
-    return relatedSetForFilter()[type] || [];
+    const items = !state.activeFilter ? (data[type] || []) : (relatedSetForFilter()[type] || []);
+    return withoutDemoRecords(type, scopeRecordsForCurrentTransportManager(type, items));
   }
   const allowed = userCircuitNames();
   const circuits = scopedCircuits();
-  const circuitDrivers = circuits.map((circuit) => driverByRef(circuit.driverId)).filter(Boolean);
+  const circuitDrivers = circuits.flatMap((circuit) => driverIdsFromRecord(circuit).map(driverByRef)).filter(Boolean);
   const circuitDriverIds = new Set(circuitDrivers.map((driver) => driver.id).filter(Boolean));
   const circuitAssistantIds = new Set(circuits.map((circuit) => circuit.assistantId).filter(Boolean));
   const circuitVehicleIds = new Set(circuits.map((circuit) => circuit.vehicleId).filter(Boolean));
-  const circuitSchools = new Set(circuits.map((circuit) => circuit.schoolName).filter(Boolean));
+  const circuitSchoolIds = new Set(circuits.flatMap((circuit) => circuitSelectedSchoolIds(circuit)).filter(Boolean));
+  const circuitSchools = new Set(circuits.flatMap((circuit) => circuitSchoolNames(circuit)).filter(Boolean));
   const childSchools = new Set(visibleChildren().map((child) => child.schoolName));
-  const linkedVehicles = (data.vehicles || []).filter((item) =>
-    circuitVehicleIds.has(item.id) ||
-    allowed.has(item.circuitId) ||
-    item.driverId === state.user.id ||
-    item.assistantId === state.user.id
-  );
+  assignedSchoolNamesFromRecord(state.user).forEach((name) => circuitSchools.add(name));
+  scopeRecordsForCurrentTransportManager("drivers", data.drivers || [])
+    .filter((item) => item.id === state.user.id || driverIdsFromRecord(item).includes(state.user.id) || allowed.has(item.schoolCircuit))
+    .flatMap(assignedSchoolNamesFromRecord)
+    .forEach((name) => circuitSchools.add(name));
+  if (state.user.role === "assistant") {
+    const assistant = scopeRecordsForCurrentTransportManager("assistants", data.assistants || []).find((item) => item.id === state.user.id) || {};
+    assignedSchoolNamesFromRecord(assistant).forEach((name) => circuitSchools.add(name));
+  }
+  const linkedVehicles = (data.vehicles || [])
+    .filter((item) => recordBelongsToTransportManager(item, transportManagerIdForUser(state.user)))
+    .filter((item) =>
+      circuitVehicleIds.has(item.id) ||
+      allowed.has(item.circuitId) ||
+      driverIdsFromRecord(item).includes(state.user.id) ||
+      item.assistantId === state.user.id
+    );
   linkedVehicles.forEach((vehicle) => {
-    const vehicleDriver = driverByRef(vehicle.driverId);
+    const vehicleDriver = driverIdsFromRecord(vehicle).map(driverByRef).find(Boolean);
     if (vehicleDriver) circuitDriverIds.add(vehicleDriver.id);
     if (vehicle.assistantId) circuitAssistantIds.add(vehicle.assistantId);
   });
-  if (type === "drivers") return (data.drivers || []).filter((item) => item.id === state.user.id || circuitDriverIds.has(item.id) || allowed.has(item.schoolCircuit));
-  if (type === "assistants") return (data.assistants || []).filter((item) =>
+  linkedVehicles.flatMap(assignedSchoolNamesFromRecord).forEach((name) => circuitSchools.add(name));
+  if (type === "drivers" && state.user.role === "driver") return scopeRecordsForCurrentTransportManager("drivers", data.drivers || []);
+  if (type === "drivers") return scopeRecordsForCurrentTransportManager("drivers", data.drivers || []).filter((item) => item.id === state.user.id || circuitDriverIds.has(item.id) || allowed.has(item.schoolCircuit));
+  if (type === "assistants") return scopeRecordsForCurrentTransportManager("assistants", data.assistants || []).filter((item) =>
     item.id === state.user.id ||
     circuitAssistantIds.has(item.id) ||
     allowed.has(item.schoolCircuit) ||
@@ -2666,15 +5364,58 @@ function visibleCollection(type) {
   );
   if (type === "circuits") return circuits;
   if (type === "vehicles") return linkedVehicles;
-  if (type === "schools") return (data.schools || []).filter((item) => childSchools.has(item.name) || circuitSchools.has(item.name));
+  if (type === "schools") return scopeRecordsForCurrentTransportManager("schools", data.schools || []).filter((item) => circuitSchoolIds.has(item.id) || childSchools.has(item.name) || circuitSchools.has(item.name));
   return [];
+}
+
+function logDriverAssignmentDiagnostic(context = "") {
+  if (typeof import.meta === "undefined" || !import.meta.env?.DEV || state.user?.role !== "driver") return;
+  const driver = (data.drivers || []).find((item) => item.id === state.user.id) || null;
+  const assignedCircuits = [...userCircuitNames()];
+  const circuits = scopedCircuits();
+  const vehicles = visibleCollection("vehicles");
+  const assistants = visibleCollection("assistants");
+  const schools = visibleCollection("schools");
+  console.debug("[Diagnostic chauffeur] données récupérées", {
+    context,
+    user: state.user,
+    driver,
+    rawCounts: {
+      drivers: (data.drivers || []).length,
+      circuits: (data.circuits || []).length,
+      vehicles: (data.vehicles || []).length,
+      assistants: (data.assistants || []).length,
+      schools: (data.schools || []).length
+    }
+  });
+  console.debug("[Diagnostic chauffeur] IDs trouvés", {
+    context,
+    assignedCircuits,
+    assignedVehicleId: state.user.assignedVehicleId || driver?.vehicleId || "",
+    circuitIds: circuits.map((circuit) => ({ id: circuit.id, name: circuit.name, driverIds: driverIdsFromRecord(circuit), vehicleId: circuit.vehicleId, assistantId: circuit.assistantId })),
+    vehicleIds: vehicles.map((vehicle) => ({ id: vehicle.id, circuitId: vehicle.circuitId, driverIds: driverIdsFromRecord(vehicle), driverId: vehicle.driverId, assistantId: vehicle.assistantId })),
+    assistantIds: assistants.map((assistant) => ({ id: assistant.id, schoolCircuit: assistant.schoolCircuit, assignedCircuits: assistant.assignedCircuits || [] })),
+    schoolIds: schools.map((school) => ({ id: school.id, name: school.name }))
+  });
+  console.debug("[Diagnostic chauffeur] données finales interface", {
+    context,
+    selectedDriver: selectedDashboardDriver(),
+    dashboardSchool: dashboardDriverSchool(),
+    visible: {
+      drivers: visibleCollection("drivers"),
+      circuits,
+      vehicles,
+      assistants,
+      schools
+    }
+  });
 }
 
 function childVisibleFromCurrentContext(childId) {
   const visible = visibleChildren().find((item) => item.id === childId);
   if (visible) return visible;
   if (["driver", "assistant"].includes(state.user?.role)) {
-    return (data.children || []).find((child) => child.id === childId) || null;
+    return (data.children || []).find((child) => child.id === childId && recordBelongsToTransportManager(child, transportManagerIdForUser(state.user))) || null;
   }
   return null;
 }
@@ -2685,7 +5426,14 @@ function userCircuitNames() {
 
 function scopedCircuits() {
   const allowed = userCircuitNames();
-  return (data.circuits || []).filter((circuit) => allowed.has(circuit.name));
+  return (data.circuits || [])
+    .filter((circuit) => recordBelongsToTransportManager(circuit, transportManagerIdForUser(state.user)))
+    .filter((circuit) =>
+      allowed.has(circuit.name) ||
+      allowed.has(circuit.id) ||
+      (state.user?.role === "driver" && driverIdsFromRecord(circuit).includes(state.user.id)) ||
+      (state.user?.role === "assistant" && circuit.assistantId === state.user.id)
+    );
 }
 
 function relatedSetForFilter() {
@@ -2698,7 +5446,7 @@ function relatedSetForFilter() {
   if (filter.type === "children") {
     children = [selected];
   } else if (filter.type === "drivers") {
-    const driverCircuits = data.circuits.filter((circuit) => circuit.driverId === selected.id || circuit.name === selected.schoolCircuit);
+    const driverCircuits = data.circuits.filter((circuit) => driverIdsFromRecord(circuit).includes(selected.id) || circuit.name === selected.schoolCircuit);
     const driverCircuitNames = new Set(driverCircuits.map((circuit) => circuit.name));
     children = data.children.filter((child) => driverCircuitNames.has(child.circuitNumber));
   } else if (filter.type === "assistants") {
@@ -2721,13 +5469,19 @@ function relatedSetForFilter() {
   const schoolNames = new Set(children.map((child) => child.schoolName).filter(Boolean));
   if (filter.type === "schools") schoolNames.add(selected.name);
 
-  const circuits = data.circuits.filter((circuit) => circuitNames.has(circuit.name) || schoolNames.has(circuit.schoolName) || circuit.id === selected.circuitId);
+  const circuits = data.circuits.filter((circuit) =>
+    circuitNames.has(circuit.name) ||
+    schoolNames.has(circuit.schoolName) ||
+    circuit.id === selected.circuitId ||
+    circuitSchoolNames(circuit).some((name) => schoolNames.has(name)) ||
+    (filter.type === "schools" && circuitSelectedSchoolIds(circuit).includes(selected.id))
+  );
   circuits.forEach((circuit) => {
     circuitNames.add(circuit.name);
-    if (circuit.schoolName) schoolNames.add(circuit.schoolName);
+    circuitSchoolNames(circuit).forEach((name) => schoolNames.add(name));
   });
 
-  const driverIds = new Set(circuits.map((circuit) => circuit.driverId).filter(Boolean));
+  const driverIds = new Set(circuits.flatMap((circuit) => driverIdsFromRecord(circuit)).filter(Boolean));
   const assistantIds = new Set(circuits.map((circuit) => circuit.assistantId).filter(Boolean));
   const vehicleIds = new Set(circuits.map((circuit) => circuit.vehicleId).filter(Boolean));
   if (filter.type === "drivers") driverIds.add(selected.id);
@@ -2765,13 +5519,55 @@ function isSupport() {
   return state.user?.role === "support";
 }
 
-function canAccessSupportCenter() {
-  return !!state.user && ["admin", "driver", "assistant", "support"].includes(state.user.role);
+function defaultSupportPermissions() {
+  return {
+    accessSupportCenter: true,
+    accessSystemMonitoring: true,
+    accessConnections: true,
+    accessIncidents: true,
+    accessServiceStatus: true
+  };
 }
 
-function canPrintAccessCard() {
+function supportPermissionsFor(user = state.user) {
+  if (user?.role !== "support") return {};
+  const stored = (data.supportPermissions || []).find((permissions) => permissions.userId === user.id || permissions.id === user.id) || {};
+  return { ...defaultSupportPermissions(), ...(user.supportPermissions || {}), ...stored };
+}
+
+function canAccessSystemMonitoring() {
+  if (isPrimaryAdmin()) return true;
+  if (!isSupport()) return false;
+  return supportPermissionsFor().accessSystemMonitoring !== false;
+}
+
+function canManageSupportAccounts() {
+  return isPrimaryAdmin();
+}
+
+function canAccessSupportCenter() {
+  if (!state.user) return false;
+  if (state.user.role === "support") return supportPermissionsFor().accessSupportCenter !== false;
+  return ["admin", "driver", "assistant"].includes(state.user.role);
+}
+
+function canManageSupportCenter() {
+  return isPrimaryAdmin() || isSupport();
+}
+
+function canPrintAccessCard(person = null) {
   if (isSupportAssistanceSession()) return false;
-  return (isAdmin() && !isPrimaryAdmin()) || isSupport();
+  if (person?.role === "admin" && (isAdmin() || isSupport())) return true;
+  if (isSupport()) return true;
+  if (isPrimaryAdmin()) return person?.role === "admin";
+  return isAdmin() && !isPrimaryAdmin();
+}
+
+function accessPrintButtonForUser(user = {}) {
+  if (user.role === "admin" && (isAdmin() || isSupport())) {
+    return `<button class="secondary-button" type="button" data-print-access-card-type="users" data-print-access-card-id="${esc(user.id)}">Imprimer accès</button>`;
+  }
+  return accessPrintButton("users", user.id);
 }
 
 function parseDateOnly(value) {
@@ -2822,7 +5618,7 @@ function age(birthDate) {
 function updateComputedAgeField() {
   const birthDate = document.querySelector("#child-form [name='birthDate']");
   const computedAge = document.querySelector("#child-form [name='computedAge']");
-  if (birthDate && computedAge) computedAge.value = age(birthDate.value);
+  if (birthDate && computedAge) computedAge.value = birthDate.value ? age(birthDate.value) : "";
 }
 
 async function updateTecStopAutocomplete(input) {
@@ -3276,16 +6072,22 @@ function scheduleCityAutocomplete(input) {
 
 function bindAddressAutocomplete() {
   document.querySelectorAll("[data-address-autocomplete]").forEach((input) => {
+    if (input.dataset.addressAutocompleteBound === "1") return;
+    input.dataset.addressAutocompleteBound = "1";
     input.addEventListener("input", () => scheduleAddressAutocomplete(input));
     input.addEventListener("change", () => applySelectedAddressToForm(input));
     input.addEventListener("blur", () => setTimeout(() => hideAutocompletePanel(input, "[data-address-suggestions]"), 180));
   });
   document.querySelectorAll("[data-postal-code-autocomplete]").forEach((input) => {
+    if (input.dataset.postalCodeAutocompleteBound === "1") return;
+    input.dataset.postalCodeAutocompleteBound = "1";
     input.addEventListener("input", () => schedulePostalCodeAutocomplete(input));
     input.addEventListener("change", () => applySelectedPostalCodeToForm(input));
     input.addEventListener("blur", () => setTimeout(() => hideAutocompletePanel(input, "[data-postal-code-suggestions]"), 180));
   });
   document.querySelectorAll("[data-city-autocomplete]").forEach((input) => {
+    if (input.dataset.cityAutocompleteBound === "1") return;
+    input.dataset.cityAutocompleteBound = "1";
     input.addEventListener("input", () => scheduleCityAutocomplete(input));
     input.addEventListener("change", () => applySelectedCityToForm(input));
     input.addEventListener("blur", () => setTimeout(() => hideAutocompletePanel(input, "[data-city-suggestions]"), 180));
@@ -3355,14 +6157,22 @@ function medicalHelpRows(child) {
     ["Mal des transports", sheet.transportSickness],
     ["Aide à la communication", sheet.communicationHelp],
     ["Communication non verbale", sheet.nonVerbalCommunication],
-    ["Pictogrammes", sheet.pictograms],
-    ["Signes", sheet.signs],
     ["Remarques complémentaires", sheet.careAdviceNotes]
   ];
 }
 
 function medicalHelpSection(child) {
   if (!canSeeMedicalHelpSheet(child)) return "";
+  if (isParent()) {
+    return `<button class="info-card medical-help-action-card" type="button" data-parent-medical-request="${esc(child.id)}">
+      <div class="medical-help-action-head">
+        <h3>Fiche médicale / aide à la prise en charge</h3>
+        <b class="badge ${child.parentMedicalHelpCompletedAt ? "ok" : "warning"}">${child.parentMedicalHelpCompletedAt ? "Complétée" : "À compléter"}</b>
+      </div>
+      ${medicalHelpRows(child).slice(0, 6).map(([label, value]) => `<div class="field-row"><span>${esc(label)}</span><strong>${esc(value || parentT("common.unknown"))}</strong></div>`).join("")}
+      <span class="medical-help-action-link">Ouvrir la fiche médicale</span>
+    </button>`;
+  }
   return section("Fiche médicale / aide à la prise en charge", medicalHelpRows(child));
 }
 
@@ -3381,15 +6191,18 @@ function parentMedicalHelpPrompt(child) {
       <b class="badge warning">À compléter</b>
     </div>
     <p class="muted">Merci de vérifier les informations médicales et d’aide à la prise en charge de ${esc(child.firstName || fullName(child))}.</p>
-    <div class="form-actions"><button class="primary-button compact-action" type="button" data-parent-request="${esc(child.id)}">Compléter maintenant</button></div>
+    <div class="form-actions"><button class="primary-button compact-action" type="button" data-parent-medical-request="${esc(child.id)}">Compléter maintenant</button></div>
   </article>`;
 }
 
 function normalizeAlternatingResidence(child = {}) {
   const residence = child.alternatingResidence || {};
+  const custody = child.alternatingCustody || {};
   return {
     enabled: residence.enabled === true,
     currentWeek: residence.currentWeek || "maman",
+    evenWeekParent: residence.evenWeekParent || custody.evenWeekParent || "Maman",
+    oddWeekParent: residence.oddWeekParent || custody.oddWeekParent || "Papa",
     motherAddress: residence.motherAddress ?? child.homeAddress ?? "",
     motherPostalCode: residence.motherPostalCode ?? child.postalCode ?? "",
     motherCity: residence.motherCity ?? child.city ?? "",
@@ -3442,13 +6255,16 @@ function alternatingResidenceRows(child) {
   if (!residence.enabled) {
     return [["Garde alternée", "Non"], ["Adresse principale", [child.homeAddress, child.postalCode, child.city].filter(Boolean).join(" ")], ["Arrêt principal", child.pickupStop]];
   }
+  const evenParent = residence.evenWeekParent || "Maman";
+  const oddParent = residence.oddWeekParent || "Papa";
   return [
     ["Garde alternée", "Oui"],
-    ["Semaine paire", residence.currentWeek === "papa" ? "Parent référent impair" : "Parent référent pair"],
-    ["Adresse semaine paire", [residence.motherAddress, residence.motherPostalCode, residence.motherCity].filter(Boolean).join(" ")],
-    ["Arrêt semaine paire", residence.motherPickupStop],
-    ["Adresse semaine impaire", [residence.fatherAddress, residence.fatherPostalCode, residence.fatherCity].filter(Boolean).join(" ")],
-    ["Arrêt semaine impaire", residence.fatherPickupStop],
+    ["Semaine paire", `Chez ${evenParent}`],
+    [`Adresse semaine paire - ${evenParent}`, [residence.motherAddress, residence.motherPostalCode, residence.motherCity].filter(Boolean).join(" ")],
+    [`Arrêt semaine paire - ${evenParent}`, residence.motherPickupStop],
+    ["Semaine impaire", `Chez ${oddParent}`],
+    [`Adresse semaine impaire - ${oddParent}`, [residence.fatherAddress, residence.fatherPostalCode, residence.fatherCity].filter(Boolean).join(" ")],
+    [`Arrêt semaine impaire - ${oddParent}`, residence.fatherPickupStop],
     ["Remarques", residence.notes]
   ];
 }
@@ -3463,10 +6279,12 @@ function alternatingResidenceEditFields(child) {
   return `
     <label class="check-field"><input name="alternatingResidence.enabled" type="checkbox" ${residence.enabled ? "checked" : ""}>Enfant une semaine sur deux chez maman / papa</label>
     <label><span>Semaine actuelle</span><select name="alternatingResidence.currentWeek"><option value="maman" ${residence.currentWeek === "maman" ? "selected" : ""}>Semaine paire</option><option value="papa" ${residence.currentWeek === "papa" ? "selected" : ""}>Semaine impaire</option></select></label>
+    <label><span>Parent semaine paire</span><select name="alternatingResidence.evenWeekParent"><option value="Maman" ${residence.evenWeekParent === "Maman" ? "selected" : ""}>Maman</option><option value="Papa" ${residence.evenWeekParent === "Papa" ? "selected" : ""}>Papa</option></select></label>
     ${addressInput("alternatingResidence.motherAddress", "Adresse semaine paire", residence.motherAddress)}
     ${postalCodeInput("alternatingResidence.motherPostalCode", "Code postal semaine paire", residence.motherPostalCode)}
     ${cityInput("alternatingResidence.motherCity", "Localité semaine paire", residence.motherCity)}
     ${tecStopInput("alternatingResidence.motherPickupStop", "Arrêt semaine paire", residence.motherPickupStop)}
+    <label><span>Parent semaine impaire</span><select name="alternatingResidence.oddWeekParent"><option value="Papa" ${residence.oddWeekParent === "Papa" ? "selected" : ""}>Papa</option><option value="Maman" ${residence.oddWeekParent === "Maman" ? "selected" : ""}>Maman</option></select></label>
     ${addressInput("alternatingResidence.fatherAddress", "Adresse semaine impaire", residence.fatherAddress)}
     ${postalCodeInput("alternatingResidence.fatherPostalCode", "Code postal semaine impaire", residence.fatherPostalCode)}
     ${cityInput("alternatingResidence.fatherCity", "Localité semaine impaire", residence.fatherCity)}
@@ -3493,8 +6311,6 @@ function medicalHelpEditFields(child, prefix = "medicalHelpSheet.") {
     ${textArea(`${prefix}transportSickness`, "Mal des transports", sheet.transportSickness)}
     ${textArea(`${prefix}communicationHelp`, "Aide à la communication", sheet.communicationHelp)}
     ${textArea(`${prefix}nonVerbalCommunication`, "Communication non verbale", sheet.nonVerbalCommunication)}
-    ${textArea(`${prefix}pictograms`, "Pictogrammes", sheet.pictograms)}
-    ${textArea(`${prefix}signs`, "Signes", sheet.signs)}
     ${textArea(`${prefix}careAdviceNotes`, "Remarques complémentaires", sheet.careAdviceNotes)}
   `;
 }
@@ -3516,14 +6332,16 @@ function parentMedicalHelpEditFields(child) {
     ${textArea(`${prefix}transportSickness`, "Mal des transports", sheet.transportSickness)}
     ${textArea(`${prefix}communicationHelp`, "Aide à la communication", sheet.communicationHelp)}
     ${textArea(`${prefix}nonVerbalCommunication`, "Communication non verbale", sheet.nonVerbalCommunication)}
-    ${textArea(`${prefix}pictograms`, "Pictogrammes", sheet.pictograms)}
-    ${textArea(`${prefix}signs`, "Signes", sheet.signs)}
     ${textArea(`${prefix}careAdviceNotes`, "Remarques complémentaires", sheet.careAdviceNotes)}
   `;
 }
 
 function logo(compact = false) {
   return `<div class="${compact ? "logo logo-compact" : "logo"}"><img src="${LOGO}" alt="Gestion Transport Scolaire" onerror="this.remove()"></div>`;
+}
+
+function dashboardBrandLogo() {
+  return `<div class="logo logo-compact dashboard-brand-logo"><img src="/assets/gts-bookmark-source.jpg" alt="Gestion Transport Scolaire" onerror="this.remove()"></div>`;
 }
 
 function companyLogo() {
@@ -3535,6 +6353,8 @@ function assistantLogo() {
 }
 
 function roleBrandLogo() {
+  if (state.user?.role === "support") return "";
+  if (state.user?.role === "admin" && !usesSpwIdentity()) return "";
   return usesSpwIdentity() ? assistantLogo() : companyLogo();
 }
 
@@ -3555,26 +6375,294 @@ function appShellClass() {
   return `app-shell ${usesSpwIdentity() ? "assistant-spw-theme" : ""} ${state.mobileMoreOpen ? "mobile-more-is-open" : ""}`;
 }
 
+const LEGAL_PAGES = {
+  "/conditions-generales": {
+    title: "Conditions générales d’utilisation",
+    eyebrow: "Cadre d’utilisation",
+    intro: "Ces conditions encadrent l’utilisation de l’application Gestion Services Mobilité.",
+    sections: [
+      ["Accès personnel", "Chaque utilisateur possède un accès personnel. Le partage d’un code d’accès ou d’un identifiant est interdit."],
+      ["Utilisation autorisée", "Les données consultées dans l’application doivent être utilisées uniquement pour l’organisation du transport scolaire et les missions liées à la sécurité des élèves."],
+      ["Accès non autorisé", "Il est interdit de tenter d’accéder à des données, profils, messages ou fiches qui ne relèvent pas de ses autorisations."],
+      ["Sécurité", "Tout utilisateur doit signaler toute erreur, anomalie, accès inhabituel ou suspicion de consultation non autorisée."],
+      ["Disponibilité", "L’application peut être temporairement indisponible pour maintenance, correction technique ou mise à jour."]
+    ]
+  },
+  "/confidentialite-rgpd": {
+    title: "Politique de confidentialité RGPD",
+    eyebrow: "Protection des données",
+    intro: "Gestion Services Mobilité traite les données nécessaires à l’organisation, à la sécurité, au suivi et au support du transport scolaire. Cette page présente les informations principales liées à la protection des données.",
+    sections: [
+      ["Responsable du traitement", "Le responsable opérationnel indiqué pour l’application est Gestion Services Mobilité. Le contact pour les demandes relatives aux données personnelles est info@gts-connect.be."],
+      ["Données traitées", "L’application peut traiter les données d’identification, coordonnées, rôles, élèves, parents ou responsables, personnes autorisées, circuits, véhicules, écoles, messages, demandes support, notifications, journaux de sécurité et informations médicales strictement utiles à la prise en charge."],
+      ["Données sensibles", "Les données médicales et les informations sensibles SPW sont protégées par des accès limités. Les parents ne voient pas les informations internes réservées au SPW. Les intervenants ne doivent consulter que les informations nécessaires à leur mission."],
+      ["Finalités", "Les données servent à organiser le transport scolaire, sécuriser les trajets, informer les intervenants autorisés, gérer les circuits, traiter les demandes support, assurer la traçabilité et maintenir la sécurité de l’application."],
+      ["Bases légales", "Les traitements reposent sur les bases applicables au transport scolaire et à la sécurité des élèves, à confirmer par le responsable du traitement : mission d’intérêt public, obligation légale, contrat, intérêt légitime ou consentement selon le cas."],
+      ["Accès par rôles", "L’accès aux informations est limité selon le rôle : parent, SPW, transporteur, chauffeur, convoyeuse, support ou administrateur système. Les règles Firestore et l’interface limitent les données visibles selon le périmètre autorisé."],
+      ["Sous-traitants techniques", "L’application utilise Firebase Hosting, Firebase Authentication, Cloud Firestore et Google Cloud Platform pour l’hébergement, l’authentification et le stockage des données."],
+      ["Conservation", "Les données sont conservées uniquement pendant la durée nécessaire aux finalités du transport, du support, de la sécurité et des obligations applicables. Les fiches médicales doivent être révisées régulièrement, notamment à chaque année scolaire."],
+      ["Sécurité", "L’application utilise des droits par rôle, des règles Firestore, le masquage des données sensibles en assistance support, des journaux de sécurité, une séparation des données médicales et sensibles, et une synchronisation locale contrôlée."],
+      ["Droits RGPD", "Vous pouvez demander l’accès, la rectification, la limitation ou la suppression des données vous concernant, selon les obligations applicables. Certaines suppressions peuvent être refusées ou différées lorsqu’une obligation légale ou de sécurité impose la conservation."],
+      ["Incident de sécurité", "Toute suspicion d’accès non autorisé, erreur d’affichage, perte ou fuite de données doit être signalée rapidement afin de bloquer l’accès, évaluer le risque et appliquer la procédure de notification si nécessaire."],
+      ["Contact", "Pour toute demande relative aux données personnelles : info@gts-connect.be."]
+    ]
+  },
+  "/mentions-legales": {
+    title: "Mentions légales",
+    eyebrow: "Informations éditeur",
+    intro: "Informations légales de l’application Gestion Services Mobilité.",
+    sections: [
+      ["Éditeur", "Gestion Services Mobilité"],
+      ["Responsable", "Jérémy Bailly"],
+      ["Email contact", "info@gts-connect.be"],
+      ["Hébergement", "Firebase Hosting - Google Cloud Platform"]
+    ]
+  }
+};
+
+function legalPageForCurrentPath() {
+  const path = window.location.pathname.replace(/\/+$/, "") || "/";
+  return LEGAL_PAGES[path] ? path : "";
+}
+
+function legalLinksInline() {
+  return `<nav class="legal-links-inline" aria-label="Pages légales">
+    <a href="/conditions-generales">Conditions générales</a>
+    <a href="/confidentialite-rgpd">Confidentialité RGPD</a>
+    <a href="/mentions-legales">Mentions légales</a>
+  </nav>`;
+}
+
+function legalLinksPanel() {
+  return `<article class="info-card legal-links-card">
+    <h3>Pages légales</h3>
+    ${legalLinksInline()}
+  </article>`;
+}
+
+function renderLegalPage(route = legalPageForCurrentPath()) {
+  const page = LEGAL_PAGES[route] || LEGAL_PAGES["/mentions-legales"];
+  document.getElementById("root").innerHTML = `<main class="legal-page">
+    <section class="legal-document">
+      <button class="secondary-button compact-action" type="button" id="legal-back-button">← Retour</button>
+      <p class="eyebrow">${esc(page.eyebrow)}</p>
+      <h1>${esc(page.title)}</h1>
+      <p class="legal-intro">${esc(page.intro)}</p>
+      <div class="legal-section-list">
+        ${page.sections.map(([title, text]) => `<article>
+          <h2>${esc(title)}</h2>
+          <p>${esc(text)}</p>
+        </article>`).join("")}
+      </div>
+      ${legalLinksInline()}
+    </section>
+  </main>`;
+  document.getElementById("legal-back-button")?.addEventListener("click", () => {
+    if (window.history.length > 1) {
+      window.history.back();
+      return;
+    }
+    window.history.pushState({}, "", state.user ? "/app" : "/");
+    render();
+  });
+}
+
+const USER_NOTICE = {
+  common: {
+    title: "Règles communes",
+    intro: "Ces règles s'appliquent à tous les utilisateurs de l'application.",
+    sections: [
+      ["Accès personnel", ["Utiliser uniquement son identifiant et son code personnel.", "Ne jamais partager son code d'accès.", "Définir son accès personnel si l'application le demande après une première connexion."]],
+      ["Bon usage", ["Vérifier les informations avant d'enregistrer une modification.", "Ne consulter que les informations nécessaires à sa mission ou à son enfant.", "Signaler toute erreur, anomalie ou accès inhabituel via le Centre Support."]]
+    ]
+  },
+  parent: {
+    title: "Notice parent",
+    intro: "Le parent utilise l'application pour suivre le transport de son ou ses enfant(s), compléter la fiche médicale et contacter le support.",
+    sections: [
+      ["Connexion", ["Choisir l'accès parent.", "Entrer l'identifiant ou le code fourni.", "Finaliser la première connexion si un code temporaire est demandé."]],
+      ["Accueil", ["Consulter les enfant(s) liés au compte.", "Vérifier le circuit, l'école, le véhicule, le chauffeur et la convoyeuse si ces informations sont renseignées.", "Suivre les messages, alertes et demandes support en cours."]],
+      ["Enfant(s)", ["Consulter la fiche de l'enfant.", "Compléter ou modifier la fiche médicale / aide à la prise en charge.", "Consulter les personnes responsables et personnes autorisées si elles sont renseignées.", "Les informations internes SPW sensibles ne sont pas affichées au parent."]],
+      ["Fiche médicale", ["Renseigner les allergies, affections, consignes et besoins utiles à la sécurité pendant le transport.", "Après enregistrement, la fiche reste modifiable si une information change."]],
+      ["Messages et support", ["Utiliser les messages uniquement pour le transport scolaire.", "Créer une demande dans le Centre Support en cas de problème.", "Le demandeur reçoit une confirmation e-mail, un numéro de ticket et les réponses du support par e-mail."]]
+    ]
+  },
+  transport: {
+    title: "Notice transporteur",
+    intro: "Le transporteur ou gestionnaire transport utilise l'application pour organiser les données opérationnelles et suivre les accès.",
+    sections: [
+      ["Connexion", ["Choisir l'accès transporteur / gestionnaire transport.", "Entrer l'identifiant et le code d'accès.", "Vérifier que le tableau de bord affiche les données de l'organisation."]],
+      ["Tableau de bord", ["Suivre les véhicules hors service ou en retard.", "Vérifier les chauffeurs, élèves, alertes et conflits de données.", "Utiliser les raccourcis vers les modules de gestion."]],
+      ["Gestion transport", ["Gérer ou consulter chauffeurs, convoyeuses, véhicules, écoles et circuits selon les droits du compte.", "Vérifier les affectations chauffeur / convoyeuse / véhicule.", "Tenir les informations de service à jour."]],
+      ["Élèves et transferts", ["Consulter uniquement les informations nécessaires à l'organisation du trajet.", "Vérifier lieu, horaire, véhicule, chauffeur, convoyeuse et élèves pour les transferts.", "Ne pas utiliser les informations sensibles réservées au SPW hors autorisation."]],
+      ["Accès & sécurité", ["Désactiver les comptes inutilisés.", "Remplacer les codes temporaires.", "Vérifier les rôles affectés.", "Ne pas créer de compte partagé."]]
+    ]
+  },
+  driver: {
+    title: "Notice chauffeur",
+    intro: "Le chauffeur utilise l'application pour consulter son service, ses élèves, ses messages et les transferts qui le concernent.",
+    sections: [
+      ["Connexion", ["Choisir l'accès chauffeur.", "Entrer l'identifiant et le code fournis."]],
+      ["Accueil", ["Vérifier le véhicule ou circuit associé.", "Consulter l'école, la convoyeuse associée, le nombre d'élèves et les alertes importantes."]],
+      ["Élèves", ["Consulter les élèves liés au circuit ou véhicule.", "Vérifier identité, école, circuit, arrêt ou prise en charge si renseigné.", "Lire les consignes nécessaires au transport et la fiche médicale utile à la sécurité selon les droits."]],
+      ["Messages", ["Signaler les informations importantes liées au transport.", "Éviter les messages personnels.", "Ne pas transmettre d'informations sensibles hors application."]],
+      ["Transferts", ["Vérifier le lieu de transfert, l'horaire, les élèves concernés et le véhicule ou circuit prévu."]]
+    ]
+  },
+  assistant: {
+    title: "Notice convoyeuse",
+    intro: "La convoyeuse utilise l'application pour consulter les informations utiles à l'accompagnement des élèves.",
+    sections: [
+      ["Connexion", ["Choisir l'accès convoyeuse.", "Entrer l'identifiant et le code fournis."]],
+      ["Accueil", ["Vérifier le circuit, le chauffeur associé, le véhicule, l'école et les élèves liés.", "Lire les alertes ou consignes importantes avant le trajet."]],
+      ["Élèves", ["Consulter les élèves de son périmètre.", "Vérifier les consignes de prise en charge, besoins particuliers et informations médicales nécessaires à l'accompagnement.", "Consulter les personnes responsables ou autorisées si elles sont affichées."]],
+      ["Messages", ["Communiquer uniquement sur les sujets liés au trajet et à l'accompagnement des élèves."]],
+      ["Transferts", ["Vérifier les changements, lieux de prise en charge, horaires et élèves concernés."]]
+    ]
+  },
+  spw: {
+    title: "Notice SPW",
+    intro: "Le SPW utilise l'application pour suivre les élèves, les données transport et les informations sensibles réservées aux comptes autorisés.",
+    sections: [
+      ["Connexion", ["Choisir l'accès SPW.", "Entrer l'identifiant et le code d'accès."]],
+      ["Tableau de bord", ["Suivre élèves, transport, messages, transferts, alertes, anomalies et données à vérifier."]],
+      ["Élèves", ["Consulter les fiches élèves selon les droits du compte.", "Accéder aux informations nécessaires au suivi administratif et à la sécurité."]],
+      ["Informations sensibles", ["Ne renseigner que les informations nécessaires.", "Ne pas copier ces données hors application sans base autorisée.", "Ne pas communiquer aux parents les informations réservées au SPW.", "Signaler toute erreur d'affichage."]],
+      ["Support", ["Créer une demande support en cas de bug, conflit de données ou besoin d'assistance.", "Indiquer le rôle utilisé, l'élève ou circuit concerné, l'écran et une description courte du problème."]]
+    ]
+  },
+  support: {
+    title: "Notice support",
+    intro: "Le support utilise l'application pour suivre les tickets, répondre aux demandeurs et vérifier les incidents techniques.",
+    sections: [
+      ["Tickets", ["Traiter les demandes depuis le Centre Support.", "Utiliser le numéro de ticket pour suivre les échanges.", "Mettre à jour le statut, la priorité, l'assignation et les notes internes."]],
+      ["E-mails", ["Les demandes support sont envoyées à support@gts-connect.be.", "Le demandeur reçoit une confirmation et les réponses par e-mail.", "Relancer manuellement un e-mail si son statut est en échec."]],
+      ["Confidentialité", ["L'assistance temporaire masque les données sensibles.", "Ne consulter que les informations nécessaires à la résolution du problème."]]
+    ]
+  }
+};
+
+function noticeRoleKey() {
+  if (isParent()) return "parent";
+  if (state.user?.role === "driver") return "driver";
+  if (state.user?.role === "assistant") return "assistant";
+  if (isSpwAccount()) return "spw";
+  if (isSupport()) return "support";
+  if (isTransportManagerUser()) return "transport";
+  return "transport";
+}
+
+function noticeSectionCard(section) {
+  return `<article class="info-card notice-section-card">
+    <h3>${esc(section[0])}</h3>
+    <ul class="notice-list">${section[1].map((item) => `<li>${esc(item)}</li>`).join("")}</ul>
+  </article>`;
+}
+
+function noticeBlock(block) {
+  return `<section class="notice-block">
+    <div class="section-title"><p class="eyebrow">Notice utilisateur</p><h2>${esc(block.title)}</h2></div>
+    <article class="info-card"><p>${esc(block.intro)}</p></article>
+    <div class="notice-grid">${block.sections.map(noticeSectionCard).join("")}</div>
+  </section>`;
+}
+
+function userNoticeView() {
+  const roleBlock = USER_NOTICE[noticeRoleKey()] || USER_NOTICE.transport;
+  return `<section class="view-stack user-notice-view">
+    <div class="section-title"><p class="eyebrow">Aide</p><h2>Notice utilisateur</h2></div>
+    <article class="notice-card">
+      <p><strong>Application</strong><br>GTS Connect - https://gestion-transport-scolaire.web.app</p>
+      <p>Support : support@gts-connect.be<br>Données personnelles / RGPD : info@gts-connect.be</p>
+    </article>
+    ${noticeBlock(USER_NOTICE.common)}
+    ${noticeBlock(roleBlock)}
+  </section>`;
+}
+
+function renderAppUnlock() {
+  document.getElementById("root").innerHTML = `<main class="premium-login-screen app-unlock-screen">
+    <section class="premium-login-panel app-unlock-panel">
+      <button class="premium-lock-icon login-brand-logo" type="button" aria-label="Application verrouillée">${logo()}</button>
+      <div class="login-copy">
+        <p class="eyebrow">Sécurité</p>
+        <h1>Déverrouiller l’app</h1>
+        <p>Votre session reste connectée. Pour continuer, déverrouillez l’app avec Face ID, Touch ID, empreinte ou le code de l’appareil si le navigateur le propose.</p>
+      </div>
+      ${state.appUnlockError ? `<p class="notice-card danger">${esc(state.appUnlockError)}</p>` : ""}
+      <div class="form-actions">
+        <button class="primary-button compact-action" type="button" id="device-unlock-button">Déverrouiller avec l’appareil</button>
+      </div>
+      <form class="login-form app-unlock-code-form" id="app-unlock-code-form">
+        <label class="screen-reader-label" for="app-unlock-code">Code GTS</label>
+        <div class="login-input-shell">
+          <span aria-hidden="true">▣</span>
+          <input id="app-unlock-code" type="password" inputmode="numeric" autocomplete="current-password" placeholder="Code GTS en secours">
+        </div>
+        <button class="secondary-button compact-action" type="submit">Déverrouiller avec le code GTS</button>
+      </form>
+      <button class="link-button" type="button" id="app-unlock-logout">Se déconnecter</button>
+    </section>
+  </main>`;
+  document.getElementById("device-unlock-button")?.addEventListener("click", async () => {
+    try {
+      await unlockWithDeviceAuthenticator();
+      markSessionUnlocked();
+      render();
+    } catch (error) {
+      state.appUnlockError = error?.message || "Déverrouillage appareil indisponible";
+      renderAppUnlock();
+    }
+  });
+  document.getElementById("app-unlock-code-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      await unlockWithAppCode(document.getElementById("app-unlock-code")?.value || "");
+      markSessionUnlocked();
+      render();
+    } catch (error) {
+      state.appUnlockError = error?.message || "Code incorrect";
+      renderAppUnlock();
+    }
+  });
+  document.getElementById("app-unlock-logout")?.addEventListener("click", logout);
+}
+
 function render() {
   try {
     applyParentLanguageDirection();
+    const legalRoute = legalPageForCurrentPath();
+    if (legalRoute) {
+      renderLegalPage(legalRoute);
+      return;
+    }
+    if (state.firstLoginId) {
+      return renderLogin();
+    }
     if (!state.user) {
       return renderLogin();
     }
-    if (!isSupportAssistanceSession() && canChooseApplication() && !state.activeApp) {
-      return renderApplicationSelector();
+    if (mobileSessionUnlockRequired() || state.appLocked) {
+      state.appLocked = true;
+      return renderAppUnlock();
     }
-    if (state.activeApp === "sncb") {
-      if (!canAccessSncbApp()) {
-        state.activeApp = "gts";
-        saveSession(state.user);
-        return renderApp();
-      }
-      renderSncbApp();
-      saveViewState();
-      return;
+    if (isMaintenanceActive() && !canAccessDuringMaintenance(state.user)) {
+      signOutFirebaseAuth();
+      localStorage.removeItem(SESSION_KEY);
+      resetViewState();
+      state.user = null;
+      return renderLogin(maintenanceAccessMessage());
     }
+    if (requiresFirstLoginCodeSetup(state.user)) {
+      state.firstLoginType = state.user.role === "parent" ? "parents" : "users";
+      state.firstLoginId = state.user.id;
+      state.user = null;
+      localStorage.removeItem(SESSION_KEY);
+      return renderLogin();
+    }
+    state.activeApp = "gts";
     renderApp();
+    updateDashboardClocks();
     saveViewState();
     processNotifications();
   } catch (error) {
@@ -3609,7 +6697,7 @@ function goToAppRoute() {
 }
 
 window.addEventListener("popstate", () => {
-  if (!state.user) render();
+  render();
 });
 
 function renderLanding() {
@@ -3731,73 +6819,6 @@ function renderLanding() {
   });
 }
 
-function renderApplicationSelector() {
-  const sncbAllowed = canAccessSncbApp();
-  document.getElementById("root").innerHTML = `<main class="app-selector-screen">
-    <section class="app-selector-panel">
-      ${logo(true)}
-      <div class="section-title"><p class="eyebrow">Session ouverte</p><h1>Choisir une application</h1><p class="muted">${esc(fullName(state.user))} - ${esc(accountRoleLabel(state.user))}</p></div>
-      <div class="app-choice-grid">
-        <article class="app-choice-card">
-          <span class="app-choice-icon">🚌</span>
-          <h2>Gestion Transport Scolaire</h2>
-          <p>Gestion des élèves, circuits, écoles, messages et véhicules.</p>
-          <button class="primary-button" type="button" data-choose-app="gts">Ouvrir</button>
-        </article>
-        <article class="app-choice-card ${sncbAllowed ? "" : "is-disabled"}">
-          <span class="app-choice-icon">🚍</span>
-          <div class="app-choice-title"><h2>Bus de remplacement SNCB</h2>${sncbAllowed ? "" : `<b class="badge danger">Accès non autorisé</b>`}</div>
-          <p>Gestion des services de remplacement SNCB.</p>
-          <button class="${sncbAllowed ? "primary-button" : "secondary-button"}" type="button" data-choose-app="sncb" ${sncbAllowed ? "" : "disabled"}>Ouvrir</button>
-        </article>
-      </div>
-      <button class="secondary-button" id="logout-button" type="button">Se déconnecter</button>
-    </section>
-  </main>`;
-  bindEvents();
-}
-
-function renderSncbApp() {
-  document.getElementById("root").innerHTML = `<div class="app-shell sncb-shell">
-    <aside class="sidebar">
-      <div class="sidebar-head">${companyLogo()}</div>
-      <div class="user-pill"><span>●</span><span>${esc(fullName(state.user))}</span></div>
-      <nav>
-        <button class="nav-item active" type="button">Tableau de bord</button>
-        <button class="nav-item" type="button" data-open-gts-app>GTS</button>
-        ${["Services", "Véhicules", "Chauffeurs", "Messages", "Réglages"].map((label) => `<button class="nav-item" type="button">${esc(label)}</button>`).join("")}
-      </nav>
-    </aside>
-    <div class="main-area">
-      <header class="topbar">
-          <div class="topbar-title"><div><strong>Bus de remplacement SNCB</strong></div></div>
-        <div class="topbar-actions">
-          ${offlineStatusBadge()}
-          ${serviceStatusHeaderBadge()}
-          <button class="secondary-button compact-action" type="button" data-change-app>Changer d’application</button>
-          <button class="icon-button topbar-icon-button" id="logout-button" title="Se déconnecter" aria-label="Se déconnecter">⏻</button>
-        </div>
-      </header>
-      <main class="content">
-        <section class="view-stack">
-          <div class="section-title"><p class="eyebrow">SNCB</p><h2>Dashboard Bus de remplacement SNCB</h2></div>
-          <article class="info-card sncb-prep-card">
-            <h3>Module en préparation</h3>
-            <p class="muted">Cet espace sera dédié aux services de remplacement SNCB. Les données restent séparées de Gestion Transport Scolaire.</p>
-          </article>
-          <div class="metric-grid">
-            ${metric("Services", "À venir")}
-            ${metric("Véhicules", "À venir")}
-            ${metric("Chauffeurs", "À venir")}
-            ${metric("Messages", "À venir")}
-          </div>
-        </section>
-      </main>
-    </div>
-  </div>`;
-  bindEvents();
-}
-
 function landingStat(label, value, detail, important = false) {
   return `<article class="landing-stat ${important ? "is-alert" : ""}">
     <span>${esc(label)}</span>
@@ -3832,11 +6853,40 @@ function normalizeLoginValue(value) {
   return String(value || "").trim().toLowerCase().replace(/\s+/g, "").replace(/[-_]/g, "");
 }
 
+function stableIdentifierForUser(user = {}, usedIdentifiers = new Set()) {
+  let identifier = user.identifier || user.identifierNumber || user.username || "";
+  if (user.id === "admin" || user.accessCode === "1901") identifier = "6183";
+  if (user.id === "support" || user.role === "support") identifier = identifier || "1990";
+  if (!identifier) identifier = generateStableIdentifierForStore(user.role, { visualTheme: user.visualTheme }, usedIdentifiers);
+  const normalized = normalizeLoginValue(identifier);
+  if (normalized && !usedIdentifiers.has(normalized)) {
+    usedIdentifiers.add(normalized);
+    return identifier;
+  }
+  return generateStableIdentifierForStore(user.role, { visualTheme: user.visualTheme }, usedIdentifiers);
+}
+
+function generateStableIdentifierForStore(role, options = {}, usedIdentifiers = new Set()) {
+  const prefix = identifierPrefixForRole(role, options);
+  for (let index = 1; index <= 9999; index += 1) {
+    const separator = ["support", "admin"].includes(role) ? "-" : "";
+    const identifier = `${prefix}${separator}${String(index).padStart(4, "0")}`;
+    const normalized = normalizeLoginValue(identifier);
+    if (!usedIdentifiers.has(normalized)) {
+      usedIdentifiers.add(normalized);
+      return identifier;
+    }
+  }
+  const fallback = `${prefix}${Date.now()}`;
+  usedIdentifiers.add(normalizeLoginValue(fallback));
+  return fallback;
+}
+
 function defaultIdentifierForUser(user) {
   if (!user) return "";
   if (user.id === "admin" || user.accessCode === "1901") return "6183";
   if (user.id === "support" || user.role === "support") return "1990";
-  return user.accessCode || "";
+  return user.identifier || user.identifierNumber || user.username || "";
 }
 
 function identifierMatches(user, identifier) {
@@ -3852,7 +6902,7 @@ function driverLoginVehicle(user, source) {
   const store = source || data;
   const driver = (store.drivers || []).find((item) => item.id === user?.id) || {};
   return (store.vehicles || []).find((vehicle) => vehicle.id === user?.assignedVehicleId)
-    || (store.vehicles || []).find((vehicle) => vehicle.driverId === user?.id)
+    || (store.vehicles || []).find((vehicle) => driverIdsFromRecord(vehicle).includes(user?.id))
     || (store.vehicles || []).find((vehicle) => vehicle.busNumber === driver.busNumber)
     || null;
 }
@@ -4009,20 +7059,125 @@ function autoFillParentStudentFromChildFile(form) {
 }
 
 async function findLoginAccount(role, identifier, code, studentLastName = "") {
+  const debug = loginDebugEnabled();
   if (role === "parent") {
     for (const parent of data.parents.filter((item) => item.isActive !== false)) {
       const childMatch = data.children.some((child) => parentChildNameMatches(child, studentLastName) && parentLinkedToChild(parent, child));
       if (childMatch && await credentialMatches(parent, code, "personal")) return { user: parent, usedTemporary: false };
       if (childMatch && await credentialMatches(parent, code, "temporary")) return { user: parent, usedTemporary: true };
     }
+    if (debug) debugLoginState(role, identifier, studentLastName);
     return null;
   }
   for (const candidate of data.users) {
-    if (candidate.role !== role || !identifierMatches(candidate, identifier)) continue;
+    if (!roleMatchesLoginRole(candidate, role) || !identifierMatches(candidate, identifier)) continue;
     if (await credentialMatches(candidate, code, "personal")) return { user: candidate, usedTemporary: false };
     if (await credentialMatches(candidate, code, "temporary")) return { user: candidate, usedTemporary: true };
   }
+  if (debug) debugLoginState(role, identifier, studentLastName);
   return null;
+}
+
+function authRoleFromLoginMode(loginMode) {
+  if (!loginMode) return "driver";
+  if (loginMode === "system_admin") return "system_admin";
+  if (loginMode === "transport_manager") return "transport_manager";
+  if (loginMode === "spw") return "spw";
+  if (loginMode === "driver") return "driver";
+  if (loginMode === "assistant") return "assistant";
+  if (loginMode === "parent") return "parent";
+  if (loginMode === "support") return "support";
+  return "driver";
+}
+
+function localLoginRoleFromAuthRole(authRole) {
+  return ["system_admin", "transport_manager", "spw"].includes(authRole) ? "admin" : authRole;
+}
+
+async function signInFirebaseWithGtsCode({ role, loginMode, identifier, code, studentLastName = "" }) {
+  try {
+    const { auth, functions } = await import("./src/firebaseConfig.js");
+    if (!auth || !functions) return null;
+    const [{ httpsCallable }, { signInWithCustomToken }] = await Promise.all([
+      import("firebase/functions"),
+      import("firebase/auth")
+    ]);
+    const loginWithGtsCode = httpsCallable(functions, "loginWithGtsCode");
+    const response = await loginWithGtsCode({ role, loginMode, identifier, code, studentLastName });
+    const authData = response?.data || {};
+    if (!authData.token) return null;
+    await signInWithCustomToken(auth, authData.token);
+    return authData;
+  } catch (error) {
+    const fallbackReason = (typeof error?.code === "string" && error.code.includes("unavailable")) || navigator.onLine === false
+      ? "offline"
+      : "rejected";
+    return { error: true, reason: fallbackReason, detail: error?.message || "Erreur de connexion" };
+  }
+}
+
+function upsertAuthenticatedAccount(authData) {
+  const serverUser = authData?.user;
+  if (!serverUser?.id) return null;
+  const collectionName = authData.collectionName === "parents" || serverUser.role === "parent" ? "parents" : "users";
+  const list = collectionName === "parents" ? data.parents : data.users;
+  const existingIndex = list.findIndex((item) => item.id === serverUser.id);
+  const existing = existingIndex >= 0 ? list[existingIndex] : {};
+  const merged = {
+    ...existing,
+    ...serverUser,
+    role: serverUser.role || existing.role || (collectionName === "parents" ? "parent" : ""),
+    isActive: serverUser.isActive !== false,
+    firebaseUid: authData.uid || serverUser.firebaseUid || existing.firebaseUid || ""
+  };
+  if (existingIndex >= 0) list[existingIndex] = merged;
+  else list.push(merged);
+  saveData();
+  return merged;
+}
+
+function loginDebugEnabled() {
+  try {
+    return localStorage.getItem("gts-login-debug") === "1";
+  } catch {
+    return false;
+  }
+}
+
+function debugLoginState(role, identifier, studentLastName = "") {
+  const normalizedIdentifier = normalizeLoginValue(identifier);
+  const users = role === "parent" ? (data.parents || []) : (data.users || []);
+  const candidates = users
+    .filter((user) => role === "parent" ? user.isActive !== false : user.role === role)
+    .map((user) => ({
+      id: user.id,
+      role: user.role,
+      name: fullName(user),
+      active: user.isActive !== false,
+      identifier: user.identifier || user.identifierNumber || user.username || "",
+      identifierMatches: role === "parent" ? undefined : identifierMatches(user, identifier),
+      enteredIdentifier: normalizedIdentifier,
+      firstLoginCompleted: user.firstLoginCompleted !== false,
+      resetRequired: user.resetRequired === true,
+      isTemporaryCode: user.isTemporaryCode === true,
+      hasPlainAccessCode: !!user.accessCode,
+      hasTemporaryAccessCode: !!user.temporaryAccessCode,
+      hasTemporaryHash: !!user.temporaryAccessHash,
+      hasAccessHash: !!user.accessCodeHash,
+      hasPasswordHash: !!user.passwordHash,
+      childNameMatch: role === "parent"
+        ? (data.children || []).some((child) => parentChildNameMatches(child, studentLastName) && parentLinkedToChild(user, child))
+        : undefined
+    }));
+  console.table(candidates);
+  console.warn("Diagnostic connexion GTS", {
+    role,
+    identifierProvided: !!identifier,
+    normalizedIdentifier,
+    studentLastNameProvided: !!studentLastName,
+    usersCount: users.length,
+    matchingIdentifierCount: candidates.filter((item) => item.identifierMatches).length
+  });
 }
 
 async function findLoginUser(role, identifier, code, studentLastName = "") {
@@ -4052,19 +7207,14 @@ function findLoginCandidate(role, identifier, studentLastName = "") {
 }
 
 function loginBlocked(account) {
-  const until = account?.loginBlockedUntil ? new Date(account.loginBlockedUntil) : null;
-  return !!until && until.getTime() > Date.now();
+  return false;
 }
 
 function registerLoginFailure(account) {
   if (!account) return;
   account.failedLoginAttempts = Number(account.failedLoginAttempts || 0) + 1;
-  if (account.failedLoginAttempts >= 5) {
-    account.loginBlockedUntil = new Date(Date.now() + 15 * 60 * 1000).toISOString();
-    recordSecurityLog(account, "login_blocked", "blocked");
-  } else {
-    recordSecurityLog(account, "login_failed", "failed");
-  }
+  account.loginBlockedUntil = "";
+  recordSecurityLog(account, "login_failed", "failed");
   account.updatedAt = new Date().toISOString();
   const collection = account.role === "parent" ? "parents" : "users";
   saveCollectionItemToFirestore(collection, account);
@@ -4084,10 +7234,11 @@ function clearLoginFailures(account) {
 async function credentialMatches(user, secret, mode = "any") {
   if (!user || !secret) return false;
   const hashed = await hashSecret(secret);
+  const legacyFallback = legacyFallbackHash(secret);
   const legacyPersonalMatch = user.isTemporaryCode !== true && user.firstLoginCompleted !== false && !!user.accessCode && user.accessCode === secret;
   const temporaryPlainMatch = (user.isTemporaryCode === true || user.firstLoginCompleted === false) && !!user.accessCode && user.accessCode === secret;
-  const personalMatch = user.accessCodeHash === hashed || user.passwordHash === hashed || legacyPersonalMatch;
-  const temporaryMatch = user.temporaryAccessHash === hashed || temporaryPlainMatch;
+  const personalMatch = [hashed, legacyFallback].includes(user.accessCodeHash) || [hashed, legacyFallback].includes(user.passwordHash) || legacyPersonalMatch;
+  const temporaryMatch = [hashed, legacyFallback].includes(user.temporaryAccessHash) || temporaryPlainMatch;
   if (mode === "personal") return personalMatch;
   if (mode === "temporary") return temporaryMatch;
   return personalMatch || temporaryMatch;
@@ -4100,17 +7251,125 @@ async function hashSecret(secret) {
     const digest = await window.crypto.subtle.digest("SHA-256", bytes);
     return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
   }
-  return `plain-fallback:${btoa(unescape(encodeURIComponent(text)))}`;
+  return sha256Hex(text);
+}
+
+function legacyFallbackHash(secret) {
+  try {
+    return `plain-fallback:${btoa(unescape(encodeURIComponent(String(secret || ""))))}`;
+  } catch {
+    return "";
+  }
+}
+
+function sha256Hex(text) {
+  const utf8 = unescape(encodeURIComponent(String(text || "")));
+  const words = [];
+  for (let index = 0; index < utf8.length; index += 1) {
+    words[index >> 2] |= utf8.charCodeAt(index) << (24 - (index % 4) * 8);
+  }
+  const bitLength = utf8.length * 8;
+  words[bitLength >> 5] |= 0x80 << (24 - bitLength % 32);
+  words[((bitLength + 64 >> 9) << 4) + 15] = bitLength;
+  const constants = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+  ];
+  let h0 = 0x6a09e667;
+  let h1 = 0xbb67ae85;
+  let h2 = 0x3c6ef372;
+  let h3 = 0xa54ff53a;
+  let h4 = 0x510e527f;
+  let h5 = 0x9b05688c;
+  let h6 = 0x1f83d9ab;
+  let h7 = 0x5be0cd19;
+  const rightRotate = (value, amount) => (value >>> amount) | (value << (32 - amount));
+  for (let block = 0; block < words.length; block += 16) {
+    const schedule = words.slice(block, block + 16);
+    for (let index = 16; index < 64; index += 1) {
+      const s0 = rightRotate(schedule[index - 15], 7) ^ rightRotate(schedule[index - 15], 18) ^ (schedule[index - 15] >>> 3);
+      const s1 = rightRotate(schedule[index - 2], 17) ^ rightRotate(schedule[index - 2], 19) ^ (schedule[index - 2] >>> 10);
+      schedule[index] = (schedule[index - 16] + s0 + schedule[index - 7] + s1) | 0;
+    }
+    let a = h0;
+    let b = h1;
+    let c = h2;
+    let d = h3;
+    let e = h4;
+    let f = h5;
+    let g = h6;
+    let h = h7;
+    for (let index = 0; index < 64; index += 1) {
+      const s1 = rightRotate(e, 6) ^ rightRotate(e, 11) ^ rightRotate(e, 25);
+      const ch = (e & f) ^ (~e & g);
+      const temp1 = (h + s1 + ch + constants[index] + schedule[index]) | 0;
+      const s0 = rightRotate(a, 2) ^ rightRotate(a, 13) ^ rightRotate(a, 22);
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const temp2 = (s0 + maj) | 0;
+      h = g;
+      g = f;
+      f = e;
+      e = (d + temp1) | 0;
+      d = c;
+      c = b;
+      b = a;
+      a = (temp1 + temp2) | 0;
+    }
+    h0 = (h0 + a) | 0;
+    h1 = (h1 + b) | 0;
+    h2 = (h2 + c) | 0;
+    h3 = (h3 + d) | 0;
+    h4 = (h4 + e) | 0;
+    h5 = (h5 + f) | 0;
+    h6 = (h6 + g) | 0;
+    h7 = (h7 + h) | 0;
+  }
+  return [h0, h1, h2, h3, h4, h5, h6, h7]
+    .map((value) => (value >>> 0).toString(16).padStart(8, "0"))
+    .join("");
 }
 
 function expireTemporarySupportAccesses(store = data) {
   const now = Date.now();
   (store.temporarySupportAccess || []).forEach((access) => {
-    if (access.status === "active" && new Date(access.expiresAt || 0).getTime() <= now) {
+    if (["active", "used"].includes(access.status) && new Date(access.expiresAt || 0).getTime() <= now) {
       access.status = "expired";
+      delete access.displayCode;
+      access.endedAt = access.endedAt || new Date().toISOString();
       access.updatedAt = new Date().toISOString();
     }
   });
+}
+
+function finishSupportAssistanceSession(session = currentSession(), status = "ended", store = data) {
+  if (session?.supportAssistance !== true || !session.assistanceAccessId) return false;
+  const access = (store.temporarySupportAccess || []).find((item) => item.id === session.assistanceAccessId);
+  if (!access || !["used"].includes(access.status)) return false;
+  const now = new Date().toISOString();
+  access.endedAt = now;
+  access.lastSupportDisconnectedAt = now;
+  access.updatedAt = now;
+  if (status === "expired") {
+    access.status = "expired";
+    delete access.displayCode;
+  }
+  logTemporarySupportAccess(access.id, status, {
+    ownerUserId: session.assistanceOwnerId || access.ownerUserId,
+    supportUserId: session.assistanceSupportId || access.supportUserId
+  });
+  if (store !== data) {
+    localStorage.setItem(STORE_KEY, JSON.stringify(store));
+  } else {
+    saveData();
+  }
+  saveTemporarySupportAccessToFirestore(access);
+  return true;
 }
 
 function canGenerateTemporarySupportAccess() {
@@ -4131,6 +7390,7 @@ async function createTemporarySupportAccess() {
   const access = {
     id: `support-access-${Date.now()}`,
     code: "******",
+    displayCode: code,
     codeHash,
     ownerUserId: state.user.id,
     ownerUserName: fullName(state.user),
@@ -4141,7 +7401,7 @@ async function createTemporarySupportAccess() {
     expiresAt: expiresAt.toISOString(),
     usedAt: "",
     revokedAt: "",
-    oneTimeUse: true,
+    oneTimeUse: false,
     sensitiveDataMasked: true
   };
   data.temporarySupportAccess = data.temporarySupportAccess || [];
@@ -4159,6 +7419,7 @@ function revokeTemporarySupportAccess(accessId) {
   const access = (data.temporarySupportAccess || []).find((item) => item.id === accessId && item.ownerUserId === state.user.id);
   if (!access || !["active", "used"].includes(access.status)) return;
   access.status = "revoked";
+  delete access.displayCode;
   access.revokedAt = new Date().toISOString();
   access.updatedAt = access.revokedAt;
   logTemporarySupportAccess(access.id, "revoked", { ownerUserId: state.user.id });
@@ -4186,8 +7447,7 @@ async function validateTemporarySupportAccess(code, supportUser) {
   expireTemporarySupportAccesses(data);
   const hashed = await hashSecret(code);
   const access = (data.temporarySupportAccess || []).find((item) =>
-    item.status === "active" &&
-    item.oneTimeUse !== false &&
+    ["active", "used"].includes(item.status) &&
     item.codeHash === hashed &&
     new Date(item.expiresAt || 0).getTime() > Date.now()
   );
@@ -4198,20 +7458,51 @@ async function validateTemporarySupportAccess(code, supportUser) {
   }
   access.status = "used";
   access.supportUserId = supportUser.id;
-  access.usedAt = new Date().toISOString();
-  access.updatedAt = access.usedAt;
+  access.supportUserName = fullName(supportUser);
+  access.usedAt = access.usedAt || new Date().toISOString();
+  access.lastSupportConnectedAt = new Date().toISOString();
+  access.updatedAt = access.lastSupportConnectedAt;
   logTemporarySupportAccess(access.id, "used", { ownerUserId: owner.id, supportUserId: supportUser.id });
   saveData();
   saveTemporarySupportAccessToFirestore(access);
   return { ok: true, access, owner };
 }
 
+function loginProfileIcon(type) {
+  const icons = {
+    shield: `<path d="M12 3 5.5 5.5v5.2c0 4.1 2.7 7.9 6.5 9.3 3.8-1.4 6.5-5.2 6.5-9.3V5.5L12 3Z"></path><path d="M9.5 12.1 11.2 14l3.5-4"></path>`,
+    "manager-bus": `<path d="M4.5 15V8c0-1.2 1-2.2 2.2-2.2h7.6c1.2 0 2.2 1 2.2 2.2v7"></path><path d="M6 11h9"></path><path d="M7.2 18a1.4 1.4 0 1 0 0-2.8 1.4 1.4 0 0 0 0 2.8Z"></path><path d="M13.8 18a1.4 1.4 0 1 0 0-2.8 1.4 1.4 0 0 0 0 2.8Z"></path><path d="M7 8.4h7"></path><path d="M19.4 20v-1.1a2.3 2.3 0 0 0-2.3-2.3"></path><path d="M17.1 13.8a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"></path>`,
+    administration: `<path d="m3.5 9 8.5-5 8.5 5"></path><path d="M5 9h14"></path><path d="M7 9v8"></path><path d="M11 9v8"></path><path d="M15 9v8"></path><path d="M19 19H5"></path>`,
+    "driver-bus": `<path d="M4.5 15.5V7.8c0-1.3 1-2.3 2.3-2.3h10.4c1.3 0 2.3 1 2.3 2.3v7.7"></path><path d="M6.2 11.2h11.6"></path><path d="M8 18.3a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"></path><path d="M16 18.3a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"></path><path d="M8 8.5h4.3"></path><path d="M15.2 8.9a1.4 1.4 0 1 0 0-2.8 1.4 1.4 0 0 0 0 2.8Z"></path>`,
+    "assistant-children": `<path d="M9 9.5a2.7 2.7 0 1 0 0-5.4 2.7 2.7 0 0 0 0 5.4Z"></path><path d="M4.5 20v-1.8A4.5 4.5 0 0 1 9 13.7h.4"></path><path d="M16.2 12.2a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"></path><path d="M12.4 20v-.9a3.8 3.8 0 0 1 7.6 0v.9"></path><path d="M19.2 8.2h2.1"></path><path d="M20.25 7.1v2.1"></path>`,
+    parents: `<path d="M8 10a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"></path><path d="M16 10a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"></path><path d="M3.5 20a4.5 4.5 0 0 1 9 0"></path><path d="M11.5 20a4.5 4.5 0 0 1 9 0"></path>`,
+    support: `<path d="M5 12a7 7 0 0 1 14 0v3"></path><path d="M5 13h3v5H5z"></path><path d="M16 13h3v5h-3z"></path><path d="M13 20h-2"></path>`
+  };
+  const paths = icons[type] || icons.shield;
+  return `<span class="premium-profile-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false">${paths}</svg></span>`;
+}
+
+function loginBenefitIcon(type) {
+  const icons = {
+    secure: `<path d="M7 10V8a5 5 0 0 1 10 0v2"></path><rect x="5" y="10" width="14" height="10" rx="2"></rect><path d="M12 14v2.5"></path>`,
+    mobile: `<rect x="7" y="3" width="10" height="18" rx="2"></rect><path d="M10 6h4"></path><path d="M12 17.5h.01"></path>`,
+    bell: `<path d="M18 9a6 6 0 1 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"></path><path d="M10 21h4"></path>`,
+    support: `<path d="M5 12a7 7 0 0 1 14 0v3"></path><path d="M5 13h3v5H5z"></path><path d="M16 13h3v5h-3z"></path><path d="M13 20h-2"></path>`
+  };
+  return `<b class="premium-benefit-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false">${icons[type]}</svg></b>`;
+}
+
 function renderLogin(error = "") {
+  const legalRoute = legalPageForCurrentPath();
+  if (legalRoute) {
+    renderLegalPage(legalRoute);
+    return;
+  }
   const message = error || sessionExpiredMessage;
   sessionExpiredMessage = "";
   const notice = state.loginNotice;
   state.loginNotice = "";
-  const allowedLoginModes = ["system_admin", "transport_manager", "spw", "driver", "assistant", "parent", ...(state.loginSupportUnlocked ? ["support"] : [])];
+  const allowedLoginModes = ["transport_manager", "spw", "driver", "assistant", "parent", ...(state.loginSupportUnlocked ? ["system_admin", "support"] : [])];
   const loginMode = allowedLoginModes.includes(state.loginMode) ? state.loginMode : "";
   const hasSelectedProfile = !!loginMode;
   const effectiveLoginMode = loginMode || "parent";
@@ -4222,34 +7513,43 @@ function renderLogin(error = "") {
   const supportTemporaryMode = hasSelectedProfile && loginRole === "support" && state.loginSupportTemporaryOpen;
   const loginActionLabel = supportTemporaryMode ? "Ouvrir assistance" : parentMode ? "Connexion parent" : "Se connecter";
   const profiles = [
-    ["system_admin", "Administrateur système", "Configuration et sécurité globales", "🛡", "blue"],
-    ["transport_manager", "Gestionnaire de transport", "Gestion opérationnelle terrain", "▦", "blue"],
-    ["spw", "SPW", "Supervision et suivi global", "🏛", "green"],
-    ["driver", "Chauffeur", "Gestion des trajets et transport", "☸", "orange"],
-    ["assistant", "Convoyeuse", "Suivi et accompagnement", "●", "violet"],
-    ["parent", "Parents", "Suivi des enfants et notifications", "👥", "turquoise"],
-    ...(state.loginSupportUnlocked ? [["support", "Support", "Maintenance et assistance technique", "🎧", "blue"]] : [])
+    ["transport_manager", "Transporteur", "Gestion opérationnelle terrain", "manager-bus", "blue"],
+    ["driver", "Chauffeurs", "Gestion des trajets et transport", "driver-bus", "orange"],
+    ["spw", "SPW", "Supervision et suivi global", "administration", "green"],
+    ["assistant", "Convoyeuses", "Suivi et accompagnement", "assistant-children", "violet"],
+    ["parent", "Parents", "Suivi des enfants et notifications", "parents", "turquoise"],
+    ...(state.loginSupportUnlocked ? [["system_admin", "Administrateur", "Configuration et sécurité globales", "shield", "blue"]] : []),
+    ...(state.loginSupportUnlocked ? [["support", "Support", "Maintenance et assistance technique", "support", "blue"]] : [])
   ];
+  const selectedProfile = profiles.find(([value]) => value === loginMode);
+  const selectedProfileTitle = selectedProfile?.[1] || "Connexion";
   document.getElementById("root").innerHTML = `
     <main class="premium-login-screen">
       <section class="premium-login-panel">
-        <button class="premium-lock-icon" type="button" id="login-secret-trigger" aria-label="Connexion sécurisée">▣</button>
+        <button class="premium-lock-icon login-brand-logo" type="button" id="login-secret-trigger" aria-label="Connexion sécurisée">
+          <img src="/assets/gts-bookmark-source.jpg" alt="Gestion Transport Scolaire" loading="eager">
+        </button>
         <div class="login-copy">
           <h1>Connexion</h1>
-          <p>Accédez à votre espace en sélectionnant votre profil</p>
         </div>
+        ${maintenanceNoticeCard({ login: true })}
         <form class="login-form" id="login-form">
           <p class="premium-profile-title">Sélectionnez votre profil</p>
           <div class="premium-profile-grid">
             ${profiles.map(([value, title, description, icon, tone]) => `<button class="premium-profile-card ${loginMode === value ? "is-selected" : ""} tone-${tone}" type="button" data-login-profile="${esc(value)}">
-              <span class="premium-profile-icon" aria-hidden="true">${esc(icon)}</span>
+              ${loginProfileIcon(icon)}
               <strong>${esc(title)}</strong>
-              <small>${esc(description)}</small>
               <b>✓</b>
             </button>`).join("")}
           </div>
           <input id="login-mode" type="hidden" value="${esc(effectiveLoginMode)}">
           ${hasSelectedProfile ? `
+            <div class="mobile-login-modal-backdrop" aria-hidden="true"></div>
+            <div class="login-credentials-panel" role="dialog" aria-modal="true" aria-label="Connexion ${esc(selectedProfileTitle)}">
+              <div class="mobile-login-modal-head">
+                <strong>${esc(selectedProfileTitle)}</strong>
+                <button class="icon-button" id="mobile-login-close" type="button" aria-label="Fermer">×</button>
+              </div>
             <div class="premium-form-divider"><span>Connectez-vous à votre compte</span></div>
             ${parentMode ? `<label class="screen-reader-label" for="student-last-name">Nom de l’élève</label><div class="login-input-shell"><span aria-hidden="true">♙</span><input id="student-last-name" type="text" autocomplete="off" placeholder="Nom de l’élève" value=""></div>` : ""}
             ${needsIdentifier ? `<label class="screen-reader-label" for="identifier-number">Identifiant</label><div class="login-input-shell"><span aria-hidden="true">♙</span><input id="identifier-number" type="text" autocomplete="off" placeholder="Identifiant" value=""></div>` : ""}
@@ -4265,24 +7565,26 @@ function renderLogin(error = "") {
               <button class="link-button" id="forgot-password-toggle" type="button">Code oublié ?</button>
             </div>
             ${loginRole === "support" ? `<button class="link-button support-temp-login-toggle" id="support-temporary-login-toggle" type="button">${supportTemporaryMode ? "Connexion support classique" : "Connexion avec code support temporaire"}</button>` : ""}
+            ${message ? `<p class="form-error">${esc(message)}</p>` : ""}
+            ${notice ? `<p class="form-success">${esc(notice)}</p>` : ""}
+            <button class="primary-button premium-login-submit" type="submit"><span aria-hidden="true">↪</span>${loginActionLabel}</button>
+            </div>
           ` : `
-            <div class="premium-form-divider"><span>Choisissez un profil</span></div>
-            <p class="premium-help-text">Sélectionnez une carte pour afficher les champs de connexion adaptés.</p>
+            ${message ? `<p class="form-error">${esc(message)}</p>` : ""}
+            ${notice ? `<p class="form-success">${esc(notice)}</p>` : ""}
           `}
-          ${message ? `<p class="form-error">${esc(message)}</p>` : ""}
-          ${notice ? `<p class="form-success">${esc(notice)}</p>` : ""}
-          ${hasSelectedProfile ? `<button class="primary-button premium-login-submit" type="submit"><span aria-hidden="true">↪</span>${loginActionLabel}</button>` : ""}
           <div class="premium-form-divider premium-help-divider"><span>Besoin d’aide ?</span></div>
           <p class="premium-help-text"><button class="link-button" id="access-request-toggle" type="button">Contactez le support</button></p>
+          ${legalLinksInline()}
         </form>
         ${state.loginAccessRequestOpen ? supportRequestLoginForm() : ""}
         ${state.loginForgotPasswordOpen ? forgotPasswordLoginForm() : ""}
         ${state.firstLoginId ? firstLoginCodeForm() : ""}
         <div class="premium-login-benefits">
-          <span><b>♢</b><strong>Données sécurisées</strong><small>Vos données sont protégées</small></span>
-          <span><b>▯</b><strong>Accessible partout</strong><small>Accédez depuis tous vos appareils</small></span>
-          <span><b>♧</b><strong>Notifications en temps réel</strong><small>Restez informé à tout moment</small></span>
-          <span><b>◎</b><strong>Support disponible</strong><small>Notre équipe est là pour vous aider</small></span>
+          <span>${loginBenefitIcon("secure")}<strong>Données sécurisées</strong></span>
+          <span>${loginBenefitIcon("mobile")}<strong>Accessible partout</strong></span>
+          <span>${loginBenefitIcon("bell")}<strong>Notifications en temps réel</strong></span>
+          <span>${loginBenefitIcon("support")}<strong>Support disponible</strong></span>
         </div>
       </section>
     </main>`;
@@ -4292,14 +7594,35 @@ function renderLogin(error = "") {
     if (!loginMode) {
       return renderLogin("Veuillez sélectionner votre profil avant de vous connecter.");
     }
+    if (isMaintenanceActive() && !canLoginDuringMaintenance(loginMode)) {
+      return renderLogin(maintenanceAccessMessage());
+    }
+    const authLoginRole = authRoleFromLoginMode(loginMode);
+    const localRoleForLookup = localLoginRoleFromAuthRole(authLoginRole);
     const code = document.getElementById("access-code").value.trim();
     const studentLastName = document.getElementById("student-last-name")?.value.trim() || "";
     const identifier = document.getElementById("identifier-number")?.value.trim() || "";
     const busNumber = document.getElementById("bus-number")?.value.trim() || "";
+    let firebaseAuthData = null;
+    let loginAccount = null;
+    let user = null;
+
+    const remoteAuthPayload = {
+      role: authLoginRole,
+      loginMode,
+      identifier,
+      code,
+      studentLastName
+    };
+
     if (loginRole === "support" && state.loginSupportTemporaryOpen) {
       const supportTempCode = document.getElementById("support-temporary-code")?.value.trim() || "";
-      const supportAccount = await findLoginAccount("support", identifier, code, "");
-      const supportUser = supportAccount?.user || null;
+      const supportAuthData = await signInFirebaseWithGtsCode(remoteAuthPayload);
+      let supportUser = supportAuthData?.user && upsertAuthenticatedAccount(supportAuthData);
+      if (!supportUser && supportAuthData?.error === true && supportAuthData.reason === "offline") {
+        const localAccount = await findLoginAccount("support", identifier, code, "");
+        supportUser = localAccount?.user || null;
+      }
       if (!supportUser || supportUser.isActive === false) {
         recordLoginAttempt(null, code, "refusée");
         return renderLogin("Identifiant support ou code incorrect");
@@ -4317,26 +7640,59 @@ function renderLogin(error = "") {
       render();
       return;
     }
-    const loginCandidate = findLoginCandidate(loginRole, identifier, studentLastName);
+    const loginCandidate = findLoginCandidate(localRoleForLookup, identifier, studentLastName);
     if (loginCandidate && loginBlocked(loginCandidate)) {
       recordLoginAttempt(loginCandidate, code, "refusée");
       recordSecurityLog(loginCandidate, "login_blocked", "blocked");
       return renderLogin("Trop de tentatives. Veuillez réessayer dans 15 minutes.");
     }
-    const loginAccount = await findLoginAccount(loginRole, identifier, code, studentLastName);
-    const user = loginAccount?.user || null;
-    if (!user || !loginProfileMatchesAccount(loginMode, user)) {
+
+    if (!firebaseAuthData) {
+      firebaseAuthData = await signInFirebaseWithGtsCode(remoteAuthPayload);
+      if (firebaseAuthData?.user) {
+        user = upsertAuthenticatedAccount(firebaseAuthData);
+        loginAccount = { user, usedTemporary: firebaseAuthData?.usedTemporary === true || firebaseAuthData?.firstLoginRequired === true };
+      }
+    }
+
+    if (!user && !firebaseAuthData?.error) {
+      // Si l'auth Firebase a été refusée (identifiants invalides), ne pas retomber en local.
       if (loginCandidate) registerLoginFailure(loginCandidate);
       recordLoginAttempt(null, code, "refusée");
       return renderLogin(loginRole === "parent" ? "Nom de l’élève ou code d’accès incorrect" : "Numéro identifiant ou code incorrect");
     }
+
+    if (!user && firebaseAuthData?.error === true && firebaseAuthData.reason === "offline") {
+      loginAccount = await findLoginAccount(localRoleForLookup, identifier, code, studentLastName);
+      user = loginAccount?.user || null;
+      if (!user) {
+        recordLoginAttempt(null, code, "refusée");
+        return renderLogin(loginRole === "parent" ? "Nom de l’élève ou code d’accès incorrect" : "Numéro identifiant ou code incorrect");
+      }
+    }
+
+    if (!user || !loginProfileMatchesAccount(loginMode, user)) {
+      if (loginCandidate && loginCandidate.isActive !== false) registerLoginFailure(loginCandidate);
+      recordLoginAttempt(null, code, "refusée");
+      return renderLogin(loginRole === "parent" ? "Nom de l’élève ou code d’accès incorrect" : "Numéro identifiant ou code incorrect");
+    }
+
     if (user.isActive === false || (user.role === "admin" && user.isActive !== true)) {
       recordLoginAttempt(user, code, "refusée");
       return renderLogin(parentT("login.disabled"));
     }
-    if (loginAccount.usedTemporary || user.firstLoginCompleted === false || user.resetRequired === true) {
+
+    if (isMaintenanceActive() && !canAccessDuringMaintenance(user)) {
+      recordLoginAttempt(user, code, "refusée");
+      return renderLogin(maintenanceAccessMessage());
+    }
+
+    if (firebaseAuthData?.uid) user.firebaseUid = firebaseAuthData.uid;
+    if ((loginAccount?.usedTemporary || requiresFirstLoginCodeSetup(user))) {
       state.firstLoginType = user.role === "parent" ? "parents" : "users";
       state.firstLoginId = user.id;
+      state.user = null;
+      localStorage.removeItem(SESSION_KEY);
       clearLoginFailures(user);
       recordLoginAttempt(user, code, "réussie");
       return renderLogin();
@@ -4344,11 +7700,13 @@ function renderLogin(error = "") {
     clearLoginFailures(user);
     recordLoginAttempt(user, code, "réussie");
     state.user = user;
-    state.activeApp = canChooseApplication(user) ? "" : "gts";
+    state.activeApp = "gts";
     if (user.themePreference) localStorage.setItem(THEME_KEY, user.themePreference);
     applyThemePreference();
     resetViewState();
+    applyRequestedScreenFromQuery();
     saveSession(user);
+    startFirestoreRealtimeSync();
     render();
   });
   document.querySelectorAll("#access-request-toggle").forEach((button) => button.addEventListener("click", () => {
@@ -4385,6 +7743,12 @@ function renderLogin(error = "") {
     state.loginSupportTemporaryOpen = false;
     renderLogin();
   }));
+  document.getElementById("mobile-login-close")?.addEventListener("click", () => {
+    state.loginMode = "";
+    state.loginShowPassword = false;
+    state.loginSupportTemporaryOpen = false;
+    renderLogin();
+  });
   document.getElementById("login-password-toggle")?.addEventListener("click", () => {
     state.loginShowPassword = !state.loginShowPassword;
     const field = document.getElementById("access-code");
@@ -4404,7 +7768,7 @@ function renderLogin(error = "") {
     secretTimer = setTimeout(() => { secretClicks = 0; }, 1200);
     if (secretClicks >= 5) {
       state.loginSupportUnlocked = true;
-      state.loginMode = "support";
+      state.loginMode = "";
       renderLogin();
     }
   });
@@ -4461,6 +7825,8 @@ function supportRequestLoginForm() {
         <option value="spw">SPW</option>
       </select></label>
       ${input("subject", "Sujet", "")}
+      <label><span>Catégorie</span><select name="category">${supportCategoryOptions("account")}</select></label>
+      <label><span>Priorité</span><select name="priority">${supportPriorityOptions("normal")}</select></label>
       ${textArea("message", "Message", "")}
       <button class="primary-button" type="submit">Envoyer demande support</button>
     </form>
@@ -4532,6 +7898,7 @@ function resetDashboardContext() {
   state.search = "";
   state.parentChildId = "";
   state.parentRequestChildId = "";
+  state.parentMedicalChildId = "";
   state.supportFilter = "all";
   state.selectedSupportRequestId = "";
   state.messageChildId = "";
@@ -4677,6 +8044,7 @@ async function completeFirstLoginCode(event) {
   const confirmCode = event.currentTarget.elements.confirmCode.value.trim();
   const error = validateCode(newCode, confirmCode);
   if (error) return alert(error);
+  if (await credentialMatches(account, newCode, "temporary")) return alert("Le nouveau code doit être différent du code temporaire.");
   const recoveryCode = generateRecoveryCode();
   account.accessCodeHash = await hashSecret(newCode);
   account.passwordHash = account.accessCodeHash;
@@ -4700,7 +8068,7 @@ async function completeFirstLoginCode(event) {
   state.firstLoginType = "";
   state.firstLoginId = "";
   state.user = account;
-  state.activeApp = canChooseApplication(account) ? "" : "gts";
+  state.activeApp = "gts";
   saveSession(account);
   render();
 }
@@ -4727,10 +8095,13 @@ function mergeInterfaceConfig(config = {}) {
       ...(config.roleVisibility || {})
     }
   };
-  ["admin", "driver"].forEach((role) => {
+  ["admin", "spw", "driver", "assistant"].forEach((role) => {
     merged.dashboardCards[role] = (merged.dashboardCards[role] || []).map((card) => {
       if (card.id === "plate") return { ...card, id: "outOfServiceVehicles", label: "Véhicules hors service" };
       if (card.id === "outOfServiceVehicles" && card.label === "Plaque") return { ...card, label: "Véhicules hors service" };
+      if (["driver", "assistant"].includes(role) && card.id === "outOfServiceVehicles") {
+        return { ...card, label: "Véhicule hors service / retard" };
+      }
       return card;
     });
   });
@@ -4746,8 +8117,12 @@ function roleKey() {
   return state.user?.role || "admin";
 }
 
+function dashboardRoleKey(role = roleKey()) {
+  return role === "admin" && isSpwAccount() ? "spw" : role;
+}
+
 function dashboardConfigFor(role = roleKey()) {
-  return [...(interfaceConfig().dashboardCards?.[role] || [])].sort((a, b) => Number(a.order || 0) - Number(b.order || 0));
+  return [...(interfaceConfig().dashboardCards?.[dashboardRoleKey(role)] || [])].sort((a, b) => Number(a.order || 0) - Number(b.order || 0));
 }
 
 function dashboardCardSetting(role, id, fallbackLabel) {
@@ -4775,20 +8150,92 @@ function orderedDashboardCards(role, cards) {
 }
 
 function dashboardOutOfServiceMetric(label, child = null) {
-  return metricButton(label, outOfServiceVehiclesForCurrentUser(child).length, "out-of-service-vehicles");
+  const isTransportCrew = ["driver", "assistant"].includes(state.user?.role);
+  const isDelayUser = isTransportCrew || isTransportManagerUser();
+  const action = isDelayUser ? "delay-center" : "out-of-service-vehicles";
+  return metricButton(label, outOfServiceVehiclesForCurrentUser(child).length + (isDelayUser ? activeTransferDelays().length : 0), action);
+}
+
+function delayedVehiclesCount() {
+  const delayed = new Set();
+  activeTransferDelays().forEach((delay) => {
+    const transfer = transferById(delay.transferId) || {};
+    const circuitRef = delay.circuitId || transfer.circuitId || "";
+    const circuit = circuitByRef(circuitRef);
+    const vehicle = (data.vehicles || []).find((item) =>
+      item.id === delay.vehicleId ||
+      item.id === circuit?.vehicleId ||
+      item.circuitId === circuitRef ||
+      item.circuitId === circuit?.name ||
+      driverIdsFromRecord(item).some((driverId) => driverIdsFromRecord(delay).includes(driverId) || driverId === delay.driverId) ||
+      item.assistantId === delay.assistantId ||
+      item.assistantId === delay.convoyeurId
+    );
+    delayed.add(vehicle?.id || circuit?.vehicleId || circuitRef || delay.transferId || delay.id);
+  });
+  return delayed.size;
+}
+
+function quickTransferDelayDialog() {
+  if (!canCreateTransferDelay() || !state.quickTransferDelayOpen) return "";
+  const available = delayDeclarationTransfers();
+  if (!available.length) {
+    return `<div class="modal-backdrop" data-close-quick-delay>
+      <article class="info-card" onclick="event.stopPropagation()">
+        <div class="modal-head"><h3>Déclarer un retard</h3><p>Indiquez le circuit concerné.</p></div>
+        ${quickDelayForm(null)}
+      </article>
+    </div>`;
+  }
+  return `<div class="modal-backdrop" data-close-quick-delay>
+    <article class="info-card" onclick="event.stopPropagation()">
+      <div class="modal-head"><h3>Déclarer un retard</h3><p>Créer une information de retard pour le transfert concerné.</p></div>
+      ${quickDelayForm(available)}
+    </article>
+  </div>`;
+}
+
+function quickDelayForm(transfers = []) {
+  const options = Array.isArray(transfers) ? transfers : [];
+  return `<form class="mini-form transfer-delay-form" data-quick-delay-form>
+    ${options.length
+      ? `<label><span>Transfert / circuit</span><select name="transferId" required>${options.map((transfer) => `<option value="${esc(transfer.transferId || transfer.id)}">${esc(transfer.transferName || transfer.circuitId || "Transfert")}</option>`).join("")}</select></label>`
+      : `<input type="hidden" name="transferId" value=""><label><span>Numéro de circuit</span><input name="manualCircuitId" type="text" placeholder=""></label>`}
+    <label><span>Durée du retard</span><select name="delayMinutes" required><option value="5">5 min</option><option value="10">10 min</option><option value="15">15 min</option><option value="20">20 min</option><option value="custom">Autre durée</option></select></label>
+    <label><span>Durée personnalisée</span><input name="customDelayMinutes" type="number" min="1" step="1" placeholder="Minutes"></label>
+    <label><span>Motif optionnel</span><select name="reason">
+      <option value="">Non renseigné</option>
+      <option value="circulation">Circulation</option>
+      <option value="déviation">Déviation</option>
+      <option value="panne">Panne</option>
+      <option value="météo">Météo</option>
+      <option value="autre">Autre</option>
+    </select></label>
+    ${canTriggerSmsTransportAlert() ? `<label class="check-field"><input name="notifyParentsSms" type="checkbox" checked>Prévenir les parents par SMS</label>` : ""}
+    <div class="form-actions"><button class="primary-button compact-action" type="submit">Signaler un retard</button><button class="secondary-button" type="button" data-close-quick-delay>Annuler</button></div>
+  </form>`;
 }
 
 function baseNavigationItems(role = roleKey()) {
   if (role === "support") return [
     { screen: "dashboard", label: "Centre Support" },
-    ...(canAccessRequestsModule() ? [{ screen: "requests", label: "Demandes", badge: requestsMenuBadge() }] : []),
+    { screen: "serviceStatus", label: "État des services" },
+    { screen: "maintenance", label: "Maintenance" },
+    { screen: "systemMonitoring", label: "Supervision système" },
     { screen: "loginLogs", label: "Connexions" },
+    { screen: "notice", label: "Notice" },
     { screen: "settings", label: "Réglages" }
   ];
   if (role === "admin" && isPrimaryAdmin()) return [
     { screen: "dashboard", label: "Supervision technique" },
+    { screen: "serviceStatus", label: "État des services" },
+    { screen: "maintenance", label: "Maintenance" },
     { screen: "loginLogs", label: "Journal connexions" },
+    { screen: "initialManager", label: "Gestionnaire transport" },
+    { screen: "spwUsers", label: "Utilisateurs SPW" },
+    { screen: "supportAccounts", label: "Comptes support" },
     { screen: "permissionTests", label: "Tests permissions" },
+    { screen: "notice", label: "Notice" },
     { screen: "settings", label: "Configuration technique" },
     { screen: "support", label: "Support technique" }
   ];
@@ -4796,43 +8243,52 @@ function baseNavigationItems(role = roleKey()) {
     { screen: "dashboard", label: parentT("nav.dashboard") },
     { screen: "children", label: parentT("nav.children") },
     { screen: "messages", label: messagesNavLabel() },
+    { screen: "notice", label: "Notice" },
     { screen: "settings", label: parentT("nav.preferences") },
     { screen: "contact", label: parentT("nav.contact") }
   ];
   if (role === "driver") return [
     { screen: "dashboard", label: "Tableau de bord" },
-    { screen: "vehicles", label: "Véhicules" },
-    { screen: "drivers", label: "Chauffeurs" },
-    { screen: "assistants", label: "Convoyeuse" },
     { screen: "children", label: "Élèves" },
-    { screen: "circuits", label: "Circuits" },
-    { screen: "transfers", label: "Mes transferts" },
-    { screen: "replacementRules", label: "Organisation transferts" },
-    { screen: "schools", label: "Écoles" },
+    { screen: "replacementRules", label: "Transfert" },
     { screen: "messages", label: messagesNavLabel() },
-    ...(canAccessRequestsModule() ? [{ screen: "requests", label: "Demandes", badge: requestsMenuBadge() }] : []),
+    { screen: "vehicles", label: "Véhicule" },
+    { screen: "notice", label: "Notice" },
     { screen: "settings", label: "Réglages" },
-    ...(canAccessSncbApp() ? [{ screen: "sncbApp", label: "SNCB" }] : []),
     { screen: "support", label: supportNavLabel() }
   ];
   if (role === "assistant") return [
     { screen: "dashboard", label: "Tableau de bord" },
     { screen: "children", label: "Élèves" },
-    { screen: "schools", label: "Écoles" },
-    { screen: "transfers", label: "Mes transferts" },
+    { screen: "spwContacts", label: "Contact SPW" },
     { screen: "replacementRules", label: "Organisation transferts" },
     { screen: "messages", label: messagesNavLabel() },
     { screen: "drivers", label: "Chauffeur" },
+    { screen: "notice", label: "Notice" },
+    { screen: "settings", label: "Réglages" },
+    { screen: "support", label: supportNavLabel() }
+  ];
+  if (role === "admin" && isSpwAccount()) return [
+    { screen: "dashboard", label: "Tableau de bord" },
+    { screen: "children", label: "Élèves" },
+    { screen: "messages", label: messagesNavLabel() },
+    { screen: "replacementRules", label: "Transfert" },
+    { screen: "transportGroup", label: "Gestion transport" },
+    { screen: "securityGroup", label: "Accès & sécurité" },
+    { screen: "notice", label: "Notice" },
     { screen: "settings", label: "Réglages" },
     { screen: "support", label: supportNavLabel() }
   ];
   if (role === "admin") return [
     { screen: "dashboard", label: "Tableau de bord" },
+    ...(isSpwAccount() ? [{ screen: "spwContacts", label: "Contact SPW" }] : []),
     { screen: "transportGroup", label: "Gestion transport" },
+    ...(isTransportManagerUser() ? [{ screen: "transfers", label: "Lieux de transfert" }] : []),
     { screen: "replacementRules", label: "Organisation transferts" },
     { screen: "messages", label: messagesNavLabel() },
     { screen: "history", label: "Historique" },
     { screen: "securityGroup", label: "Accès & sécurité" },
+    { screen: "notice", label: "Notice" },
     { screen: "settings", label: "Réglages" },
     { screen: "support", label: supportNavLabel() }
   ];
@@ -4842,13 +8298,13 @@ function baseNavigationItems(role = roleKey()) {
     { screen: "drivers", label: "Chauffeurs" },
     { screen: "assistants", label: "Convoyeuses" },
     { screen: "vehicles", label: "Véhicules" },
-    { screen: "schools", label: "Écoles" },
     { screen: "circuits", label: "Circuits" },
     { screen: "replacementRules", label: "Organisation transferts" },
     { screen: "messages", label: messagesNavLabel() },
     { screen: "users", label: "Codes d’accès" },
     { screen: "loginLogs", label: "Connexions" },
     ...(canAccessRequestsModule() ? [{ screen: "requests", label: "Demandes", badge: requestsMenuBadge() }] : []),
+    { screen: "notice", label: "Notice" },
     { screen: "settings", label: "Réglages" },
     { screen: "support", label: supportNavLabel() }
   ];
@@ -4857,53 +8313,99 @@ function baseNavigationItems(role = roleKey()) {
 function configuredNavigationItems(role = roleKey()) {
   const config = interfaceConfig();
   const base = baseNavigationItems(role);
+  const layoutRole = role === "admin" && isSpwAccount() ? "spw" : role;
   const byScreen = new Map(base.map((item, index) => [item.screen, { ...item, order: index + 1 }]));
-  (config.menuLayout?.[role] || []).forEach((screen, index) => {
+  (config.menuLayout?.[layoutRole] || []).forEach((screen, index) => {
     if (byScreen.has(screen)) byScreen.get(screen).order = index + 1;
   });
   return [...byScreen.values()]
     .map((item) => ({
       ...item,
-      label: config.menuLabels?.[role]?.[item.screen] || config.menuLabels?.[item.screen] || item.label,
-      visible: config.roleVisibility?.[role]?.[item.screen] !== false
+      label: config.menuLabels?.[layoutRole]?.[item.screen] || config.menuLabels?.[item.screen] || item.label,
+      visible: ["driver", "assistant"].includes(role) && item.screen === "replacementRules"
+        ? true
+        : config.roleVisibility?.[layoutRole]?.[item.screen] !== false
     }))
     .filter((item) => item.visible)
     .sort((a, b) => a.order - b.order);
 }
 
+function navIcon(screen) {
+  const icons = {
+    dashboard: '<path d="M4 11.5 12 5l8 6.5"></path><path d="M6.5 10.5V20h11v-9.5"></path><path d="M9.5 20v-5h5v5"></path>',
+    children: '<path d="M9 10a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"></path><path d="M4 20a5 5 0 0 1 10 0"></path><path d="M17 11.5a2.2 2.2 0 1 0 0-4.4"></path><path d="M15.5 15.5a4.2 4.2 0 0 1 4.5 4.2"></path>',
+    drivers: '<path d="M4.5 15.5V7.8c0-1.3 1-2.3 2.3-2.3h10.4c1.3 0 2.3 1 2.3 2.3v7.7"></path><path d="M6.2 11.2h11.6"></path><path d="M8 18.3a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"></path><path d="M16 18.3a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"></path><path d="M14.8 8.7a1.35 1.35 0 1 0 0-2.7 1.35 1.35 0 0 0 0 2.7Z"></path>',
+    assistants: '<path d="M9 9.5a2.7 2.7 0 1 0 0-5.4 2.7 2.7 0 0 0 0 5.4Z"></path><path d="M4.5 20v-1.8A4.5 4.5 0 0 1 9 13.7h.4"></path><path d="M16.2 12.2a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"></path><path d="M12.4 20v-.9a3.8 3.8 0 0 1 7.6 0v.9"></path><path d="M19.4 7.9h2"></path>',
+    vehicles: '<path d="M4.5 15.5V7.8c0-1.3 1-2.3 2.3-2.3h10.4c1.3 0 2.3 1 2.3 2.3v7.7"></path><path d="M6.2 11.2h11.6"></path><path d="M8 18.3a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"></path><path d="M16 18.3a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"></path>',
+    schools: '<path d="M3.5 10.5 12 5l8.5 5.5"></path><path d="M5.5 10v9h13v-9"></path><path d="M9 19v-5h6v5"></path><path d="M7.5 12h1.5"></path><path d="M15 12h1.5"></path>',
+    circuits: '<path d="M6 18c3.8 0 4.2-12 8-12 1.9 0 3.1 1.3 3.1 3.1 0 2.8-3.1 4.4-5.4 5.8"></path><path d="M6 18h5"></path><path d="m8.5 15.5-2.5 2.5 2.5 2.5"></path>',
+    transfers: '<path d="M7 7h10"></path><path d="m14 4 3 3-3 3"></path><path d="M17 17H7"></path><path d="m10 14-3 3 3 3"></path>',
+    replacementRules: '<path d="M7 7h10"></path><path d="m14 4 3 3-3 3"></path><path d="M17 17H7"></path><path d="m10 14-3 3 3 3"></path>',
+    messages: '<path d="M5 6h14v10H8l-3 3V6Z"></path><path d="M8 9h8"></path><path d="M8 12h5"></path>',
+    spwContacts: '<path d="M6.5 5.5h11v13h-11v-13Z"></path><path d="M9 9h6"></path><path d="M9 12h6"></path><path d="M9 15h3"></path>',
+    users: '<path d="M8.5 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"></path><path d="M3.5 20a5 5 0 0 1 10 0"></path><path d="M17 14.5V20"></path><path d="M14.5 17h5"></path>',
+    loginLogs: '<path d="M12 8v5l3 2"></path><path d="M4.5 12a7.5 7.5 0 1 0 2.2-5.3"></path><path d="M4.5 5.5v4h4"></path>',
+    serviceStatus: '<path d="M4 13h4l2-6 4 12 2-6h4"></path>',
+    maintenance: '<path d="M7 4.5h10"></path><path d="M8.5 2.8v4"></path><path d="M15.5 2.8v4"></path><path d="M5.5 8.5h13"></path><path d="M6 5.5h12v15H6v-15Z"></path><path d="M9 13h2"></path><path d="M13 13h2"></path><path d="M9 16h2"></path>',
+    requests: '<path d="M7 4.5h8l3 3V20H7V4.5Z"></path><path d="M14.5 4.5V8h3.5"></path><path d="M9.5 12h5"></path><path d="M9.5 15.5h4"></path>',
+    settings: '<path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"></path><path d="M19.4 15a1.8 1.8 0 0 0 .36 1.98l.04.04a2.1 2.1 0 0 1-2.97 2.97l-.04-.04a1.8 1.8 0 0 0-1.98-.36 1.8 1.8 0 0 0-1.09 1.65V21.3a2.1 2.1 0 0 1-4.2 0v-.06a1.8 1.8 0 0 0-1.09-1.65 1.8 1.8 0 0 0-1.98.36l-.04.04a2.1 2.1 0 0 1-2.97-2.97l.04-.04A1.8 1.8 0 0 0 4.6 15a1.8 1.8 0 0 0-1.65-1.09H2.9a2.1 2.1 0 0 1 0-4.2h.06A1.8 1.8 0 0 0 4.6 8.62a1.8 1.8 0 0 0-.36-1.98l-.04-.04a2.1 2.1 0 0 1 2.97-2.97l.04.04a1.8 1.8 0 0 0 1.98.36A1.8 1.8 0 0 0 10.29 2.4V2.1a2.1 2.1 0 0 1 4.2 0v.3a1.8 1.8 0 0 0 1.09 1.65 1.8 1.8 0 0 0 1.98-.36l.04-.04a2.1 2.1 0 0 1 2.97 2.97l-.04.04a1.8 1.8 0 0 0-.36 1.98 1.8 1.8 0 0 0 1.65 1.09h.06a2.1 2.1 0 0 1 0 4.2h-.06A1.8 1.8 0 0 0 19.4 15Z"></path>',
+    support: '<path d="M12 20a8 8 0 1 0-8-8"></path><path d="M4 12h4"></path><path d="M16 12h4"></path><path d="M8.5 17.5 11 15"></path><path d="M13 15l2.5 2.5"></path><path d="M9 9a3 3 0 0 1 6 0v3H9V9Z"></path>',
+    notice: '<path d="M6.5 4.5h8l3 3V20h-11V4.5Z"></path><path d="M14.5 4.5V8h3"></path><path d="M9 11h6"></path><path d="M9 14h6"></path><path d="M9 17h4"></path>',
+    contact: '<path d="M6.5 5.5h11v13h-11v-13Z"></path><path d="M9 9h6"></path><path d="M9 12h6"></path><path d="M9 15h3"></path>',
+    history: '<path d="M12 8v5l3 2"></path><path d="M4.5 12a7.5 7.5 0 1 0 2.2-5.3"></path><path d="M4.5 5.5v4h4"></path>',
+    transportGroup: '<path d="M4.5 15V8c0-1.2 1-2.2 2.2-2.2h7.6c1.2 0 2.2 1 2.2 2.2v7"></path><path d="M6 11h9"></path><path d="M7.2 18a1.4 1.4 0 1 0 0-2.8 1.4 1.4 0 0 0 0 2.8Z"></path><path d="M13.8 18a1.4 1.4 0 1 0 0-2.8 1.4 1.4 0 0 0 0 2.8Z"></path><path d="M19.4 20v-1.1a2.3 2.3 0 0 0-2.3-2.3"></path><path d="M17.1 13.8a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"></path>',
+    securityGroup: '<path d="M12 21s7-3.5 7-10V5.5L12 3 5 5.5V11c0 6.5 7 10 7 10Z"></path><path d="m9.5 12 1.7 1.7 3.5-3.7"></path>',
+    circuitAssignments: '<path d="M5 7h8"></path><path d="m10 4 3 3-3 3"></path><path d="M19 17h-8"></path><path d="m14 14-3 3 3 3"></path><path d="M5 17h2"></path><path d="M17 7h2"></path>',
+    systemMonitoring: '<path d="M4 13h4l2-6 4 12 2-6h4"></path>',
+    initialManager: '<path d="M4.5 15V8c0-1.2 1-2.2 2.2-2.2h7.6c1.2 0 2.2 1 2.2 2.2v7"></path><path d="M6 11h9"></path><path d="M19.4 20v-1.1a2.3 2.3 0 0 0-2.3-2.3"></path><path d="M17.1 13.8a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"></path>',
+    spwUsers: '<path d="m3.5 9 8.5-5 8.5 5"></path><path d="M5 9h14"></path><path d="M7 9v8"></path><path d="M11 9v8"></path><path d="M15 9v8"></path><path d="M19 19H5"></path>',
+    supportAccounts: '<path d="M8.5 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"></path><path d="M3.5 20a5 5 0 0 1 10 0"></path><path d="M17 10v4"></path><path d="M15 12h4"></path>',
+    permissionTests: '<path d="M12 21s7-3.5 7-10V5.5L12 3 5 5.5V11c0 6.5 7 10 7 10Z"></path><path d="M9 12.5h6"></path>',
+    mobileMore: '<path d="M5 7h14"></path><path d="M5 12h14"></path><path d="M5 17h14"></path>'
+  };
+  return `<span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false">${icons[screen] || icons.dashboard}</svg></span>`;
+}
+
 function renderNavigationItems(items) {
-  return items.map((item) => `<button class="nav-item ${state.screen === item.screen ? "active" : ""}" data-screen="${esc(item.screen)}">${esc(item.label)}${item.badge ? ` <b class="nav-badge">${esc(item.badge)}</b>` : ""}</button>`).join("");
+  return items.map((item) => {
+    const label = item.screen === "replacementRules" ? "Transfert" : item.label;
+    return `<button class="nav-item ${state.screen === item.screen ? "active" : ""}" data-screen="${esc(item.screen)}">${navIcon(item.screen)}<span class="nav-label">${esc(label)}</span>${item.badge ? ` <b class="nav-badge">${esc(item.badge)}</b>` : ""}</button>`;
+  }).join("");
 }
 
 function renderApp() {
+  const showGlobalSearch = !isParent() && !isSupport() && !isPrimaryAdmin() && state.screen !== "support";
+  const hasServiceAlert = currentServiceStatus().status !== "operational";
   document.getElementById("root").innerHTML = `
     <div class="${appShellClass()}">
       <aside class="sidebar">
         <div class="sidebar-head">${roleBrandLogo()}</div>
-        <div class="user-pill"><span>●</span><span>${esc(sidebarUserName())}</span></div>
+        <div class="user-pill"><span>${esc(sidebarUserName())}</span>${offlineStatusBadge()}</div>
         <nav>
           ${navigationItems()}
-          <button class="nav-item mobile-more-toggle ${state.mobileMoreOpen ? "active" : ""}" type="button" data-mobile-more-toggle>Plus</button>
+          <button class="nav-item mobile-home-button ${state.screen === "dashboard" ? "active" : ""}" type="button" data-screen="dashboard">${navIcon("dashboard")}<span class="nav-label">Accueil</span></button>
+          <button class="nav-item mobile-more-toggle ${state.mobileMoreOpen ? "active" : ""}" type="button" data-mobile-more-toggle>${navIcon("mobileMore")}<span class="nav-label">Menu</span></button>
         </nav>
       </aside>
       ${mobileMorePanel()}
       <div class="main-area">
         <header class="topbar">
-          <div class="topbar-title"><div><strong>${usesSpwIdentity() ? "Gestion Transport Scolaire SPW" : "Gestion Transport Scolaire"}</strong></div></div>
-          <div class="topbar-actions">
-            ${offlineStatusBadge()}
+          <div class="topbar-title" aria-hidden="true"></div>
+          <div class="topbar-actions ${hasServiceAlert ? "has-service-alert" : "no-service-alert"}">
+            ${offlineStatusBadge("topbar-sync-status")}
             ${serviceStatusHeaderBadge()}
-            ${!isSupportAssistanceSession() && canAccessSncbApp() ? `<button class="secondary-button compact-action" type="button" data-change-app>Changer d’application</button>` : ""}
-            <button class="icon-button topbar-icon-button" type="button" data-screen="settings" title="Réglages" aria-label="Réglages">⚙</button>
-            <button class="icon-button topbar-icon-button" id="logout-button" title="Se déconnecter" aria-label="Se déconnecter">⏻</button>
+            ${showGlobalSearch ? searchBox("topbar-search") : ""}
+            <button class="icon-button topbar-icon-button" type="button" data-screen="settings" title="Réglages" aria-label="Réglages"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"></path><path d="M19.4 15a1.8 1.8 0 0 0 .36 1.98l.04.04a2.1 2.1 0 0 1-2.97 2.97l-.04-.04a1.8 1.8 0 0 0-1.98-.36 1.8 1.8 0 0 0-1.09 1.65V21.3a2.1 2.1 0 0 1-4.2 0v-.06a1.8 1.8 0 0 0-1.09-1.65 1.8 1.8 0 0 0-1.98.36l-.04.04a2.1 2.1 0 0 1-2.97-2.97l.04-.04A1.8 1.8 0 0 0 4.6 15a1.8 1.8 0 0 0-1.65-1.09H2.9a2.1 2.1 0 0 1 0-4.2h.06A1.8 1.8 0 0 0 4.6 8.62a1.8 1.8 0 0 0-.36-1.98l-.04-.04a2.1 2.1 0 0 1 2.97-2.97l.04.04a1.8 1.8 0 0 0 1.98.36A1.8 1.8 0 0 0 10.29 2.4V2.1a2.1 2.1 0 0 1 4.2 0v.3a1.8 1.8 0 0 0 1.09 1.65 1.8 1.8 0 0 0 1.98-.36l.04-.04a2.1 2.1 0 0 1 2.97 2.97l-.04.04a1.8 1.8 0 0 0-.36 1.98 1.8 1.8 0 0 0 1.65 1.09h.06a2.1 2.1 0 0 1 0 4.2h-.06A1.8 1.8 0 0 0 19.4 15Z"></path></svg></button>
+            <button class="icon-button topbar-icon-button" id="logout-button" title="Se déconnecter" aria-label="Se déconnecter"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v8"></path><path d="M17.66 6.34a8 8 0 1 1-11.32 0"></path></svg></button>
           </div>
         </header>
         <main class="content">
           ${adminInfoBar()}
           ${supportAssistanceBanner()}
-          ${isParent() ? (!["contact", "settings"].includes(state.screen) ? parentChildTabs() : "") : isSupport() || isPrimaryAdmin() || state.screen === "support" ? "" : searchBox()}
+          ${isParent() ? (!["contact", "settings"].includes(state.screen) ? parentChildTabs() : "") : showGlobalSearch ? searchBox("content-search") : ""}
           ${filterBanner()}
           ${offlineStatusCard()}
+          ${pageBackButton()}
           ${content()}
           ${deleteChildDialog()}
           ${notificationToast()}
@@ -4911,6 +8413,7 @@ function renderApp() {
       </div>
     </div>`;
   bindEvents();
+  bindLocalDraftAutosave();
 }
 
 function navigationItems() {
@@ -4922,14 +8425,18 @@ function mobileMorePanel() {
   const items = mobileMoreItems();
   return `<div class="mobile-more-backdrop" data-mobile-more-close></div>
     <section class="mobile-more-panel">
-      <div class="mobile-more-head"><strong>Plus</strong><button class="icon-button" type="button" data-mobile-more-close>×</button></div>
+      <div class="mobile-more-head"><div><strong>Menu</strong><span class="mobile-connected-user">${esc(sidebarUserName())} · ${esc(accountRoleLabel(state.user))}</span></div><button class="icon-button" type="button" data-mobile-more-close>×</button></div>
       <div class="mobile-more-grid">
-        ${items.map((item) => `<button class="nav-item ${state.screen === item.screen ? "active" : ""}" data-screen="${esc(item.screen)}">${esc(item.label)}${item.badge ? ` <b class="nav-badge">${esc(item.badge)}</b>` : ""}</button>`).join("") || `<p class="muted">Aucune autre section.</p>`}
+        ${items.map((item) => {
+          const label = item.screen === "replacementRules" ? "Transfert" : item.label;
+          return `<button class="nav-item ${state.screen === item.screen ? "active" : ""}" data-screen="${esc(item.screen)}">${navIcon(item.screen)}<span class="nav-label">${esc(label)}</span>${item.badge ? ` <b class="nav-badge">${esc(item.badge)}</b>` : ""}</button>`;
+        }).join("") || `<p class="muted">Aucune autre section.</p>`}
       </div>
     </section>`;
 }
 
 function mobileMoreItems() {
+  if (window.matchMedia?.("(max-width: 640px)").matches) return configuredNavigationItems();
   if (isSupport()) return configuredNavigationItems("support").filter((item) => item.screen !== "dashboard" && item.screen !== "settings");
   if (isPrimaryAdmin()) return configuredNavigationItems("admin").filter((item) => !["dashboard", "settings"].includes(item.screen));
   if (isParent()) return [];
@@ -4965,7 +8472,7 @@ function adminInfoBar() {
   const vehicleSummary = usesSpwIdentity()
     ? `${vehicle?.busNumber || driver.busNumber || "Bus non renseigné"}`
     : `${vehicle?.busNumber || driver.busNumber || "Bus non renseigné"} · ${vehicle?.licensePlate || driver.licensePlate || "Plaque non renseignée"}`;
-  return `<section class="admin-info-bar is-filtered"><div class="admin-info-brand">${logo(true)}${companyLogo()}</div><div><span class="admin-info-kicker">Chauffeur sélectionné</span><h2>${esc(fullName(driver))}</h2><p>${esc(driver.phone || "Téléphone non renseigné")} · ${esc(vehicleSummary)}</p></div><div class="admin-info-grid"><span><b>Véhicule</b>${esc(vehicle?.busNumber || driver.busNumber || "Non renseigné")}</span><span><b>Circuit</b>${esc(circuits)}</span><span><b>École</b>${esc(schools)}</span><span><b>Convoyeuse</b>${esc(assistant ? fullName(assistant) : "Non renseigné")}</span><span><b>Élèves</b>${esc(scoped.children.length)}</span></div><div class="admin-info-badges"><span>Gestionnaire de transport</span><span>Circuit ${esc(circuits)}</span><span>${esc(schools)}</span></div></section>`;
+  return `<section class="admin-info-bar is-filtered"><div class="admin-info-brand">${dashboardBrandLogo()}${companyLogo()}</div><div><span class="admin-info-kicker">Chauffeur sélectionné</span><h2>${esc(fullName(driver))}</h2><p>${esc(driver.phone || "Téléphone non renseigné")} · ${esc(vehicleSummary)}</p></div><div class="admin-info-grid"><span><b>Véhicule</b>${esc(vehicle?.busNumber || driver.busNumber || "Non renseigné")}</span><span><b>Circuit</b>${esc(circuits)}</span><span><b>École</b>${esc(schools)}</span><span><b>Convoyeuse</b>${esc(assistant ? fullName(assistant) : "Non renseigné")}</span><span><b>Élèves</b>${esc(scoped.children.length)}</span></div><div class="admin-info-badges"><span>Gestionnaire de transport</span><span>Circuit ${esc(circuits)}</span><span>${esc(schools)}</span></div></section>`;
 }
 
 function supportAssistanceBanner() {
@@ -5011,7 +8518,63 @@ function selectedDashboardDriver() {
   return null;
 }
 
+function dashboardDriverSchool() {
+  if (state.user?.role !== "driver") return null;
+  const schools = visibleCollection("schools");
+  if (schools.length) return schools[0];
+  const schoolName = [
+    selectedDashboardDriver()?.schoolName,
+    ...scopedCircuits().flatMap((circuit) => circuitSchoolNames(circuit)),
+    ...visibleChildren().map((child) => child.schoolName)
+  ].find(Boolean);
+  if (!schoolName) return null;
+  return scopeRecordsForCurrentTransportManager("schools", data.schools || []).find((school) => school.name === schoolName) || null;
+}
+
+function openDashboardDriverSchool() {
+  const school = dashboardDriverSchool();
+  if (!school) {
+    state.screen = "schools";
+    state.selectedType = "";
+    state.selectedId = "";
+    return;
+  }
+  state.screen = "dashboard";
+  state.selectedType = "schools";
+  state.selectedId = school.id;
+}
+
+function openDashboardDriverAssistant() {
+  if (state.user?.role !== "driver") return;
+  const assistant = visibleCollection("assistants")[0] || null;
+  if (!assistant) {
+    state.screen = "assistants";
+    state.selectedType = "";
+    state.selectedId = "";
+    return;
+  }
+  state.screen = "dashboard";
+  state.selectedType = "assistants";
+  state.selectedId = assistant.id;
+}
+
+function canOpenCircuitStudentsDashboard() {
+  return ["driver", "assistant"].includes(state.user?.role);
+}
+
+function dashboardCircuitStudents() {
+  if (!canOpenCircuitStudentsDashboard()) return [];
+  return [...visibleChildren()].sort((a, b) => fullName(a).localeCompare(fullName(b), "fr", { sensitivity: "base" }));
+}
+
 function content() {
+  if (state.screen === "notice") return userNoticeView();
+  if (isSupport() && state.screen === "settings") return settingsView();
+  if (isSupport() && state.screen === "serviceStatus") return serviceStatusManagementView();
+  if (isSupport() && state.screen === "maintenance") return maintenancePlanningView();
+  if (isSupport() && state.screen === "systemMonitoring") return canAccessSystemMonitoring() ? supportSystemMonitoringView() : supportDashboard();
+  if (isSupport() && ["technical-errors", "failed-logins", "security-alerts"].includes(state.screen)) return canAccessSystemMonitoring() ? monitoringDetailView(state.screen) : supportDashboard();
+  if (isSupport() && state.screen === "requests") return canAccessRequestsModule() ? requestsView() : supportDashboard();
   if (isSupport() && state.screen === "loginLogs") return loginLogsView();
   if (isSupport() && state.screen === "replacementRules") return replacementRulesView();
   if (isSupport()) return supportDashboard();
@@ -5031,7 +8594,10 @@ function content() {
   if (state.screen === "securityGroup") return isAdmin() ? securityGroupView() : dashboard();
   if (state.screen === "history") return canViewHistoryLogs() ? historyView() : dashboard();
   if (state.screen === "replacementRules") return replacementRulesView();
-  if (state.screen === "transfers") return ["driver", "assistant"].includes(state.user?.role) ? transfersView() : dashboard();
+  if (state.screen === "delayCenter") return canAccessGlobalDelayCenter() ? delayCenterView() : dashboard();
+  if (state.screen === "transfers") return (isTransportManagerUser() || isSpwAccount()) ? transfersView() : dashboard();
+  if (state.screen === "spwContacts") return canAccessSpwContacts() ? spwContactsView() : dashboard();
+  if (state.screen === "circuitStudents") return canOpenCircuitStudentsDashboard() ? circuitStudentsView() : dashboard();
   if (state.screen === "children") return childrenList();
   if (isSupportAssistanceSession() && state.screen === "messages") return `<article class="info-card privacy-masked-card"><h3>Messages</h3><p>Information masquée pour confidentialité</p></article>`;
   if (state.screen === "messages" && ["admin", "parent", "driver", "assistant"].includes(state.user?.role)) return messagesView();
@@ -5052,12 +8618,15 @@ function content() {
   return dashboard();
 }
 
-function searchBox() {
+function searchBox(extraClass = "") {
   const results = state.search.trim().length >= 2 ? searchAll(state.search).slice(0, 8) : [];
+  const placeholder = canAccessSpwContacts()
+    ? "Rechercher élève, contact SPW, téléphone, circuit..."
+    : "Rechercher élève, téléphone, arrêt, circuit, école...";
   return `
-    <div class="search-box">
+    <div class="search-box ${esc(extraClass)}">
       <span>⌕</span>
-      <input id="global-search" value="${esc(state.search)}" placeholder="Rechercher élève, téléphone, arrêt, circuit, école...">
+      <input data-global-search value="${esc(state.search)}" placeholder="${esc(placeholder)}">
       ${results.length ? `<div class="search-results">${results.map((result) => `
         <button data-open-type="${esc(result.type)}" data-open-id="${esc(result.id)}" data-filter-result="1">
           <b>${esc(result.title)}</b>
@@ -5067,10 +8636,17 @@ function searchBox() {
 }
 
 function primaryAdminContent() {
+  if (state.screen === "notice") return userNoticeView();
+  if (state.screen === "serviceStatus") return serviceStatusManagementView();
+  if (state.screen === "maintenance") return maintenancePlanningView();
   if (state.screen === "loginLogs") return loginLogsView();
+  if (["technical-errors", "failed-logins", "security-alerts"].includes(state.screen)) return monitoringDetailView(state.screen);
+  if (state.screen === "initialManager") return primaryAdminInitialManagerView();
+  if (state.screen === "spwUsers") return primaryAdminSpwUsersView();
+  if (state.screen === "supportAccounts") return primaryAdminSupportAccountsView();
   if (state.screen === "permissionTests") return permissionTestsView();
   if (state.screen === "settings") return primaryAdminSettingsView();
-  if (state.screen === "support") return primaryAdminSupportView();
+  if (state.screen === "support") return supportDashboard();
   return primaryAdminDashboard();
 }
 
@@ -5088,6 +8664,16 @@ function selectedParentChild() {
   const children = visibleChildren();
   if (!children.length) return null;
   return children.find((child) => child.id === state.parentChildId) || children[0];
+}
+
+function parentRequestChild() {
+  if (!state.parentRequestChildId) return null;
+  return visibleChildren().find((child) => child.id === state.parentRequestChildId) || null;
+}
+
+function parentMedicalChild() {
+  if (!state.parentMedicalChildId) return null;
+  return visibleChildren().find((child) => child.id === state.parentMedicalChildId) || null;
 }
 
 function localDateString(date = new Date()) {
@@ -5145,8 +8731,21 @@ function transferCircuitIdForChild(child = {}) {
   return child.pickupCircuitId || circuitRef(child, "pickupCircuitId", child.circuitNumber) || child.circuitNumber || "";
 }
 
+function circuitTransferNameByRef(ref) {
+  const circuit = circuitByRef(ref);
+  return circuit?.transferName || "";
+}
+
 function transferNameForChild(child = {}) {
-  return child.transferLocation || child.transferCircuit || (child.circuitNumber ? `Circuit ${child.circuitNumber}` : "Transfert non renseigné");
+  const circuitTransferName =
+    circuitTransferNameByRef(child.pickupCircuitId) ||
+    circuitTransferNameByRef(child.schoolCircuitId) ||
+    circuitTransferNameByRef(child.circuitNumber);
+  return circuitTransferName || child.transferName || child.transferLocation || child.transferCircuit || (child.circuitNumber ? `Circuit ${child.circuitNumber}` : "Transfert non renseigné");
+}
+
+function transferLocationForTransfer(transfer = {}) {
+  return transfer.transferLocation || transfer.transferPlace || transfer.location || transfer.transferName || "";
 }
 
 function transferKeyFor(child = {}) {
@@ -5164,15 +8763,19 @@ function buildDerivedTransportTransfers() {
     const existing = transfers.get(transferId) || {
       transferId,
       id: transferId,
+      transportManagerId: child.transportManagerId || circuit?.transportManagerId || "",
       transferName: transferNameForChild(child),
+      transferLocation: child.transferLocation || "",
       circuitId,
-      driverId: child.driverId || circuit?.driverId || childDriver(child)?.id || "",
+      driverId: driverIdsFromRecord(child)[0] || driverIdsFromRecord(circuit || {})[0] || childDriver(child)?.id || "",
+      driverIds: uniqueText([...driverIdsFromRecord(child), ...driverIdsFromRecord(circuit || {})]),
       convoyeurId: child.assistantId || circuit?.assistantId || childAssistant(child)?.id || "",
       studentsIds: [],
       parentIds: []
     };
     if (!existing.circuitId && circuitId) existing.circuitId = circuitId;
-    if (!existing.driverId) existing.driverId = child.driverId || circuit?.driverId || "";
+    existing.driverIds = uniqueText([...(existing.driverIds || []), ...driverIdsFromRecord(child), ...driverIdsFromRecord(circuit || {})]);
+    if (!existing.driverId) existing.driverId = existing.driverIds[0] || "";
     if (!existing.convoyeurId) existing.convoyeurId = child.assistantId || circuit?.assistantId || "";
     existing.studentsIds = Array.from(new Set([...(existing.studentsIds || []), child.id].filter(Boolean)));
     existing.parentIds = Array.from(new Set([...(existing.parentIds || []), ...(child.parentIds || [])].filter(Boolean)));
@@ -5181,9 +8784,69 @@ function buildDerivedTransportTransfers() {
   return [...transfers.values()];
 }
 
+function buildCircuitTransportTransfers() {
+  return scopeRecordsForCurrentTransportManager("circuits", data.circuits || [])
+    .map((circuit) => {
+      const circuitRef = circuit.name || circuit.id || "";
+      if (!circuitRef) return null;
+      const children = scopeRecordsForCurrentTransportManager("children", data.children || []).filter((child) => {
+        const refs = childCircuitReferences(child);
+        return refs.includes(circuit.id) || refs.includes(circuit.name) || refs.includes(circuitRef);
+      });
+      return {
+        id: `circuit-transfer-${slugify(circuitRef)}`,
+        transferId: `circuit-transfer-${slugify(circuitRef)}`,
+        transportManagerId: circuit.transportManagerId || transportManagerIdForUser(state.user),
+        transferName: circuit.transferName || `Circuit ${circuitRef}`,
+        transferLocation: circuit.transferName || "",
+        circuitId: circuitRef,
+        driverId: driverIdsFromRecord(circuit)[0] || "",
+        driverIds: driverIdsFromRecord(circuit),
+        convoyeurId: circuit.assistantId || "",
+        assistantId: circuit.assistantId || "",
+        studentsIds: children.map((child) => child.id).filter(Boolean),
+        parentIds: uniqueText(children.flatMap((child) => child.parentIds || []))
+      };
+    })
+    .filter(Boolean);
+}
+
+function transferFromCircuit(circuit = {}) {
+  const circuitRef = circuit.name || circuit.id || "";
+  if (!circuitRef) return null;
+  const children = scopeRecordsForCurrentTransportManager("children", data.children || []).filter((child) => {
+    const refs = childCircuitReferences(child);
+    return refs.includes(circuit.id) || refs.includes(circuit.name) || refs.includes(circuitRef);
+  });
+  return {
+    id: `circuit-transfer-${slugify(circuitRef)}`,
+    transferId: `circuit-transfer-${slugify(circuitRef)}`,
+    transportManagerId: circuit.transportManagerId || transportManagerIdForUser(state.user),
+    transferName: circuit.transferName || `Circuit ${circuitRef}`,
+    transferLocation: circuit.transferName || "",
+    circuitId: circuitRef,
+    driverId: driverIdsFromRecord(circuit)[0] || "",
+    driverIds: driverIdsFromRecord(circuit),
+    convoyeurId: circuit.assistantId || "",
+    assistantId: circuit.assistantId || "",
+    studentsIds: children.map((child) => child.id).filter(Boolean),
+    parentIds: uniqueText(children.flatMap((child) => child.parentIds || []))
+  };
+}
+
+function delayDeclarationTransfers() {
+  const visible = visibleTransportTransfers().filter((transfer) => canManageTransferDelay(transfer));
+  if (visible.length) return visible;
+  if (!canCreateTransferDelay()) return [];
+  return scopeRecordsForCurrentTransportManager("circuits", data.circuits || [])
+    .map(transferFromCircuit)
+    .filter(Boolean)
+    .filter((transfer) => recordBelongsToTransportManager(transfer, transportManagerIdForUser(state.user)));
+}
+
 function allTransportTransfers() {
   const byId = new Map();
-  [...(data.transportTransfers || []), ...buildDerivedTransportTransfers()].forEach((transfer) => {
+  [...buildCircuitTransportTransfers(), ...buildDerivedTransportTransfers(), ...(data.transportTransfers || [])].forEach((transfer) => {
     const id = transfer.transferId || transfer.id;
     if (!id) return;
     const existing = byId.get(id) || {};
@@ -5192,6 +8855,7 @@ function allTransportTransfers() {
       ...transfer,
       id,
       transferId: id,
+      driverIds: uniqueText([...(existing.driverIds || []), ...(transfer.driverIds || []), existing.driverId, transfer.driverId].filter(Boolean)),
       studentsIds: Array.from(new Set([...(existing.studentsIds || []), ...(transfer.studentsIds || [])].filter(Boolean))),
       parentIds: Array.from(new Set([...(existing.parentIds || []), ...(transfer.parentIds || [])].filter(Boolean)))
     });
@@ -5200,15 +8864,16 @@ function allTransportTransfers() {
 }
 
 function canSeeTransfer(transfer = {}) {
-  if (!state.user || isSupport() || usesSpwIdentity()) return false;
+  if (!state.user || isSupport()) return false;
   if (isPrimaryAdmin()) return false;
+  if (!recordBelongsToTransportManager(transfer, transportManagerIdForUser(state.user))) return false;
   if (isAdmin()) return true;
   if (isParent()) {
     const linked = new Set(state.user.linkedChildrenIds || []);
     return (transfer.parentIds || []).includes(state.user.id) || (transfer.studentsIds || []).some((id) => linked.has(id));
   }
   if (state.user.role === "driver") {
-    return transfer.driverId === state.user.id || userCircuitNames().has(transfer.circuitId) || transferHasVisibleStudent(transfer);
+    return driverIdsFromRecord(transfer).includes(state.user.id) || userCircuitNames().has(transfer.circuitId) || transferHasVisibleStudent(transfer);
   }
   if (state.user.role === "assistant") {
     return transfer.convoyeurId === state.user.id || transfer.assistantId === state.user.id || userCircuitNames().has(transfer.circuitId) || transferHasVisibleStudent(transfer);
@@ -5228,10 +8893,33 @@ function visibleTransportTransfers() {
 }
 
 function canManageTransferDelay(transfer = {}) {
-  if (!["driver", "assistant"].includes(state.user?.role)) return false;
+  if (isTransportManagerUser()) return canSeeTransfer(transfer);
+  if (state.user?.role !== "driver") return false;
   if (!canSeeTransfer(transfer)) return false;
-  if (state.user.role === "driver") return transfer.driverId === state.user.id || userCircuitNames().has(transfer.circuitId);
-  return transfer.convoyeurId === state.user.id || transfer.assistantId === state.user.id || userCircuitNames().has(transfer.circuitId);
+  return driverIdsFromRecord(transfer).includes(state.user.id) || userCircuitNames().has(transfer.circuitId);
+}
+
+function manualDelayTransfer(circuitId = "") {
+  if (!canCreateTransferDelay()) return null;
+  const normalizedCircuit = circuitId || "Non renseigné";
+  return {
+    id: `manual-delay-${state.user?.id || "user"}-${slugify(normalizedCircuit)}`,
+    transferId: `manual-delay-${state.user?.id || "user"}-${slugify(normalizedCircuit)}`,
+    transportManagerId: transportManagerIdForUser(state.user),
+    transferName: normalizedCircuit === "Non renseigné" ? "Retard transport" : `Circuit ${normalizedCircuit}`,
+    circuitId: normalizedCircuit,
+    driverId: state.user?.role === "driver" ? state.user.id : "",
+    driverIds: state.user?.role === "driver" ? [state.user.id] : [],
+    convoyeurId: state.user?.role === "assistant" ? state.user.id : "",
+    assistantId: state.user?.role === "assistant" ? state.user.id : "",
+    studentsIds: [],
+    parentIds: [],
+    manualDelay: true
+  };
+}
+
+function canManageTransferLocation(transfer = {}) {
+  return isTransportManagerUser() && canSeeTransfer(transfer);
 }
 
 function transferById(transferId) {
@@ -5239,8 +8927,10 @@ function transferById(transferId) {
 }
 
 function canSeeTransferDelay(delay = {}) {
-  if (!state.user || isSupport() || usesSpwIdentity()) return false;
+  if (!state.user || isSupport() || isSpwAccount()) return false;
   if (isPrimaryAdmin()) return false;
+  if (["driver", "assistant"].includes(state.user.role)) return true;
+  if (!recordBelongsToTransportManager(delay, transportManagerIdForUser(state.user))) return false;
   if (isAdmin()) return true;
   const transfer = transferById(delay.transferId);
   if (transfer && canSeeTransfer(transfer)) return true;
@@ -5248,15 +8938,107 @@ function canSeeTransferDelay(delay = {}) {
     const linked = new Set(state.user.linkedChildrenIds || []);
     return (delay.parentIds || []).includes(state.user.id) || (delay.studentsIds || []).some((id) => linked.has(id));
   }
-  if (state.user.role === "driver") return delay.driverId === state.user.id || userCircuitNames().has(delay.circuitId);
-  if (state.user.role === "assistant") return delay.convoyeurId === state.user.id || delay.assistantId === state.user.id || userCircuitNames().has(delay.circuitId);
   return false;
+}
+
+function canReceiveTransferDelayNotifications() {
+  return ["driver", "assistant"].includes(state.user?.role) && !isSupport() && !isSpwAccount() && !isPrimaryAdmin();
+}
+
+function canAccessGlobalDelayCenter() {
+  return (["driver", "assistant"].includes(state.user?.role) || isTransportManagerUser())
+    && !isSupport()
+    && !isSpwAccount()
+    && !isPrimaryAdmin()
+    && !isParent();
+}
+
+function canCreateTransferDelay() {
+  return (state.user?.role === "driver" || isTransportManagerUser()) && canAccessGlobalDelayCenter();
+}
+
+function canCancelTransferDelay(delay = {}) {
+  if (!delay || delay.status !== "active" || !canAccessGlobalDelayCenter()) return false;
+  if (isTransportManagerUser()) return true;
+  return state.user?.role === "driver" && (delay.createdById === state.user.id || delay.driverId === state.user.id);
+}
+
+function canDeleteTransferDelay(delay = {}) {
+  return !!delay && isTransportManagerUser() && canAccessGlobalDelayCenter();
+}
+
+function activeTransferDelayNotifications() {
+  if (!canReceiveTransferDelayNotifications()) return [];
+  return (data.transferDelays || [])
+    .filter((delay) => delay.status === "active")
+    .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
 }
 
 function activeTransferDelays() {
   return (data.transferDelays || [])
     .filter((delay) => delay.status === "active" && canSeeTransferDelay(delay))
     .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+}
+
+function delayNotificationForTransfer(delay) {
+  return {
+    id: `notification-delay-${delay.id}`,
+    type: "delay",
+    status: delay.status || "active",
+    key: delay.id,
+    entityId: delay.id,
+    transferId: delay.transferId || "",
+    transferName: delay.transferName || "",
+    circuitId: delay.circuitId || "",
+    transportManagerId: delay.transportManagerId || transportManagerIdForUser(state.user),
+    delayMinutes: delay.delayMinutes || "",
+    title: "Retard signalé",
+    message: `${delay.transferName || "Transfert"}${delay.circuitId ? ` - circuit ${delay.circuitId}` : ""} : ${delay.delayMinutes || ""} min${delay.reason ? ` - ${delay.reason}` : ""}`,
+    icon: "!",
+    link: "transfers",
+    recipientRoles: ["driver", "assistant", "transport_manager"],
+    createdById: delay.createdById || state.user?.id || "",
+    createdByRole: delay.createdByRole || state.user?.role || "",
+    createdAt: delay.createdAt || new Date().toISOString(),
+    cancelledAt: delay.cancelledAt || "",
+    resolvedAt: delay.resolvedAt || "",
+    readBy: []
+  };
+}
+
+function createDelayNotification(delay) {
+  const notification = delayNotificationForTransfer(delay);
+  data.notifications = data.notifications || [];
+  const index = data.notifications.findIndex((item) => item.id === notification.id);
+  if (index >= 0) data.notifications[index] = { ...data.notifications[index], ...notification };
+  else data.notifications.unshift(notification);
+  data.notifications = data.notifications.slice(0, 300);
+  saveNotificationToFirestore(notification);
+  return notification;
+}
+
+function delayNotificationForId(delayId) {
+  return (data.notifications || []).find((notification) => notification.type === "delay" && (notification.entityId === delayId || notification.id === `notification-delay-${delayId}`)) || null;
+}
+
+function saveDelayNotificationStatus(delay) {
+  const existing = delayNotificationForId(delay.id);
+  const notification = {
+    ...delayNotificationForTransfer(delay),
+    ...(existing || {}),
+    status: delay.status || "active",
+    delayMinutes: delay.delayMinutes || existing?.delayMinutes || "",
+    message: `${delay.transferName || "Transfert"}${delay.circuitId ? ` - circuit ${delay.circuitId}` : ""} : ${delay.delayMinutes || ""} min${delay.reason ? ` - ${delay.reason}` : ""}`,
+    cancelledAt: delay.cancelledAt || existing?.cancelledAt || "",
+    resolvedAt: delay.resolvedAt || existing?.resolvedAt || "",
+    readBy: existing?.readBy || []
+  };
+  data.notifications = data.notifications || [];
+  const index = data.notifications.findIndex((item) => item.id === notification.id);
+  if (index >= 0) data.notifications[index] = notification;
+  else data.notifications.unshift(notification);
+  saveData();
+  saveNotificationToFirestore(notification);
 }
 
 function activeDelayForTransfer(transfer = {}) {
@@ -5280,7 +9062,11 @@ function delayBadge(child) {
 }
 
 function transferDelayAlerts(child = null) {
-  const delays = child ? [activeDelayForChild(child)].filter(Boolean) : activeTransferDelays();
+  const readIds = new Set((data.notifications || [])
+    .filter((notification) => notification.type === "delay" && notification.readBy?.includes(state.user?.id))
+    .map((notification) => notification.entityId || notification.key));
+  const delays = (child ? [activeDelayForChild(child)].filter(Boolean) : activeTransferDelays())
+    .filter((delay) => !readIds.has(delay.id));
   if (!delays.length) return "";
   if (isParent()) {
     const delay = delays[0];
@@ -5288,17 +9074,18 @@ function transferDelayAlerts(child = null) {
   }
   return `<article class="pending-card transfer-delay-alert">
     <div class="pending-head"><div><p class="eyebrow">Retards</p><h3>Retard en cours</h3><span>${esc(delays.length)} transfert${delays.length > 1 ? "s" : ""} concerné${delays.length > 1 ? "s" : ""}</span></div><b class="badge warning">${esc(delays.length)}</b></div>
-    <div class="quick-list-inner">${delays.map((delay) => `<div class="child-row as-static"><span>${esc(delay.transferName || "Transfert")}</span><small>${esc([delay.circuitId, `${delay.delayMinutes} min`, delay.reason].filter(Boolean).join(" - "))}</small><b class="badge warning">Retard en cours</b></div>`).join("")}</div>
+    <div class="quick-list-inner">${delays.map((delay) => `<div class="child-row as-static"><span>${esc(delay.transferName || "Transfert")}</span><small>${esc([delay.circuitId, `${delay.delayMinutes} min`, delay.reason].filter(Boolean).join(" - "))}</small><button class="secondary-button compact-action" type="button" data-mark-delay-read="${esc(delay.id)}">Marquer comme lu</button></div>`).join("")}</div>
   </article>`;
 }
 
 function parentContent() {
+  if (state.screen === "notice") return userNoticeView();
   if (state.screen === "settings") return parentSettingsView();
   if (state.screen === "contact") return parentContactView();
   const child = selectedParentChild();
   if (!child) return `<section class="view-stack"><article class="info-card"><p>${esc(parentT("parent.noAccess"))}</p></article></section>`;
-  if (state.parentRequestChildId) return parentChangeForm(child);
-  if (parentMedicalHelpNeedsCompletion(child)) return parentChangeForm(child, true);
+  if (state.parentMedicalChildId) return parentMedicalHelpForm(parentMedicalChild() || child);
+  if (state.parentRequestChildId) return parentChangeForm(parentRequestChild() || child);
   if (state.screen === "messages") return messagesView();
   if (state.screen === "children") return parentChildFile(child);
   return parentDashboard(child);
@@ -5320,6 +9107,130 @@ function parentContactView() {
   </section>`;
 }
 
+function canAccessSpwContacts() {
+  return state.user?.role === "assistant" || isSpwAccount();
+}
+
+function canManageSpwContacts() {
+  return isSpwAccount() && !isSupportAssistanceSession();
+}
+
+function spwContactRecords() {
+  return (Array.isArray(data.spwContacts) && data.spwContacts.length ? data.spwContacts : defaultSpwContacts)
+    .filter((contact) => !isDeletedRecord("spwContacts", contact.id, data))
+    .sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""), "fr"));
+}
+
+function telHref(phone = "") {
+  return String(phone || "").replace(/[^\d+]/g, "");
+}
+
+function contactActionLinks(contact = {}) {
+  const phones = [contact.phone, contact.mobile].filter(Boolean);
+  return `<div class="spw-contact-links">
+    ${phones.map((phone) => `<a class="spw-contact-link" href="tel:${esc(telHref(phone))}"><span aria-hidden="true">☎</span>${esc(phone)}</a>`).join("")}
+    ${contact.email ? `<a class="spw-contact-link" href="mailto:${esc(contact.email)}"><span aria-hidden="true">✉</span>${esc(contact.email)}</a>` : ""}
+  </div>`;
+}
+
+function spwContactForm(contact = {}, mode = "create") {
+  const isEdit = mode === "edit";
+  return `<form class="info-card form-grid spw-contact-form" data-spw-contact-form="${esc(isEdit ? contact.id : "new")}">
+    <h3>${esc(isEdit ? "Modifier le contact" : "Ajouter une personne")}</h3>
+    ${input("name", "Nom et prénom", contact.name || "")}
+    ${input("role", "Fonction", contact.role || "")}
+    ${input("phone", "Téléphone", contact.phone || "")}
+    ${input("mobile", "GSM", contact.mobile || "")}
+    ${input("email", "Adresse e-mail", contact.email || "", "email")}
+    <div class="form-actions full-span">
+      <button class="primary-button compact-action" type="submit">${esc(isEdit ? "Enregistrer" : "Ajouter")}</button>
+      ${isEdit ? `<button class="secondary-button" type="button" data-cancel-spw-contact-edit>Annuler</button>` : ""}
+    </div>
+  </form>`;
+}
+
+function spwContactCard(contact) {
+  const editing = state.editingSpwContactId === contact.id;
+  if (editing && canManageSpwContacts()) return spwContactForm(contact, "edit");
+  return `<article class="info-card spw-contact-card">
+    <div class="action-title">
+      <div><h3>${esc(contact.name)}</h3><p class="muted">${esc(contact.role)}</p></div>
+      ${canManageSpwContacts() ? `<div class="action-row">
+        <button class="secondary-button compact-action" type="button" data-edit-spw-contact="${esc(contact.id)}">Modifier</button>
+        <button class="danger-button compact-action" type="button" data-delete-spw-contact="${esc(contact.id)}">Supprimer</button>
+      </div>` : ""}
+    </div>
+    ${sectionRows([
+      ["Téléphone", contact.phone],
+      ["GSM", contact.mobile],
+      ["Email", contact.email]
+    ])}
+    ${contactActionLinks(contact)}
+  </article>`;
+}
+
+function spwContactsView() {
+  if (!canAccessSpwContacts()) return dashboard();
+  const contacts = spwContactRecords();
+  return `<section class="view-stack">
+    <div class="section-title"><p class="eyebrow">Contact SPW</p><h2>Coordonnées BR Liège-Verviers</h2></div>
+    ${canManageSpwContacts() ? spwContactForm({}, "create") : ""}
+    <article class="info-card spw-contact-card spw-general-contact">
+      ${sectionRows([
+        ["Boîte générale", "info-tr-liege@spw.wallonie.be"],
+        ["Téléphone général", "04/230 39 00"]
+      ])}
+      <div class="spw-contact-links">
+        <a class="spw-contact-link" href="tel:042303900"><span aria-hidden="true">☎</span>04/230 39 00</a>
+        <a class="spw-contact-link" href="mailto:info-tr-liege@spw.wallonie.be"><span aria-hidden="true">✉</span>info-tr-liege@spw.wallonie.be</a>
+      </div>
+    </article>
+    <div class="card-grid">
+      ${contacts.map(spwContactCard).join("") || `<article class="info-card"><p class="muted">Aucun contact SPW encodé.</p></article>`}
+    </div>
+  </section>`;
+}
+
+function saveSpwContact(event) {
+  event.preventDefault();
+  if (!canManageSpwContacts()) return alert("Modification réservée au SPW.");
+  const form = event.currentTarget;
+  const id = form.dataset.spwContactForm === "new"
+    ? `spw-contact-${Date.now()}`
+    : form.dataset.spwContactForm;
+  const contact = {
+    id,
+    name: String(form.elements.name.value || "").trim(),
+    role: String(form.elements.role.value || "").trim(),
+    phone: String(form.elements.phone.value || "").trim(),
+    mobile: String(form.elements.mobile.value || "").trim(),
+    email: String(form.elements.email.value || "").trim(),
+    updatedAt: new Date().toISOString(),
+    updatedBy: state.user.id
+  };
+  if (!contact.name) return alert("Nom et prénom obligatoires.");
+  data.spwContacts = Array.isArray(data.spwContacts) ? data.spwContacts : [];
+  const existing = data.spwContacts.find((item) => item.id === id);
+  if (existing) Object.assign(existing, contact);
+  else data.spwContacts.push({ ...contact, createdAt: contact.updatedAt, createdBy: state.user.id });
+  state.editingSpwContactId = "";
+  saveData();
+  saveCollectionItemToFirestore("spwContacts", existing || data.spwContacts.find((item) => item.id === id));
+  render();
+}
+
+function deleteSpwContact(contactId) {
+  if (!canManageSpwContacts()) return alert("Suppression réservée au SPW.");
+  const contact = (data.spwContacts || []).find((item) => item.id === contactId) || defaultSpwContacts.find((item) => item.id === contactId);
+  if (!contact) return;
+  if (!confirm(`Supprimer définitivement ${contact.name || "ce contact"} des coordonnées SPW ?`)) return;
+  data.spwContacts = (Array.isArray(data.spwContacts) ? data.spwContacts : defaultSpwContacts.map((item) => ({ ...item }))).filter((item) => item.id !== contactId);
+  state.editingSpwContactId = "";
+  saveData();
+  deleteCollectionItemFromFirestore("spwContacts", contactId);
+  render();
+}
+
 function parentDashboard(child) {
   const vehicle = childVehicle(child);
   const driver = childDriver(child);
@@ -5333,10 +9244,12 @@ function parentDashboard(child) {
     { id: "driver", label: parentT("dashboard.driver"), render: (label) => metric(label, driver ? fullName(driver) : parentT("common.unknown")) },
     { id: "assistant", label: parentT("dashboard.assistant"), render: (label) => metric(label, assistant ? fullName(assistant) : parentT("common.unknown")) },
     { id: "stop", label: parentT("dashboard.stop"), render: (label) => metric(label, child.pickupStop || parentT("common.unknown")) },
+    { id: "morningPassage", label: parentT("dashboard.morningPassage"), render: (label) => metric(label, childMorningPassageTime(child) || parentT("common.unknown")) },
     { id: "important", label: parentT("dashboard.important"), render: (label) => metric(label, medicalSheet.careAdviceNotes || medicalSheet.allergiesDetails || parentT("dashboard.noAlert")) }
   ];
   return `<section class="view-stack">
     <div class="section-title"><p class="eyebrow">${esc(parentT("parent.space"))}</p><h2>${esc(fullName(child))}</h2></div>
+    ${maintenanceNoticeCard()}
     ${vehicleOutOfServiceAlerts(child)}
     ${circuitReplacementAlerts(child)}
     ${transferDelayAlerts(child)}
@@ -5349,6 +9262,10 @@ function parentDashboard(child) {
     ${parentAbsenceCard(child)}
     ${parentTransferCard(child)}
   </section>`;
+}
+
+function childMorningPassageTime(child = {}) {
+  return child.morningPickupTime || child.pickupTime || child.morningPassageTime || child.morningTime || "";
 }
 
 function parentAbsenceCard(child) {
@@ -5384,25 +9301,39 @@ function studentAbsencesDashboardCard() {
 }
 
 function parentChildFile(child) {
+  const parentInfoRows = [
+    [parentT("child.firstName"), child.firstName],
+    [parentT("child.lastName"), child.lastName],
+    [parentT("child.school"), child.schoolName],
+    [parentT("child.circuitNumber"), child.circuitNumber],
+    [parentT("child.pickupCircuit"), childPickupCircuitLabel(child)],
+    [parentT("child.schoolCircuit"), childSchoolCircuitLabel(child)],
+    [parentT("child.bus"), childVehicle(child)?.busNumber || parentT("common.unknown")],
+    [parentT("dashboard.assistant"), childAssistant(child) ? fullName(childAssistant(child)) : parentT("common.unknown")],
+    [parentT("child.assistantPhone"), childAssistant(child)?.phone || parentT("common.unknown")],
+    ["Heure de passage matin", childMorningPassageTime(child)],
+    [parentT("child.stop"), child.pickupStop],
+    [parentT("child.address"), child.homeAddress]
+  ];
   return `<section class="view-stack child-detail">
-    <div class="detail-head">
+    <div class="detail-head parent-child-detail-head">
       <div><p class="eyebrow">${esc(parentT("parent.file"))}</p><h2>${esc(fullName(child))}</h2></div>
-      ${badge(child)}${alternatingCustodyBadge(child)}${specialAttentionBadge(child)}
       <button class="primary-button compact-action" data-parent-request="${esc(child.id)}">${esc(parentT("parent.propose"))}</button>
     </div>
+    ${childStatusAlerts(child)}
     ${vehicleOutOfServiceAlerts(child)}
     ${circuitReplacementAlerts(child)}
     ${transferDelayAlerts(child)}
     ${studentIssueUrgentAlert(child)}
     ${isParent() ? parentAbsenceCard(child) : ""}
     <div class="detail-grid">
-      ${section(parentT("child.info"), [[parentT("child.firstName"), child.firstName], [parentT("child.lastName"), child.lastName], [parentT("child.school"), child.schoolName], [parentT("child.circuitNumber"), child.circuitNumber], [parentT("child.pickupCircuit"), childPickupCircuitLabel(child)], [parentT("child.schoolCircuit"), childSchoolCircuitLabel(child)], [parentT("child.bus"), childVehicle(child)?.busNumber || parentT("common.unknown")], [parentT("dashboard.driver"), childDriver(child) ? fullName(childDriver(child)) : parentT("common.unknown")], [parentT("dashboard.assistant"), childAssistant(child) ? fullName(childAssistant(child)) : parentT("common.unknown")], [parentT("child.assistantPhone"), childAssistant(child)?.phone || parentT("common.unknown")], [parentT("child.stop"), child.pickupStop], [parentT("child.address"), child.homeAddress]])}
+      ${section(parentT("child.info"), parentInfoRows)}
       ${parentVehicleSection(child)}
       ${parentTransferCard(child)}
       ${alternatingResidenceSection(child)}
       ${specialAttentionBox(child)}
-      ${peopleSection(parentT("people.guardians"), child.responsiblePersons || child.guardians)}
-      ${readonlyAuthorizedPeople(child.authorizedPersons || child.authorizedPickupPersons)}
+      ${peopleSection(parentT("people.guardians"), responsiblePeopleForChild(child))}
+      ${readonlyAuthorizedPeople(authorizedPeopleForChild(child))}
       ${medicalHelpSection(child)}
       ${section(parentT("child.health"), [[parentT("child.parentNotes"), child.parentNotes]])}
       ${studentIssuesSection(child)}
@@ -5421,7 +9352,7 @@ function parentVehicleSection(child) {
 }
 
 function readonlyAuthorizedPeople(people = []) {
-  return `<article class="info-card"><h3>${esc(parentT("people.authorized"))}</h3><b class="badge warning">${esc(parentT("people.reserved"))}</b>${people.map((person) => `
+  return `<article class="info-card"><h3>${esc(parentT("people.authorized"))}</h3>${people.map((person) => `
     <div class="person-card">
       <strong>${esc(fullName(person))}</strong>
       <span>${esc(person.relation || parentT("people.relationUnknown"))}</span>
@@ -5429,6 +9360,18 @@ function readonlyAuthorizedPeople(people = []) {
       ${person.phone ? `<small>${esc(person.phone)}</small>` : ""}
       ${person.note ? `<small>${esc(person.note)}</small>` : ""}
     </div>`).join("") || `<p class="muted">${esc(parentT("people.none"))}</p>`}</article>`;
+}
+
+function firstNonEmptyPeopleList(...lists) {
+  return lists.find((list) => Array.isArray(list) && list.length) || [];
+}
+
+function responsiblePeopleForChild(child = {}) {
+  return firstNonEmptyPeopleList(child.responsiblePersons, child.guardians);
+}
+
+function authorizedPeopleForChild(child = {}) {
+  return firstNonEmptyPeopleList(child.authorizedPersons, child.authorizedPickupPersons);
 }
 
 function parentTransferCard(child) {
@@ -5455,10 +9398,27 @@ function parentChangeForm(child, requiredMedicalCompletion = false) {
         <h3>${esc(requiredMedicalCompletion ? "Fiche médicale / aide à la prise en charge" : parentT("request.title"))}</h3>
         ${addressInput("homeAddress", parentT("child.address"), syncedAddress)}
         ${input("guardianPhone", parentT("request.parentPhone"), guardian.phone || state.user?.phone || "", "tel")}
-        ${parentMedicalHelpEditFields(child)}
         ${textArea("parentNotes", parentT("child.parentNotes"), child.parentNotes)}
       </article>
       <div class="form-actions"><button class="primary-button compact-action" type="submit">${esc(requiredMedicalCompletion ? "Valider et accéder à la fiche" : parentT("request.send"))}</button>${requiredMedicalCompletion ? "" : `<button class="secondary-button" type="button" data-cancel-parent-request>${esc(parentT("request.cancel"))}</button>`}</div>
+    </form>
+  </section>`;
+}
+
+function parentMedicalHelpForm(child) {
+  const completed = !!child.parentMedicalHelpCompletedAt;
+  return `<section class="view-stack">
+    <div class="detail-head"><button class="icon-button" data-cancel-parent-medical-request title="${esc(parentT("common.back"))}">‹</button><div><p class="eyebrow">Fiche médicale</p><h2>${esc(fullName(child))}</h2></div></div>
+    <form class="edit-form" id="parent-medical-help-form" data-child-id="${esc(child.id)}">
+      <article class="info-card form-grid">
+        <h3>Fiche médicale / aide à la prise en charge</h3>
+        <p class="muted full-span">${esc(completed ? "Vous pouvez modifier et enregistrer la fiche médicale à tout moment." : "Merci de compléter et enregistrer la fiche médicale de l’enfant.")}</p>
+        ${parentMedicalHelpEditFields(child)}
+      </article>
+      <div class="form-actions">
+        <button class="primary-button compact-action" type="submit">Enregistrer la fiche</button>
+        <button class="secondary-button" type="button" data-cancel-parent-medical-request>${esc(parentT("request.cancel"))}</button>
+      </div>
     </form>
   </section>`;
 }
@@ -5473,13 +9433,32 @@ function childVehicle(child) {
 }
 
 function childDriver(child) {
+  return childDrivers(child)[0] || null;
+}
+
+function childDrivers(child) {
   const circuit = childCircuit(child);
-  return data.drivers.find((driver) => driver.id === child.driverId || driver.id === circuit?.driverId || driver.schoolCircuit === child.circuitNumber) || null;
+  const driverIds = new Set([
+    ...driverIdsFromRecord(child),
+    ...driverIdsFromRecord(circuit || {})
+  ]);
+  const circuitNumber = String(child?.circuitNumber || "").trim();
+  return data.drivers.filter((driver) =>
+    driverIds.has(driver.id) ||
+    (circuitNumber && driver.schoolCircuit === circuitNumber)
+  );
 }
 
 function childAssistant(child) {
   const circuit = childCircuit(child);
-  return data.assistants.find((assistant) => assistant.id === child.assistantId || assistant.id === circuit?.assistantId || assistant.schoolCircuit === child.circuitNumber) || null;
+  const assistantId = String(child?.assistantId || "").trim();
+  const circuitAssistantId = String(circuit?.assistantId || "").trim();
+  const circuitNumber = String(child?.circuitNumber || "").trim();
+  return data.assistants.find((assistant) =>
+    (assistantId && assistant.id === assistantId) ||
+    (circuitAssistantId && assistant.id === circuitAssistantId) ||
+    (circuitNumber && assistant.schoolCircuit === circuitNumber)
+  ) || null;
 }
 
 function transferVehicle(child) {
@@ -5498,7 +9477,7 @@ function openChildPdfPreview(child) {
   const pdfWindow = window.open("", "_blank");
   if (!pdfWindow) return alert("Autorisez les fenêtres pop-up pour générer le PDF.");
   const vehicle = childVehicle(child);
-  const driver = childDriver(child);
+  const drivers = childDrivers(child);
   const assistant = childAssistant(child);
   const transferChanges = child.changesBusAtTransfer || !child.staysInSameBus;
   const transferVehicleData = transferVehicle(child);
@@ -5518,9 +9497,10 @@ function openChildPdfPreview(child) {
     ["Transport", [
       ["Circuit de prise en charge", childPickupCircuitLabel(child)],
       ["Lieu de transfert", child.transferLocation],
+      ...(!isParent() ? [["Nom du transfert", transferNameForChild(child)]] : []),
       ["Circuit vers l’école", childSchoolCircuitLabel(child)],
       ["Numéro du bus", vehicle?.busNumber || child.transferVehicleId],
-      ["Chauffeur associé", driver ? fullName(driver) : ""],
+      ["Chauffeurs associés", drivers.map(fullName).join(", ")],
       ["Convoyeuse associée", assistant ? fullName(assistant) : ""],
       ["Téléphone convoyeuse", assistant?.phone],
       ["Arrêt de prise en charge", child.pickupStop],
@@ -5545,8 +9525,8 @@ function openChildPdfPreview(child) {
       ["Début exclusion", child.exclusionStartDate],
       ["Fin exclusion", child.exclusionEndDate]
     ]],
-    ["Responsables", peoplePdfRows(child.guardians)],
-    ["Personnes autorisées", peoplePdfRows(child.authorizedPickupPersons)],
+    ["Responsables", peoplePdfRows(responsiblePeopleForChild(child))],
+    ["Personnes autorisées", peoplePdfRows(authorizedPeopleForChild(child))],
     ["Fiche médicale / aide à la prise en charge", medicalHelpRows(child)],
     ["Remarques utiles", [
       ["Notes parents", child.parentNotes],
@@ -5599,8 +9579,8 @@ function openChildPdfPreview(child) {
       <body>
         <main class="page">
           <div class="toolbar">
-            <button class="primary" onclick="downloadPdf()">Télécharger le PDF</button>
-            <button class="secondary" onclick="sharePdf()">Exporter / partager le PDF</button>
+            <button class="primary" onclick="downloadPdf()">Télécharger / imprimer PDF</button>
+            <button class="secondary" onclick="sharePdf()">Exporter / enregistrer</button>
             <button onclick="window.print()">Imprimer</button>
           </div>
           <header>
@@ -5616,121 +9596,11 @@ function openChildPdfPreview(child) {
         <script>
           const pdfPayload = ${pdfPayloadScript};
 
-          function pdfHex(text) {
-            const source = String(text || "");
-            let hex = "FEFF";
-            for (let index = 0; index < source.length; index += 1) {
-              const code = source.charCodeAt(index).toString(16).toUpperCase().padStart(4, "0");
-              hex += code;
-            }
-            return "<" + hex + ">";
-          }
-
-          function wrapPdfText(text, maxLength) {
-            const words = String(text || "").replace(/\\s+/g, " ").trim().split(" ");
-            const lines = [];
-            let line = "";
-            words.forEach((word) => {
-              const next = line ? line + " " + word : word;
-              if (next.length > maxLength && line) {
-                lines.push(line);
-                line = word;
-              } else {
-                line = next;
-              }
-            });
-            if (line) lines.push(line);
-            return lines.length ? lines : [""];
-          }
-
-          function pdfLines(payload) {
-            const lines = [
-              { text: "Gestion Transport Scolaire", size: 16 },
-              { text: "Fiche élève", size: 20 },
-              { text: payload.childName + " · Généré le " + payload.generatedAt, size: 11 },
-              { text: "Statut : " + payload.status, size: 11 },
-              { text: "", size: 8 }
-            ];
-            payload.sections.forEach((section) => {
-              lines.push({ text: section.title, size: 14 });
-              if (!section.rows.length) lines.push({ text: "Non renseigné", size: 10 });
-              section.rows.forEach((row) => {
-                wrapPdfText(row.label + " : " + row.value, 88).forEach((line) => lines.push({ text: line, size: 10 }));
-              });
-              lines.push({ text: "", size: 7 });
-            });
-            return lines;
-          }
-
-          function createPdfBlob(payload) {
-            const allLines = pdfLines(payload);
-            const pages = [];
-            let current = [];
-            allLines.forEach((line) => {
-              const lineHeight = line.size >= 14 ? 20 : 15;
-              if (current.reduce((total, item) => total + (item.size >= 14 ? 20 : 15), 0) + lineHeight > 740) {
-                pages.push(current);
-                current = [];
-              }
-              current.push(line);
-            });
-            if (current.length) pages.push(current);
-
-            const objects = [null, "", "", "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"];
-            const pageIds = [];
-            pages.forEach((pageLines) => {
-              let y = 800;
-              const stream = pageLines.map((line) => {
-                const size = line.size || 10;
-                const command = "BT /F1 " + size + " Tf 42 " + y + " Td " + pdfHex(line.text) + " Tj ET";
-                y -= size >= 14 ? 20 : 15;
-                return command;
-              }).join("\\n");
-              const contentId = objects.length;
-              objects.push("<< /Length " + stream.length + " >>\\nstream\\n" + stream + "\\nendstream");
-              const pageId = objects.length;
-              objects.push("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents " + contentId + " 0 R >>");
-              pageIds.push(pageId);
-            });
-            objects[1] = "<< /Type /Catalog /Pages 2 0 R >>";
-            objects[2] = "<< /Type /Pages /Kids [" + pageIds.map((id) => id + " 0 R").join(" ") + "] /Count " + pageIds.length + " >>";
-
-            let output = "%PDF-1.4\\n%\\xE2\\xE3\\xCF\\xD3\\n";
-            const offsets = [0];
-            for (let index = 1; index < objects.length; index += 1) {
-              offsets[index] = output.length;
-              output += index + " 0 obj\\n" + objects[index] + "\\nendobj\\n";
-            }
-            const xrefOffset = output.length;
-            output += "xref\\n0 " + objects.length + "\\n0000000000 65535 f \\n";
-            for (let index = 1; index < objects.length; index += 1) {
-              output += String(offsets[index]).padStart(10, "0") + " 00000 n \\n";
-            }
-            output += "trailer\\n<< /Size " + objects.length + " /Root 1 0 R >>\\nstartxref\\n" + xrefOffset + "\\n%%EOF";
-            return new Blob([new TextEncoder().encode(output)], { type: "application/pdf" });
-          }
-
           function downloadPdf() {
-            const blob = createPdfBlob(pdfPayload);
-            const url = URL.createObjectURL(blob);
-            const link = document.createElement("a");
-            link.href = url;
-            link.download = pdfPayload.fileName;
-            document.body.appendChild(link);
-            link.click();
-            link.remove();
-            setTimeout(() => URL.revokeObjectURL(url), 1000);
+            window.print();
           }
 
           async function sharePdf() {
-            const blob = createPdfBlob(pdfPayload);
-            const file = new File([blob], pdfPayload.fileName, { type: "application/pdf" });
-            if (navigator.canShare && navigator.canShare({ files: [file] })) {
-              try {
-                await navigator.share({ title: document.title, files: [file] });
-                return;
-              } catch (error) {}
-            }
             downloadPdf();
           }
         </script>
@@ -5761,14 +9631,17 @@ function messagePanel(child) {
   const messages = childMessages(child.id);
   const linkedParents = parentListForChild(child);
   const transportUserLabel = state.user?.role === "assistant" ? "Message au parent de l’élève" : state.user?.role === "driver" ? "Message au parent de l’élève" : "Nouveau message";
+  const parentLinkLabel = linkedParents.length
+    ? linkedParents.map((parent) => `${fullName(parent)}${parent.phone ? ` (${parent.phone})` : ""}`).join(", ")
+    : "aucun parent lié à cette fiche";
   return `<article class="info-card message-panel">
     <h3>${esc(isParent() ? parentT("messages.privateConversation") : "Conversation privée")}</h3>
-    ${!isParent() ? `<p class="muted">Parent(s) lié(s) : ${esc(linkedParents.map(fullName).join(", ") || "aucun parent lié")}</p>` : ""}
+    ${!isParent() ? `<p class="muted">Parent(s) lié(s) : ${esc(parentLinkLabel)}</p>` : ""}
     <div class="message-list">${messages.map((message) => `
       <div class="message-item">
         <strong>${esc(message.authorName || "Utilisateur")} <span>${esc(roleLabel(message.authorRole))}</span></strong>
         <p>${esc(message.text)}</p>
-        <small>${esc(formatDateTime(message.createdAt))} - ${message.readBy?.includes(state.user.id) ? esc(isParent() ? parentT("messages.read") : "lu") : esc(isParent() ? parentT("messages.unread") : "non lu")}${offlinePendingBadge(message.id)}</small>
+        <small>${esc(formatDateTime(message.createdAt))} - ${message.readBy?.includes(state.user.id) ? esc(isParent() ? parentT("messages.read") : "lu") : esc(isParent() ? parentT("messages.unread") : "non lu")}${esc(messageDeliveryNotice(message))}${offlinePendingBadge(message.id)}</small>
         <div class="message-tools">${translateMessageButton(message.text)}${messageDeleteButton("private", message.id, child.id, message)}</div>
       </div>`).join("") || `<p class="muted">${esc(isParent() ? parentT("messages.noChildMessage") : "Aucun message pour cet enfant.")}</p>`}</div>
     <form class="mini-form" data-message-form="${esc(child.id)}">
@@ -5780,13 +9653,18 @@ function messagePanel(child) {
 
 function canDeleteMessage(message, context = "private") {
   if (!message || !state.user) return false;
-  if (context === "support") return isSupport() || message.authorId === state.user.id;
+  if (context === "support") return canManageSupportCenter();
   return message.authorId === state.user.id;
 }
 
 function messageDeleteButton(type, messageId, ownerId, message) {
   if (!canDeleteMessage(message, type)) return "";
   return `<button class="message-delete-button" type="button" data-delete-message-type="${esc(type)}" data-delete-message-owner="${esc(ownerId)}" data-delete-message-id="${esc(messageId)}">Supprimer</button>`;
+}
+
+function canDeleteTransportConversation(conversation) {
+  if (!conversation || !["driver", "assistant"].includes(state.user?.role)) return false;
+  return currentUserInList(conversation.participants || []) || currentUserInList([conversation.senderId, conversation.recipientId]);
 }
 
 function privateMessagesView() {
@@ -5808,8 +9686,12 @@ function privateMessagesView() {
 }
 
 function messagesView() {
+  if (["driver", "assistant"].includes(state.user?.role)) return transportInboxView();
   const tabs = messageTabsForUser();
   if (!tabs.some((tab) => tab.key === state.messagesTab)) state.messagesTab = tabs[0]?.key || "children";
+  const unreadTab = tabs.find((tab) => tab.badge > 0);
+  const activeTab = tabs.find((tab) => tab.key === state.messagesTab);
+  if (unreadTab && (!activeTab || !activeTab.badge)) state.messagesTab = unreadTab.key;
   return `<section class="view-stack">
     <div class="section-title"><p class="eyebrow">${esc(isParent() ? parentT("messages.communication") : "Communication")}</p><h2>${esc(isParent() ? parentT("messages.title") : "Messages")}</h2></div>
     <div class="support-filters">${tabs.map((tab) => `<button class="${state.messagesTab === tab.key ? "active" : ""}" data-message-tab="${esc(tab.key)}">${esc(tab.label)}${tab.badge ? ` <b class="badge danger">${esc(tab.badge)}</b>` : ""}</button>`).join("")}</div>
@@ -5817,15 +9699,105 @@ function messagesView() {
   </section>`;
 }
 
+function transportInboxView() {
+  const tabs = transportMessageTabs();
+  if (!tabs.some((tab) => tab.key === state.messagesTab)) state.messagesTab = defaultTransportMessagesTab(tabs);
+  return `<section class="view-stack">
+    <div class="section-title"><p class="eyebrow">Communication</p><h2>Messages</h2></div>
+    ${dashboardUnreadMessageAlert()}
+    <div class="support-filters">${tabs.map((tab) => `<button class="${state.messagesTab === tab.key ? "active" : ""}" data-message-tab="${esc(tab.key)}">${esc(tab.label)}${tab.badge ? ` <b class="badge danger">${esc(tab.badge)}</b>` : ""}</button>`).join("")}</div>
+    ${transportMessageTabContent()}
+  </section>`;
+}
+
+function defaultTransportMessagesTab(tabs = transportMessageTabs()) {
+  return tabs.some((tab) => tab.key === "drivers") ? "drivers" : tabs[0]?.key || "parents";
+}
+
+function transportMessageTabs() {
+  return [
+    { key: "drivers", label: "Chauffeurs", badge: directUnreadCount("driver") },
+    { key: "assistants", label: "Convoyeuses", badge: directUnreadCount("assistant") },
+    { key: "parents", label: "Parents / élèves", badge: privateUnreadCount() }
+  ];
+}
+
+function transportMessageTabContent() {
+  if (state.messagesTab === "drivers") return transportDirectRolePanel("driver");
+  if (state.messagesTab === "assistants") return transportDirectRolePanel("assistant");
+  return transportPrivateMessagesPanel();
+}
+
+function transportDirectRolePanel(targetRole) {
+  const conversations = transportDirectConversationsForTab(targetRole);
+  const selectedFallback = (data.directMessages || []).find((conversation) =>
+    conversation.conversationId === state.selectedDirectConversationId &&
+    !conversation.deletedAt &&
+    canReadDirectConversation(conversation)
+  );
+  const visibleConversations = selectedFallback && !conversations.some((conversation) => conversation.conversationId === selectedFallback.conversationId)
+    ? [selectedFallback, ...conversations]
+    : conversations;
+  const selected = visibleConversations.find((conversation) => conversation.conversationId === state.selectedDirectConversationId) || visibleConversations[0] || null;
+  if (selected && selected.conversationId !== state.selectedDirectConversationId) state.selectedDirectConversationId = selected.conversationId;
+  if (selected) markDirectConversationRead(selected.conversationId);
+  const composing = state.composingDirectRole === targetRole || !visibleConversations.length;
+  return `<div class="view-stack">
+    <div class="form-actions"><button class="primary-button compact-action" type="button" data-compose-direct="${esc(targetRole)}">Nouveau message</button></div>
+    ${composing && directRecipientOptions(targetRole).length ? directMessageForm(targetRole) : ""}
+    ${visibleConversations.length ? `<div class="support-layout">
+      <article class="info-card">
+        <h3>${esc(directConversationListTitle(targetRole))}</h3>
+        ${visibleConversations.map(directConversationRow).join("")}
+      </article>
+      ${selected ? directConversationPanel(selected) : ""}
+    </div>` : `<article class="info-card"><p class="muted">Aucune conversation ${targetRole === "driver" ? "chauffeur" : "convoyeuse"} pour le moment.</p></article>`}
+  </div>`;
+}
+
+function transportDirectConversationsForTab(targetRole) {
+  return [...(data.directMessages || [])]
+    .filter((conversation) => !isDirectConversationDeletedForCurrentUser(conversation.conversationId))
+    .filter((conversation) => !conversation.deletedAt)
+    .filter((conversation) => canReadDirectConversation(conversation) || canReadOwnDirectConversation(conversation))
+    .filter((conversation) =>
+      conversation.targetRole === targetRole ||
+      conversation.counterpartRole === targetRole ||
+      directCounterpartRole(conversation) === targetRole ||
+      conversation.conversationId === state.selectedDirectConversationId
+    )
+    .sort((a, b) => new Date(b.lastMessageAt || 0) - new Date(a.lastMessageAt || 0));
+}
+
+function transportPrivateMessagesPanel() {
+  const privateConversations = state.user?.role === "assistant"
+    ? privateConversationsForUser()
+    : privateConversationsForUser().filter((conversation) => conversation.messages.length);
+  const selectedPrivate = privateConversations.find((conversation) => conversation.child.id === state.messageChildId) || privateConversations[0] || null;
+  if (selectedPrivate && selectedPrivate.child.id !== state.messageChildId) state.messageChildId = selectedPrivate.child.id;
+  if (selectedPrivate && privateUnreadForChild(selectedPrivate.child.id)) markPrivateConversationRead(selectedPrivate.child.id);
+  return privateConversations.length ? `<div class="support-layout">
+      <article class="info-card">
+        <h3>Parents / élèves</h3>
+        ${privateConversations.map(privateConversationRow).join("")}
+      </article>
+      ${selectedPrivate ? messagePanel(selectedPrivate.child) : ""}
+    </div>` : `<article class="info-card"><p class="muted">Aucun message parent / élève pour le moment.</p></article>`;
+}
+
 function messageTabsForUser() {
   const tabs = [{ key: "children", label: isParent() ? parentT("nav.children") : "Élèves", badge: privateUnreadCount() }];
-  if (isAdmin() || ["driver", "assistant"].includes(state.user?.role)) tabs.push({ key: "drivers", label: "Chauffeurs", badge: (state.user?.role === "driver" ? roleAnnouncementUnreadCount("driver") : 0) + directUnreadCount("driver") });
+  if (isSpwAccount()) tabs.push({ key: "managers", label: "Gestionnaires de transport", badge: directUnreadCount("transport_manager") });
+  if (isTransportManagerUser()) tabs.push({ key: "spw", label: "SPW", badge: directUnreadCount("spw") });
+  if ((isAdmin() && !isSpwAccount()) || ["driver", "assistant"].includes(state.user?.role)) tabs.push({ key: "drivers", label: "Chauffeurs", badge: (state.user?.role === "driver" ? roleAnnouncementUnreadCount("driver") : 0) + directUnreadCount("driver") });
   if (isAdmin() || ["driver", "assistant"].includes(state.user?.role)) tabs.push({ key: "assistants", label: "Convoyeuses", badge: (state.user?.role === "assistant" ? roleAnnouncementUnreadCount("assistant") : 0) + directUnreadCount("assistant") });
   if (["driver", "assistant"].includes(state.user?.role)) tabs.push({ key: "team", label: "Équipe transport", badge: teamUnreadCount("team") });
   return tabs;
 }
 
 function messageTabContent() {
+  if (state.messagesTab === "managers") return directMessagesView("transport_manager");
+  if (state.messagesTab === "spw") return directMessagesView("spw");
   if (state.messagesTab === "drivers") return directMessagesView("driver");
   if (state.messagesTab === "assistants") return directMessagesView("assistant");
   if (state.messagesTab === "team") return teamMessagesView("team");
@@ -5885,6 +9857,18 @@ function privateMessageNotification() {
   </article>`;
 }
 
+function dashboardUnreadMessageAlert() {
+  if (!state.user || isPrimaryAdmin() || isSupportAssistanceSession()) return "";
+  const unread = dashboardRecentMessages().filter((message) => message.unread);
+  if (!unread.length) return "";
+  return `<article class="pending-card message-alert" data-screen="${esc(isSupport() ? "dashboard" : "messages")}">
+    <div class="pending-head">
+      <div><p class="eyebrow">Message reçu</p><h3>Nouveau message</h3><span>${esc(unread.length)} message${unread.length > 1 ? "s" : ""} non lu${unread.length > 1 ? "s" : ""}</span></div>
+      <b>${esc(unread.length)}</b>
+    </div>
+  </article>`;
+}
+
 function privateConversationMeta(child) {
   if (isAdmin() || isSupport()) return "";
   const conversation = privateConversationForChild(child.id);
@@ -5893,9 +9877,20 @@ function privateConversationMeta(child) {
 
 function canReadPrivateConversation(child) {
   if (!child || !state.user) return false;
+  if (!recordBelongsToTransportManager(child, transportManagerIdForUser(state.user))) return false;
   if (["admin", "support"].includes(state.user.role)) return false;
   if (state.user.role === "parent") return visibleChildren().some((item) => item.id === child.id);
-  return userCircuitNames().has(child.circuitNumber);
+  if (state.user.role === "driver") {
+    return driverIdsFromRecord(child).includes(state.user.id)
+      || childLinkedCircuits(child).some((circuit) => driverIdsFromRecord(circuit).includes(state.user.id))
+      || childCircuitReferences(child).some((ref) => userCircuitNames().has(ref));
+  }
+  if (state.user.role === "assistant") {
+    return child.assistantId === state.user.id
+      || childLinkedCircuits(child).some((circuit) => circuit.assistantId === state.user.id)
+      || childCircuitReferences(child).some((ref) => userCircuitNames().has(ref));
+  }
+  return false;
 }
 
 function childMessages(childId) {
@@ -5905,24 +9900,81 @@ function childMessages(childId) {
     .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
 }
 
+function localDateKey(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function isBelgiumSchoolBlockedDate(date = new Date()) {
+  const key = localDateKey(date);
+  return BELGIUM_SCHOOL_BLOCKED_PERIODS.some((period) => key >= period.start && key <= period.end);
+}
+
+function isParentMessageDeliveryDay(date = new Date()) {
+  return ![0, 6].includes(date.getDay()) && !isBelgiumSchoolBlockedDate(date);
+}
+
+function nextParentMessageDeliveryDate(now = new Date()) {
+  const delivery = new Date(now);
+  const setMorning = (date) => {
+    date.setHours(6, 0, 0, 0);
+    return date;
+  };
+  const moveToNextWeekdayMorning = (date) => {
+    do {
+      date.setDate(date.getDate() + 1);
+    } while (!isParentMessageDeliveryDay(date));
+    return setMorning(date);
+  };
+  if (!isParentMessageDeliveryDay(delivery)) return moveToNextWeekdayMorning(delivery);
+  if (delivery.getHours() < 6) return setMorning(delivery);
+  if (delivery.getHours() >= 18) return moveToNextWeekdayMorning(delivery);
+  return delivery;
+}
+
+function isScheduledParentMessage(message = {}) {
+  return message.authorRole === "parent" && message.deliveryStatus === "scheduled" && Boolean(message.deliverAt);
+}
+
+function isMessageDeliveryAvailable(message = {}) {
+  if (!isScheduledParentMessage(message)) return true;
+  const deliverAt = new Date(message.deliverAt).getTime();
+  return Number.isFinite(deliverAt) && deliverAt <= Date.now();
+}
+
+function messageDeliveryNotice(message = {}) {
+  if (!isScheduledParentMessage(message) || isMessageDeliveryAvailable(message)) return "";
+  return ` - livraison prévue ${formatDateTime(message.deliverAt)}`;
+}
+
 function canReadMessage(message, child = {}) {
   if (!message || !state.user) return false;
-  if (state.user.role === "admin") return message.recipientType === "admin" || (message.recipientIds || []).includes(state.user.id);
-  if (state.user.role === "support") return message.recipientType === "support" || (message.recipientIds || []).includes(state.user.id);
-  if (state.user.role === "parent") return canReadPrivateConversation(child) && (message.recipientIds || []).includes(state.user.id);
-  if (["driver", "assistant"].includes(state.user.role)) return canReadPrivateConversation(child) && (message.recipientIds || []).includes(state.user.id);
+  if (state.user.role === "admin") return message.recipientType === "admin" || currentUserInList(message.recipientIds || []);
+  if (state.user.role === "support") return message.recipientType === "support" || currentUserInList(message.recipientIds || []);
+  if (state.user.role === "parent") return canReadPrivateConversation(child) && (currentUserInList(message.recipientIds || []) || privateRecipientIdsForChild(child).includes(state.user.id));
+  if (["driver", "assistant"].includes(state.user.role)) return isMessageDeliveryAvailable(message) && canReadPrivateConversation(child) && (currentUserInList(message.recipientIds || []) || privateRecipientIdsForChild(child).includes(state.user.id));
   return false;
+}
+
+function parentIdsForChild(child = {}) {
+  return [...new Set([
+    ...(Array.isArray(child.parentIds) ? child.parentIds : []),
+    child.parentId,
+    ...parentListForChild(child).map((parent) => parent.id)
+  ].filter(Boolean))];
 }
 
 function privateConversationForChild(childId) {
   const child = data.children.find((item) => item.id === childId) || {};
   const messages = childMessages(childId);
   const last = messages[messages.length - 1] || null;
-  const parentIds = child.parentIds || [];
-  const participantIds = [...new Set([child.driverId, child.assistantId, ...parentIds].filter(Boolean))];
+  const participantIds = uniqueText([...privateRecipientIdsForChild(child), ...currentUserIdentityIds()]);
   return {
     conversationId: `child-${childId}`,
     childId,
+    transportManagerId: child.transportManagerId || "",
     participants: participantIds,
     lastMessage: last?.text || "",
     lastMessageAt: last?.createdAt || "",
@@ -5931,7 +9983,21 @@ function privateConversationForChild(childId) {
 }
 
 function privateRecipientIdsForChild(child = {}) {
-  return [...new Set([child.driverId, child.assistantId, ...(child.parentIds || [])].filter(Boolean))];
+  const drivers = driverIdsFromRecord(child).map((driverId) =>
+    data.drivers.find((driver) => driver.id === driverId)
+    || data.users.find((user) => user.id === driverId && user.role === "driver")
+    || { id: driverId, role: "driver" }
+  );
+  const assistant = child.assistantId
+    ? data.assistants.find((item) => item.id === child.assistantId)
+      || data.users.find((user) => user.id === child.assistantId && user.role === "assistant")
+      || { id: child.assistantId, role: "assistant" }
+    : null;
+  const parents = parentIdsForChild(child).map((parentId) =>
+    data.parents.find((parent) => parent.id === parentId)
+    || { id: parentId, role: "parent" }
+  );
+  return [...new Set([...drivers, assistant, ...parents].filter(Boolean).flatMap(personIdentityIds))];
 }
 
 function privateParticipantNames(participantIds = []) {
@@ -5963,7 +10029,7 @@ function roleAnnouncementsView(targetRole) {
 
 function directMessagesView(targetRole) {
   if (!isAdmin() && !["driver", "assistant"].includes(state.user?.role)) return `<article class="info-card"><p>Accès non autorisé.</p></article>`;
-  const conversations = directConversationsForUser(targetRole);
+  let conversations = ["driver", "assistant"].includes(state.user?.role) ? directConversationsForUser("") : directConversationsForUser(targetRole);
   const selected = conversations.find((conversation) => conversation.conversationId === state.selectedDirectConversationId) || conversations[0] || null;
   if (selected && selected.conversationId !== state.selectedDirectConversationId) state.selectedDirectConversationId = selected.conversationId;
   if (selected) markDirectConversationRead(selected.conversationId);
@@ -5972,7 +10038,7 @@ function directMessagesView(targetRole) {
     ${directMessageForm(targetRole)}
     <div class="support-layout">
       <article class="info-card">
-        <h3>Conversations ${targetRole === "driver" ? "chauffeurs" : "convoyeuses"}</h3>
+        <h3>${esc(directConversationListTitle(targetRole))}</h3>
         ${conversations.map(directConversationRow).join("") || `<p class="muted">Aucune conversation privée.</p>`}
       </article>
       ${selected ? directConversationPanel(selected) : `<article class="info-card"><p class="muted">Sélectionnez une conversation.</p></article>`}
@@ -5983,50 +10049,144 @@ function directMessagesView(targetRole) {
 
 function directMessageForm(targetRole) {
   const recipients = directRecipientOptions(targetRole);
-  const title = targetRole === "driver" ? "Envoyer un message à un chauffeur" : "Envoyer un message à une convoyeuse";
-  const button = targetRole === "driver" ? "Envoyer au chauffeur" : "Envoyer à la convoyeuse";
+  const meta = directTargetMeta(targetRole);
+  const canCancel = ["driver", "assistant"].includes(state.user?.role);
   return `<form class="edit-form" data-direct-message-form="${esc(targetRole)}">
     <article class="info-card form-grid">
-      <h3>${esc(title)}</h3>
-      <label><span>${targetRole === "driver" ? "Sélectionner un chauffeur" : "Sélectionner une convoyeuse"}</span><select name="recipientId">${recipients.map((recipient) => `<option value="${esc(recipient.id)}">${esc(directRecipientLabel(targetRole, recipient))}</option>`).join("")}</select></label>
+      <h3>${esc(meta.title)}</h3>
+      <label><span>${esc(meta.selectLabel)}</span><select name="recipientId">${recipients.map((recipient) => `<option value="${esc(recipient.id)}">${esc(directRecipientLabel(targetRole, recipient))}</option>`).join("")}</select></label>
       ${input("subject", "Sujet", "")}
       ${textArea("messageText", "Message", "")}
     </article>
-    <div class="form-actions"><button class="primary-button compact-action" type="submit" ${recipients.length ? "" : "disabled"}>${esc(button)}</button></div>
+    <div class="form-actions"><button class="primary-button compact-action" type="submit" ${recipients.length ? "" : "disabled"}>${esc(meta.button)}</button>${canCancel ? `<button class="secondary-button" type="button" data-cancel-direct-compose>Annuler</button>` : ""}</div>
   </form>`;
 }
 
 function directRecipientOptions(targetRole) {
-  if (targetRole === "driver") return data.drivers || [];
-  if (targetRole === "assistant") return data.assistants || [];
+  if (targetRole === "driver" && isSpwAccount()) return [];
+  if (targetRole === "driver") return transportMessageRecipients("driver");
+  if (targetRole === "assistant") return transportMessageRecipients("assistant");
+  if (targetRole === "transport_manager") return scopeRecordsForCurrentTransportManager("users", data.users || []).filter((user) => isTransportManagerUser(user) && user.isActive !== false);
+  if (targetRole === "spw") return scopeRecordsForCurrentTransportManager("users", data.users || []).filter((user) => isSpwAccount(user) && user.isActive !== false);
   return [];
 }
 
+function transportMessageRecipients(role) {
+  const managerId = transportManagerIdForUser(state.user);
+  const profileItems = role === "driver" ? data.drivers || [] : data.assistants || [];
+  const userItems = (data.users || []).filter((user) => user.role === role);
+  const byId = new Map();
+  [...profileItems, ...userItems].forEach((person) => {
+    if (!person?.id || currentUserInList([person.id, person.firebaseUid])) return;
+    if (person.isActive === false) return;
+    if (managerId && person.transportManagerId && person.transportManagerId !== managerId) return;
+    const existing = byId.get(person.id) || {};
+    byId.set(person.id, { ...existing, ...person, role });
+  });
+  return [...byId.values()].sort((a, b) => fullName(a).localeCompare(fullName(b), "fr"));
+}
+
 function directRecipientLabel(targetRole, person) {
-  const circuit = person.schoolCircuit || (targetRole === "driver" ? data.circuits.find((item) => item.driverId === person.id)?.name : data.circuits.find((item) => item.assistantId === person.id)?.name) || "circuit ?";
-  const vehicle = data.vehicles.find((item) => targetRole === "driver" ? item.driverId === person.id : item.assistantId === person.id);
+  if (targetRole === "transport_manager" || targetRole === "spw") {
+    return [fullName(person), person.companyName, person.identifier || person.identifierNumber].filter(Boolean).join(" - ");
+  }
+  const circuit = person.schoolCircuit || (targetRole === "driver" ? data.circuits.find((item) => driverIdsFromRecord(item).includes(person.id))?.name : data.circuits.find((item) => item.assistantId === person.id)?.name) || "circuit ?";
+  const vehicle = data.vehicles.find((item) => targetRole === "driver" ? driverIdsFromRecord(item).includes(person.id) : item.assistantId === person.id);
   return `${fullName(person)} - ${circuit} - ${vehicle?.busNumber || person.busNumber || "bus ?"}`;
+}
+
+function directTargetMeta(targetRole) {
+  if (targetRole === "transport_manager") {
+    return {
+      title: "Envoyer un message à un gestionnaire de transport",
+      selectLabel: "Sélectionner un gestionnaire de transport",
+      button: "Envoyer au gestionnaire"
+    };
+  }
+  if (targetRole === "spw") {
+    return {
+      title: "Envoyer un message au SPW",
+      selectLabel: "Sélectionner un utilisateur SPW",
+      button: "Envoyer au SPW"
+    };
+  }
+  if (targetRole === "driver") {
+    return {
+      title: "Envoyer un message à un chauffeur",
+      selectLabel: "Sélectionner un chauffeur",
+      button: "Envoyer au chauffeur"
+    };
+  }
+  return {
+    title: "Envoyer un message à une convoyeuse",
+    selectLabel: "Sélectionner une convoyeuse",
+    button: "Envoyer à la convoyeuse"
+  };
+}
+
+function directConversationListTitle(targetRole) {
+  if (targetRole === "transport_manager") return "Conversations gestionnaires de transport";
+  if (targetRole === "spw") return "Conversations SPW";
+  return `Conversations ${targetRole === "driver" ? "chauffeurs" : "convoyeuses"}`;
 }
 
 function directConversationsForUser(targetRole = "") {
   return [...(data.directMessages || [])]
+    .filter((conversation) => !isDirectConversationDeletedForCurrentUser(conversation.conversationId))
+    .filter((conversation) => !conversation.deletedAt)
     .filter(canReadDirectConversation)
-    .filter((conversation) => !targetRole || directCounterpartRole(conversation) === targetRole)
+    .filter((conversation) => directConversationMatchesTab(conversation, targetRole))
     .sort((a, b) => new Date(b.lastMessageAt || 0) - new Date(a.lastMessageAt || 0));
+}
+
+function directConversationMatchesTab(conversation, targetRole = "") {
+  if (!targetRole) return true;
+  if (conversation.targetRole === targetRole) return true;
+  if (conversation.counterpartRole === targetRole) return true;
+  return directCounterpartRole(conversation) === targetRole;
 }
 
 function canReadDirectConversation(conversation) {
   if (!conversation || !state.user) return false;
   if (isSupport() || isParent()) return false;
-  if (isAdmin()) return conversation.recipientId === state.user.id || (conversation.recipientIds || []).includes(state.user.id);
-  return (conversation.participants || []).includes(state.user.id);
+  if (isAdmin()) return currentUserInList([conversation.senderId, conversation.recipientId]) || currentUserInList(conversation.participants || []) || currentUserInList(conversation.recipientIds || []);
+  if (currentUserInList(conversation.participants || []) || currentUserInList([conversation.senderId, conversation.recipientId])) return true;
+  if (!["driver", "assistant"].includes(state.user.role)) return false;
+  if (![conversation.senderRole, conversation.recipientRole].includes(state.user.role)) return false;
+  if (!recordBelongsToTransportManager(conversation, transportManagerIdForUser(state.user))) return false;
+  const currentName = normalizeLoginValue(fullName(state.user));
+  const senderName = normalizeLoginValue(conversation.senderName);
+  const recipientName = normalizeLoginValue(conversation.recipientName);
+  return !!currentName && (currentName === senderName || currentName === recipientName);
+}
+
+function canReadOwnDirectConversation(conversation) {
+  if (!conversation || !["driver", "assistant"].includes(state.user?.role)) return false;
+  if (conversation.conversationId === state.selectedDirectConversationId) return true;
+  return (data.directMessageItems?.[conversation.conversationId] || []).some((message) =>
+    message.authorId === state.user.id ||
+    currentUserInList(message.recipientIds || [])
+  );
 }
 
 function directCounterpartRole(conversation) {
-  if (conversation.senderId === state.user?.id) return conversation.recipientRole;
-  if (conversation.recipientId === state.user?.id) return conversation.senderRole;
+  if (currentUserInList([conversation.senderId])) return conversation.recipientRole;
+  if (currentUserInList([conversation.recipientId])) return conversation.senderRole;
+  if (currentUserInList(conversation.participants || [])) {
+    const currentRole = directRoleForUser(state.user);
+    if (conversation.senderRole === currentRole && conversation.recipientRole) return conversation.recipientRole;
+    if (conversation.recipientRole === currentRole && conversation.senderRole) return conversation.senderRole;
+    if (conversation.senderRole) return conversation.senderRole;
+    if (conversation.recipientRole) return conversation.recipientRole;
+  }
   if (isAdmin()) return conversation.recipientRole || conversation.senderRole;
   return "";
+}
+
+function directRoleForUser(user = state.user) {
+  if (isSpwAccount(user)) return "spw";
+  if (isTransportManagerUser(user)) return "transport_manager";
+  return user?.role || "";
 }
 
 function directConversationRow(conversation) {
@@ -6043,6 +10203,7 @@ function directConversationPanel(conversation) {
   return `<article class="info-card message-panel">
     <h3>${esc(conversation.subject || "Conversation privée")}</h3>
     <p class="muted">${esc(conversation.senderName)} -> ${esc(conversation.recipientName)}</p>
+    ${canDeleteTransportConversation(conversation) ? `<div class="form-actions"><button class="danger-button compact-action" type="button" data-delete-direct-conversation="${esc(conversation.conversationId)}">Supprimer la conversation</button></div>` : ""}
     <div class="message-list">${messages.map((message) => `
       <div class="message-item">
         <strong>${esc(message.authorName)} <span>${esc(roleLabel(message.authorRole))}</span></strong>
@@ -6059,7 +10220,7 @@ function directConversationPanel(conversation) {
 
 function directMessagesForConversation(conversationId) {
   const conversation = data.directMessages.find((item) => item.conversationId === conversationId);
-  if (!conversation || !canReadDirectConversation(conversation)) return [];
+  if (!conversation || (!canReadDirectConversation(conversation) && !canReadOwnDirectConversation(conversation))) return [];
   return [...(data.directMessageItems?.[conversationId] || [])]
     .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
 }
@@ -6078,6 +10239,7 @@ function markDirectConversationRead(conversationId) {
   (data.directMessageItems?.[conversationId] || []).forEach((message) => {
     if (message.authorId !== state.user.id && !message.readBy?.includes(state.user.id)) {
       message.readBy = [...new Set([...(message.readBy || []), state.user.id])];
+      markFirestoreDocumentRead(["directMessages", conversationId, "messages", message.id], message, "message");
       changed = true;
     }
   });
@@ -6100,26 +10262,43 @@ function teamMessagesView(mode) {
 }
 
 function teamConversationsForUser(mode) {
-  return scopedCircuits()
-    .filter((circuit) => circuit.driverId && circuit.assistantId)
+  const byId = new Map();
+  const deletedConversationIds = new Set((data.teamMessages || []).filter((conversation) => conversation.deletedAt).map((conversation) => conversation.conversationId));
+  scopedCircuits()
+    .filter((circuit) => driverIdsFromRecord(circuit).length && circuit.assistantId)
     .map(teamConversationForCircuit)
-    .filter((conversation) => conversation.participants.includes(state.user.id))
-    .sort((a, b) => new Date(b.lastMessageAt || 0) - new Date(a.lastMessageAt || 0));
+    .filter((conversation) => !deletedConversationIds.has(conversation.conversationId) && !conversation.deletedAt)
+    .filter((conversation) => currentUserInList(conversation.participants || []))
+    .forEach((conversation) => byId.set(conversation.conversationId, conversation));
+  (data.teamMessages || [])
+    .filter((conversation) => !conversation.deletedAt)
+    .filter((conversation) => currentUserInList(conversation.participants || []))
+    .forEach((conversation) => {
+      const existing = byId.get(conversation.conversationId) || {};
+      byId.set(conversation.conversationId, { ...conversation, ...existing, lastMessage: conversation.lastMessage || existing.lastMessage || "", lastMessageAt: conversation.lastMessageAt || existing.lastMessageAt || "" });
+    });
+  return [...byId.values()].sort((a, b) => new Date(b.lastMessageAt || 0) - new Date(a.lastMessageAt || 0));
 }
 
 function teamConversationForCircuit(circuit) {
-  const conversationId = `team-${circuit.id || circuit.name}-${circuit.driverId}-${circuit.assistantId}`;
+  const driverIds = driverIdsFromRecord(circuit);
+  const drivers = driverIds.map((driverId) => data.drivers.find((driver) => driver.id === driverId) || data.users.find((user) => user.id === driverId && user.role === "driver") || { id: driverId, role: "driver" });
+  const assistant = data.assistants.find((item) => item.id === circuit.assistantId) || data.users.find((user) => user.id === circuit.assistantId && user.role === "assistant") || { id: circuit.assistantId, role: "assistant" };
+  const participants = [...new Set([...drivers.flatMap(personIdentityIds), ...personIdentityIds(assistant)].filter(Boolean))];
+  const conversationId = `team-${circuit.id || circuit.name}-${driverIds.join("_")}-${circuit.assistantId}`;
   const messages = teamMessagesForConversation(conversationId);
   const last = messages[messages.length - 1] || null;
   const conversation = data.teamMessages.find((item) => item.conversationId === conversationId) || {};
   return {
     ...conversation,
     conversationId,
+    transportManagerId: circuit.transportManagerId || "",
     circuitId: circuit.id || circuit.name,
     circuitName: circuit.name,
-    driverId: circuit.driverId,
+    driverId: driverIds[0] || "",
+    driverIds,
     assistantId: circuit.assistantId,
-    participants: [circuit.driverId, circuit.assistantId].filter(Boolean),
+    participants,
     participantRoles: ["driver", "assistant"],
     lastMessage: last?.text || conversation.lastMessage || "",
     lastMessageAt: last?.createdAt || conversation.lastMessageAt || "",
@@ -6129,11 +10308,11 @@ function teamConversationForCircuit(circuit) {
 
 function teamConversationRow(conversation) {
   const unread = teamUnreadForConversation(conversation.conversationId);
-  const driver = data.drivers.find((item) => item.id === conversation.driverId);
+  const driverNames = driverNamesByIds(driverIdsFromRecord(conversation));
   const assistant = data.assistants.find((item) => item.id === conversation.assistantId);
   return `<button class="child-row support-row ${state.selectedTeamConversationId === conversation.conversationId ? "active" : ""}" data-open-team-conversation="${esc(conversation.conversationId)}">
     <span>${unread ? `<b class="badge danger">Nouveau message</b>` : ""} ${esc(conversation.circuitName || conversation.circuitId)}</span>
-    <small>${esc(driver ? fullName(driver) : "Chauffeur")} - ${esc(assistant ? fullName(assistant) : "Convoyeuse")}</small>
+    <small>${esc(driverNames || "Chauffeurs")} - ${esc(assistant ? fullName(assistant) : "Convoyeuse")}</small>
     <small>${esc(conversation.lastMessage || "Ouvrir la conversation")}</small>
   </button>`;
 }
@@ -6142,6 +10321,7 @@ function teamConversationPanel(conversation) {
   const messages = teamMessagesForConversation(conversation.conversationId);
   return `<article class="info-card message-panel">
     <h3>Équipe transport - ${esc(conversation.circuitName || conversation.circuitId)}</h3>
+    ${canDeleteTransportConversation(conversation) ? `<div class="form-actions"><button class="danger-button compact-action" type="button" data-delete-team-conversation="${esc(conversation.conversationId)}">Supprimer la conversation</button></div>` : ""}
     <div class="message-list">${messages.map((message) => `
       <div class="message-item">
         <strong>${esc(message.authorName)} <span>${esc(roleLabel(message.authorRole))}</span></strong>
@@ -6164,9 +10344,10 @@ function teamMessagesForConversation(conversationId) {
 
 function canReadTeamMessage(message) {
   if (!message || !state.user) return false;
-  if (state.user.role === "admin") return (message.recipientIds || []).includes(state.user.id);
+  if (!recordBelongsToTransportManager(message, transportManagerIdForUser(state.user))) return false;
+  if (state.user.role === "admin") return currentUserInList(message.recipientIds || []);
   if (["support", "parent"].includes(state.user.role)) return false;
-  return (message.recipientIds || []).includes(state.user.id);
+  return currentUserInList(message.recipientIds || []);
 }
 
 function teamUnreadForConversation(conversationId) {
@@ -6181,8 +10362,9 @@ function teamUnreadCount(mode = "team") {
 function markTeamConversationRead(conversationId) {
   let changed = false;
   (data.teamMessageItems?.[conversationId] || []).forEach((message) => {
-    if ((message.recipientIds || []).includes(state.user.id) && !message.readBy?.includes(state.user.id)) {
+    if (currentUserInList(message.recipientIds || []) && !message.readBy?.includes(state.user.id)) {
       message.readBy = [...new Set([...(message.readBy || []), state.user.id])];
+      markFirestoreDocumentRead(["teamMessages", conversationId, "messages", message.id], message, "message");
       changed = true;
     }
   });
@@ -6197,6 +10379,7 @@ function canSeeRoleAnnouncements(targetRole) {
 
 function roleAnnouncementsFor(targetRole) {
   return [...(data.roleAnnouncements || [])]
+    .filter((item) => recordBelongsToTransportManager(item, transportManagerIdForUser(state.user)))
     .filter((item) => item.targetRole === targetRole)
     .filter((item) => !isAdmin() || (item.recipientIds || []).includes(state.user.id) || item.recipientType === "admin")
     .sort((a, b) => Number(!!b.important) - Number(!!a.important) || new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
@@ -6242,8 +10425,12 @@ function markRoleAnnouncementsRead(targetRole) {
 }
 
 function markPrivateConversationRead(childId) {
+  const conversation = privateConversationForChild(childId);
   (data.messages[childId] || []).forEach((message) => {
-    message.readBy = [...new Set([...(message.readBy || []), state.user.id])];
+    if (!message.readBy?.includes(state.user.id)) {
+      message.readBy = [...new Set([...(message.readBy || []), state.user.id])];
+      markFirestoreDocumentRead(["privateMessages", conversation.conversationId, "messages", message.id], message, "message");
+    }
   });
   saveData();
 }
@@ -6254,6 +10441,42 @@ function formatDateTime(value) {
   return date.toLocaleString("fr-BE", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 
+function formatDashboardClock(date = new Date()) {
+  return date.toLocaleString("fr-BE", {
+    weekday: "long",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  });
+}
+
+function dashboardClockLabel() {
+  return `<p class="eyebrow dashboard-clock" data-dashboard-clock>${esc(formatDashboardClock())}</p>`;
+}
+
+function updateDashboardClocks() {
+  document.querySelectorAll("[data-dashboard-clock]").forEach((node) => {
+    node.textContent = formatDashboardClock();
+  });
+}
+
+function startDashboardClock() {
+  if (dashboardClockTimer) return;
+  dashboardClockTimer = window.setInterval(updateDashboardClocks, 1000);
+}
+
+function startMaintenanceMonitoring() {
+  if (maintenanceMonitorTimer) return;
+  maintenanceMonitorTimer = window.setInterval(() => {
+    if (isMaintenanceActive() && state.user && !canAccessDuringMaintenance(state.user)) {
+      render();
+    }
+  }, 60 * 1000);
+}
+
 function supportCenterView() {
   if (!canAccessSupportCenter() || isParent()) return dashboard();
   const requests = supportRequestsForUser();
@@ -6261,6 +10484,7 @@ function supportCenterView() {
   return `<section class="view-stack">
     <div class="section-title"><p class="eyebrow">Aide</p><h2>Centre Support</h2></div>
     ${supportRequestForm()}
+    ${legalLinksPanel()}
     <article class="info-card">
       <h3>Mes demandes support</h3>
       <div class="quick-list-inner">${requests.map((request) => supportRequestSummary(request, false)).join("") || `<p class="muted">Aucune demande support.</p>`}</div>
@@ -6278,6 +10502,8 @@ function supportRequestForm() {
       ${input("userName", "Nom", fullName(state.user))}
       ${input("userRole", "Rôle", accountRoleLabel(state.user), "text", true)}
       ${input("subject", "Sujet", "")}
+      <label><span>Catégorie</span><select name="category">${supportCategoryOptions("technical")}</select></label>
+      <label><span>Priorité</span><select name="priority">${supportPriorityOptions("normal")}</select></label>
       ${textArea("message", "Message", "")}
     </article>
     <article class="info-card">
@@ -6295,6 +10521,7 @@ function primaryAdminSupportView() {
   return `<section class="view-stack">
     <div class="section-title"><p class="eyebrow">Support technique</p><h2>Demandes techniques générales</h2></div>
     ${serviceStatusDashboardCard()}
+    ${legalLinksPanel()}
     <article class="info-card">
       <h3>Demandes support anonymisées</h3>
       <div class="quick-list-inner">
@@ -6302,18 +10529,170 @@ function primaryAdminSupportView() {
           <strong>Demande support technique ${esc(index + 1)}</strong>
           ${sectionRows([
             ["Rôle demandeur", roleLabel(request.userRole)],
+            ["Catégorie", supportCategoryLabel(request.category)],
+            ["Priorité", supportPriorityLabel(request.priority)],
             ["Statut", supportStatusLabel(request.status)],
+            ["Échéance", supportSlaState(request).label],
             ["Créée le", formatDateTime(request.createdAt)],
             ["Dernière mise à jour", formatDateTime(request.updatedAt || request.createdAt)]
           ])}
+          <div class="form-actions">
+            <button class="secondary-button" data-support-status="${esc(request.id)}" data-status-value="pending">En attente</button>
+            <button class="secondary-button" data-support-status="${esc(request.id)}" data-status-value="in_progress">En cours</button>
+            <button class="secondary-button" data-support-status="${esc(request.id)}" data-status-value="waiting_requester">Attente demandeur</button>
+            <button class="primary-button compact-action" data-support-status="${esc(request.id)}" data-status-value="resolved">Résolue</button>
+            <button class="secondary-button" data-support-status="${esc(request.id)}" data-status-value="closed">Fermer</button>
+            <button class="danger-button" data-delete-support-request="${esc(request.id)}">Supprimer</button>
+          </div>
         </div>`).join("") || `<p class="muted">Aucune demande support technique.</p>`}
       </div>
     </article>
   </section>`;
 }
 
+function supportSystemMonitoringView() {
+  const permissions = supportPermissionsFor();
+  return `<section class="view-stack">
+    <div class="section-title"><p class="eyebrow">Support technique</p><h2>Supervision système</h2></div>
+    ${serviceStatusDashboardCard()}
+    <div class="metric-grid">
+      ${metric("Total élèves", (data.children || []).length)}
+      ${metric("Total chauffeurs", (data.drivers || []).length)}
+      ${metric("Total convoyeuses", (data.assistants || []).length)}
+      ${metric("Total parents", (data.parents || []).length)}
+      ${metric("Total circuits", (data.circuits || []).length)}
+      ${metricButton("Erreurs techniques", technicalErrorCount(), "technical-errors")}
+      ${metricButton("Connexions refusées", failedLoginCount(), "failed-logins")}
+      ${metricButton("Alertes sécurité", securityAlertCount(), "security-alerts")}
+    </div>
+    <article class="info-card">
+      <h3>Statut technique</h3>
+      ${sectionRows([
+        ["Firebase / Firestore", firestoreStatusLabel()],
+        ["Messagerie locale", typeof data.messages === "object" && typeof data.supportMessages === "object" ? "active" : "dégradée"],
+        ["Version application", "gts-mobile"],
+        ["Stockage fichiers", "désactivé"],
+        ["Données sensibles élèves", "masquées pour le support"]
+      ])}
+    </article>
+    ${supportAccountsOverview()}
+    ${permissions.accessServiceStatus !== false ? serviceStatusSettingsPanel() : ""}
+  </section>`;
+}
+
+function supportAccountsOverview() {
+  const supports = (data.users || []).filter((user) => user.role === "support");
+  return `<article class="info-card">
+    <h3>Comptes support</h3>
+    <div class="quick-list-inner">
+      ${supports.map((user) => `<div class="child-row">
+        <span>${esc(fullName(user))}</span>
+        <small>${esc(user.isActive === false ? "désactivé" : "actif")} · première connexion ${esc(user.firstLoginCompleted === false ? "à faire" : "effectuée")}</small>
+      </div>`).join("") || `<p class="muted">Aucun compte support.</p>`}
+      </div>
+  </article>
+  </section>`;
+}
+
+function primaryAdminSupportAccountsView() {
+  if (!canManageSupportAccounts()) return primaryAdminDashboard();
+  const supports = (data.users || []).filter((user) => user.role === "support");
+  return `<section class="view-stack">
+    <div class="section-title"><p class="eyebrow">Administration système</p><h2>Comptes support</h2></div>
+    ${accessPersonEditView()}
+    <form class="edit-form" id="create-support-form">
+      <article class="info-card form-grid">
+        <h3>Créer un membre support</h3>
+        ${input("lastName", "Nom", "")}
+        ${input("firstName", "Prénom", "")}
+        ${input("phone", "Téléphone", "", "tel")}
+        ${input("email", "Adresse e-mail", "", "email")}
+        <p class="muted full-span">L’identifiant support et le code temporaire à 4 chiffres sont générés automatiquement.</p>
+        <label class="check-field"><input name="isActive" type="checkbox" checked>Actif</label>
+      </article>
+      <div class="form-actions"><button class="primary-button compact-action" type="submit">Créer le support</button></div>
+    </form>
+    <article class="notice-card">
+      <p><strong>Périmètre support.</strong><br>Ces comptes accèdent au centre support, à la supervision technique, aux connexions et à l’état des services. Ils ne peuvent pas ouvrir les fiches élèves complètes ni consulter les données sensibles.</p>
+    </article>
+    <div class="card-grid">${supports.map(userCard).join("") || `<article class="info-card"><p class="muted">Aucun compte support.</p></article>`}</div>
+  </section>`;
+}
+
+function transportManagerAccounts() {
+  const byId = new Map();
+  (data.users || []).filter((user) => isTransportManagerUser(user)).forEach((user) => {
+    byId.set(user.transportManagerId || user.id, user);
+  });
+  (data.transportManagers || []).forEach((manager) => {
+    const id = manager.id || manager.transportManagerId;
+    if (!id || byId.has(id)) return;
+    byId.set(id, {
+      id,
+      role: "admin",
+      transportManagerId: id,
+      companyName: manager.companyName || manager.name || "",
+      firstName: manager.firstName || "",
+      lastName: manager.lastName || "",
+      phone: manager.phone || "",
+      email: manager.email || "",
+      identifier: manager.identifier || manager.identifierNumber || "",
+      identifierNumber: manager.identifierNumber || manager.identifier || "",
+      username: manager.identifierNumber || manager.identifier || "",
+      isTemporaryCode: manager.isTemporaryCode === true,
+      firstLoginCompleted: manager.isTemporaryCode === true ? false : manager.firstLoginCompleted,
+      resetRequired: manager.isTemporaryCode === true,
+      isActive: manager.isActive !== false,
+      createdAt: manager.createdAt || "",
+      createdBy: manager.createdBy || "system",
+      updatedAt: manager.updatedAt || "",
+      updatedBy: manager.updatedBy || ""
+    });
+  });
+  return [...byId.values()];
+}
+
+function primaryAdminInitialManagerView() {
+  if (!isPrimaryAdmin()) return primaryAdminDashboard();
+  const managers = transportManagerAccounts();
+  return `<section class="view-stack">
+    <div class="section-title"><p class="eyebrow">Administration système</p><h2>Gestionnaires de transport</h2></div>
+    <article class="notice-card">
+      <p><strong>Comptes opérationnels.</strong><br>L’administrateur système peut créer des gestionnaires de transport et remettre leur accès à zéro sans accéder aux fiches élèves ni aux données sensibles.</p>
+    </article>
+    <form class="edit-form" id="create-admin-form">
+      <article class="info-card form-grid">
+        <h3>Créer un gestionnaire de transport</h3>
+        ${input("companyName", "Nom société", "")}
+        ${input("lastName", "Nom", "")}
+        ${input("firstName", "Prénom", "")}
+        ${input("phone", "Téléphone", "", "tel")}
+        ${input("email", "Adresse e-mail", "", "email")}
+        <p class="muted full-span">L’identifiant sera généré automatiquement au format GTR-0001 et un code temporaire à 4 chiffres sera affiché une seule fois.</p>
+        <label class="check-field"><input name="isActive" type="checkbox" checked>Actif</label>
+      </article>
+      <div class="form-actions"><button class="primary-button compact-action" type="submit">Créer gestionnaire de transport</button></div>
+    </form>
+    <article class="info-card">
+      <h3>Gestionnaires existants</h3>
+      <div class="quick-list-inner">
+        ${managers.map((manager) => `<div class="child-row access-row">
+          <span>${esc(fullName(manager))}</span>
+          <small>${esc(manager.companyName || "Société non renseignée")} · ${esc(manager.identifier || manager.identifierNumber || "Identifiant non renseigné")} · ${esc(manager.isActive === false ? "désactivé" : "actif")} · ${esc(accessSecurityStatus(manager))}</small>
+          <span class="form-actions">
+            <button class="secondary-button compact-action" type="button" data-reset-code="${esc(manager.id)}">Réinitialiser accès</button>
+            ${canRemoveAdmin(manager) ? `<button class="danger-button compact-action" type="button" data-delete-manager-account="${esc(manager.id)}">Supprimer</button>` : ""}
+          </span>
+        </div>`).join("")}
+        ${managers.length ? "" : `<p class="muted">Aucun gestionnaire de transport créé.</p>`}
+      </div>
+      <p class="muted">La réinitialisation génère un nouveau code temporaire. Le gestionnaire devra ensuite créer son code personnel.</p>
+    </article>
+  </section>`;
+}
+
 function canAccessPermissionTests() {
-  return isPrimaryAdmin() || isSupport();
+  return isPrimaryAdmin();
 }
 
 function permissionTestUsers() {
@@ -6540,21 +10919,34 @@ function permissionTestCard(result) {
 
 function supportDashboard() {
   const requests = filteredSupportRequests();
-  const selected = data.supportRequests.find((request) => request.id === state.selectedSupportRequestId) || requests[0] || null;
+  const paginated = paginatedSupportRequests(requests);
+  const selected = requests.find((request) => request.id === state.selectedSupportRequestId) || paginated.items[0] || requests[0] || null;
   if (selected && state.selectedSupportRequestId !== selected.id) state.selectedSupportRequestId = selected.id;
   if (selected && (!selected.readBy?.includes(state.user.id) || supportMessages(selected.id).some((message) => !message.readBy?.includes(state.user.id)))) markSupportRequestRead(selected.id);
   return `<section class="view-stack">
     <div class="section-title"><p class="eyebrow">Support</p><h2>Centre Support</h2></div>
     ${serviceStatusDashboardCard()}
+    ${legalLinksPanel()}
     ${supportStats()}
+    ${supportReportPanel()}
+    ${supportAutomationPanel()}
     ${circuitReplacementAlerts()}
     ${dashboardMessagesCard()}
     ${accessRequestsPanel()}
     ${supportFilters()}
     <div class="support-layout">
       <article class="info-card">
-        <h3>Demandes</h3>
-        ${requests.map((request) => supportRequestSummary(request, true)).join("") || `<p class="muted">Aucune demande pour ce filtre.</p>`}
+        <div class="action-title">
+          <h3>Demandes</h3>
+          <div class="form-actions">
+            <button class="secondary-button compact-action" type="button" id="run-support-overdue-digest">Relancer SLA</button>
+            <button class="secondary-button compact-action" type="button" id="send-support-weekly-report">Rapport e-mail</button>
+            <button class="secondary-button compact-action" type="button" id="run-support-anonymization">Anonymiser anciens</button>
+            <button class="secondary-button compact-action" type="button" id="export-support-tickets">Exporter CSV</button>
+          </div>
+        </div>
+        ${paginated.items.map((request) => supportRequestSummary(request, true)).join("") || `<p class="muted">Aucune demande pour ce filtre.</p>`}
+        ${supportPagination(requests.length, paginated)}
       </article>
       ${selected ? supportRequestDetail(selected) : `<article class="info-card"><p class="muted">Sélectionnez une demande.</p></article>`}
     </div>
@@ -6605,13 +10997,167 @@ function accessRequestStatusLabel(status) {
 function supportStats() {
   const requests = data.supportRequests || [];
   const pending = requests.filter((request) => request.status === "pending").length;
+  const waiting = requests.filter((request) => request.status === "waiting_requester").length;
+  const unassigned = requests.filter((request) => !request.assignedSupport && !["resolved", "closed"].includes(request.status)).length;
+  const urgent = requests.filter((request) => request.priority === "urgent" && !["resolved", "closed"].includes(request.status)).length;
+  const overdue = requests.filter((request) => supportSlaState(request).overdue && !["resolved", "closed"].includes(request.status)).length;
+  const toClose = requests.filter((request) => supportAutoCloseState(request).ready).length;
+  const toAnonymize = requests.filter((request) => supportRetentionState(request).ready).length;
   const unread = supportUnreadCount();
   const cards = [
     { id: "requests", label: "Demandes", render: (label) => metric(label, requests.length) },
     { id: "pending", label: "En attente", render: (label) => metric(label, pending) },
+    { id: "waiting", label: "Attente demandeur", render: (label) => metric(label, waiting) },
+    { id: "unassigned", label: "Non assignés", render: (label) => metric(label, unassigned) },
+    { id: "urgent", label: "Urgentes", render: (label) => metric(label, urgent) },
+    { id: "overdue", label: "En retard", render: (label) => metric(label, overdue) },
+    { id: "toClose", label: "À clôturer", render: (label) => metric(label, toClose) },
+    { id: "toAnonymize", label: "À anonymiser", render: (label) => metric(label, toAnonymize) },
     { id: "unread", label: "Non lues", render: (label) => metric(label, unread) }
   ];
   return `<div class="metric-grid">${orderedDashboardCards("support", cards)}</div>`;
+}
+
+function supportReportPanel() {
+  const report = supportReportMetrics();
+  const weeklyReport = latestSupportWeeklyReport();
+  return `<article class="info-card support-report-panel">
+    <div class="action-title">
+      <div><p class="eyebrow">Qualité support</p><h3>Reporting</h3></div>
+      <span class="badge ok">${esc(report.closedRate)} clôturés</span>
+    </div>
+    <div class="metric-grid support-report-grid">
+      ${metric("Temps moyen résolution", report.averageResolution)}
+      ${metric("Satisfaction moyenne", report.averageSatisfaction)}
+      ${metric("Respect SLA", report.slaCompliance)}
+      ${metric("Tickets anonymisés", report.anonymized)}
+    </div>
+    <div class="support-report-breakdowns">
+      ${supportBreakdownList("Catégories", report.categories)}
+      ${supportBreakdownList("Priorités", report.priorities)}
+    </div>
+    ${sectionRows([
+      ["Dernier rapport e-mail", weeklyReport?.lastSentAt ? formatDateTime(weeklyReport.lastSentAt) : "Jamais envoyé"],
+      ["Statut dernier rapport", weeklyReport?.lastStatus || "non renseigné"],
+      ["Déclenché par", weeklyReport?.triggeredBy || ""]
+    ])}
+  </article>`;
+}
+
+function latestSupportWeeklyReport() {
+  return (data.supportReports || []).find((report) => report.id === "weekly") || null;
+}
+
+function supportAutomationPanel() {
+  const reports = supportAutomationReports();
+  return `<article class="info-card support-automation-panel">
+    <div class="action-title"><div><p class="eyebrow">Exploitation</p><h3>Automatisations support</h3></div></div>
+    <div class="quick-list-inner">
+      ${reports.map((report) => `<div class="message-item">
+        <strong>${esc(report.label)}</strong>
+        ${sectionRows([
+          ["Dernière exécution", report.lastAt ? formatDateTime(report.lastAt) : "Jamais"],
+          ["Statut", report.status || "non renseigné"],
+          ["Résultat", report.summary || ""],
+          ["Déclenché par", report.triggeredBy || ""]
+        ])}
+      </div>`).join("")}
+    </div>
+  </article>`;
+}
+
+function supportAutomationReports() {
+  const byId = new Map((data.supportReports || []).map((report) => [report.id, report]));
+  return [
+    automationReportDisplay(byId.get("weekly"), "Rapport hebdomadaire", "lastSentAt"),
+    automationReportDisplay(byId.get("overdueDigest"), "Digest SLA", "lastRunAt"),
+    automationReportDisplay(byId.get("autoClose"), "Clôture automatique", "lastRunAt"),
+    automationReportDisplay(byId.get("anonymization"), "Anonymisation RGPD", "lastRunAt")
+  ];
+}
+
+function automationReportDisplay(report = {}, label, dateField) {
+  const metrics = report?.metrics || {};
+  const count = report?.lastCount ?? metrics.count ?? metrics.total ?? "";
+  const messageCount = report?.lastMessageCount ?? metrics.messageCount ?? "";
+  return {
+    label,
+    lastAt: report?.[dateField] || report?.lastSentAt || report?.lastRunAt || "",
+    status: report?.lastStatus || "non renseigné",
+    triggeredBy: report?.triggeredBy || "",
+    summary: [count !== "" ? `${count} élément(s)` : "", messageCount !== "" ? `${messageCount} message(s)` : "", report?.lastReason || ""].filter(Boolean).join(" - ")
+  };
+}
+
+function supportReportMetrics() {
+  const requests = data.supportRequests || [];
+  const closed = requests.filter((request) => ["resolved", "closed"].includes(request.status));
+  const resolvedDurations = closed
+    .map((request) => {
+      const start = new Date(request.createdAt || "").getTime();
+      const end = new Date(request.resolvedAt || request.closedAt || request.updatedAt || "").getTime();
+      return Number.isFinite(start) && Number.isFinite(end) && end >= start ? end - start : null;
+    })
+    .filter((value) => value !== null);
+  const ratings = requests.map((request) => Number(request.satisfactionRating)).filter((value) => Number.isFinite(value) && value > 0);
+  const slaEligible = requests.filter((request) => ["resolved", "closed"].includes(request.status) && request.dueAt);
+  const slaOk = slaEligible.filter((request) => {
+    const due = new Date(request.dueAt || "").getTime();
+    const done = new Date(request.resolvedAt || request.closedAt || request.updatedAt || "").getTime();
+    return Number.isFinite(due) && Number.isFinite(done) && done <= due;
+  }).length;
+  return {
+    averageResolution: resolvedDurations.length ? durationLabel(Math.round(resolvedDurations.reduce((sum, value) => sum + value, 0) / resolvedDurations.length)) : "N/A",
+    averageSatisfaction: ratings.length ? `${(ratings.reduce((sum, value) => sum + value, 0) / ratings.length).toFixed(1)}/5` : "N/A",
+    slaCompliance: slaEligible.length ? `${Math.round((slaOk / slaEligible.length) * 100)}%` : "N/A",
+    closedRate: requests.length ? `${Math.round((closed.length / requests.length) * 100)}%` : "0%",
+    anonymized: requests.filter((request) => request.anonymizedAt).length,
+    categories: supportBreakdown(requests, (request) => supportCategoryLabel(request.category)),
+    priorities: supportBreakdown(requests, (request) => supportPriorityLabel(request.priority))
+  };
+}
+
+function supportBreakdown(requests, labelFor) {
+  const counts = new Map();
+  requests.forEach((request) => {
+    const label = labelFor(request);
+    counts.set(label, (counts.get(label) || 0) + 1);
+  });
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 6)
+    .map(([label, count]) => ({ label, count }));
+}
+
+function supportBreakdownList(title, items) {
+  return `<div class="support-breakdown">
+    <strong>${esc(title)}</strong>
+    ${items.map((item) => `<span><b>${esc(item.count)}</b>${esc(item.label)}</span>`).join("") || `<small class="muted">Aucune donnée</small>`}
+  </div>`;
+}
+
+function durationLabel(ms) {
+  const hours = Math.round(ms / (60 * 60 * 1000));
+  if (hours < 24) return `${hours} h`;
+  const days = Math.round(hours / 24);
+  return `${days} j`;
+}
+
+function paginatedSupportRequests(requests = []) {
+  const pageSize = Number(state.supportPageSize || 20);
+  const pageCount = Math.max(1, Math.ceil(requests.length / pageSize));
+  const page = Math.min(Math.max(1, Number(state.supportPage || 1)), pageCount);
+  const start = (page - 1) * pageSize;
+  return { page, pageSize, pageCount, items: requests.slice(start, start + pageSize) };
+}
+
+function supportPagination(total, pagination) {
+  if (total <= pagination.pageSize) return "";
+  return `<div class="support-pagination">
+    <button class="secondary-button compact-action" type="button" data-support-page="${esc(pagination.page - 1)}" ${pagination.page <= 1 ? "disabled" : ""}>Précédent</button>
+    <span>${esc(pagination.page)} / ${esc(pagination.pageCount)} - ${esc(total)} ticket(s)</span>
+    <button class="secondary-button compact-action" type="button" data-support-page="${esc(pagination.page + 1)}" ${pagination.page >= pagination.pageCount ? "disabled" : ""}>Suivant</button>
+  </div>`;
 }
 
 function pendingLeaveRequests() {
@@ -6729,26 +11275,72 @@ function replacementRuleReadEntry(rule) {
 function supportFilters() {
   const filters = [
     ["all", "Tous"],
+    ["mine", "Mes tickets"],
+    ["unassigned", "Non assigné"],
+    ["overdue", "En retard"],
+    ["to_close", "À clôturer"],
+    ["retention", "À anonymiser"],
+    ["urgent", "Urgent"],
     ["admin", "Gestionnaire de transport"],
     ["driver", "Chauffeur"],
     ["assistant", "Convoyeuse"],
     ["parent", "Parent"],
     ["pending", "En attente"],
     ["in_progress", "En cours"],
-    ["resolved", "Résolue"]
+    ["waiting_requester", "Attente demandeur"],
+    ["resolved", "Résolue"],
+    ["closed", "Fermée"]
   ];
-  return `<div class="support-filters">${filters.map(([value, label]) => `<button class="${state.supportFilter === value ? "active" : ""}" data-support-filter="${esc(value)}">${esc(label)}</button>`).join("")}</div>`;
+  return `<div class="support-filters support-ticket-tools">
+    <label class="search-field"><span>Recherche ticket</span><input id="support-search-input" value="${esc(state.supportSearch || "")}" placeholder="Ticket, sujet, nom..."></label>
+    <label class="support-filter-select"><span>Catégorie</span><select id="support-category-filter"><option value="all">Toutes</option>${supportCategoryOptions(state.supportCategoryFilter || "all")}</select></label>
+    <label class="support-filter-select"><span>Priorité</span><select id="support-priority-filter"><option value="all">Toutes</option>${supportPriorityOptions(state.supportPriorityFilter || "all")}</select></label>
+    <div>${filters.map(([value, label]) => `<button class="${state.supportFilter === value ? "active" : ""}" data-support-filter="${esc(value)}">${esc(label)}</button>`).join("")}</div>
+  </div>`;
 }
 
 function filteredSupportRequests() {
   const filter = state.supportFilter || "all";
+  const search = normalizeTextSearch(state.supportSearch || "");
+  const categoryFilter = state.supportCategoryFilter || "all";
+  const priorityFilter = state.supportPriorityFilter || "all";
   return [...(data.supportRequests || [])].filter((request) => {
+    if (categoryFilter !== "all" && (request.category || "technical") !== categoryFilter) return false;
+    if (priorityFilter !== "all" && (request.priority || "normal") !== priorityFilter) return false;
+    const matchesSearch = !search || normalizeTextSearch([
+      supportTicketNumber(request),
+      request.id,
+      request.subject,
+      request.userName,
+      request.userRole,
+      request.category,
+      request.priority,
+      request.message,
+      request.context?.userEmail,
+      request.context?.email,
+      request.context?.phone,
+      request.context?.userPhone
+    ].filter(Boolean).join(" ")).includes(search);
+    if (!matchesSearch) return false;
+    if (filter === "mine") return request.assignedSupport === state.user?.id;
+    if (filter === "unassigned") return !request.assignedSupport && !["resolved", "closed"].includes(request.status);
+    if (filter === "overdue") return supportSlaState(request).overdue && !["resolved", "closed"].includes(request.status);
+    if (filter === "to_close") return supportAutoCloseState(request).ready;
+    if (filter === "retention") return supportRetentionState(request).ready;
+    if (filter === "urgent") return request.priority === "urgent" && !["resolved", "closed"].includes(request.status);
+    if (["resolved", "closed"].includes(filter)) return request.status === filter;
+    if (["resolved", "closed"].includes(request.status)) return false;
     if (filter === "all") return true;
-    if (["pending", "in_progress", "resolved"].includes(filter)) return request.status === filter;
+    if (["pending", "in_progress", "waiting_requester", "resolved", "closed"].includes(filter)) return request.status === filter;
     return request.userRole === filter;
   }).sort((a, b) => {
-    const priority = { pending: 0, in_progress: 1, resolved: 2 };
-    return (priority[a.status] ?? 9) - (priority[b.status] ?? 9) || new Date(b.updatedAt || b.createdAt) - new Date(a.updatedAt || a.createdAt);
+    const priority = { pending: 0, in_progress: 1, waiting_requester: 2, resolved: 3, closed: 4 };
+    const slaDelta = Number(supportSlaState(b).overdue) - Number(supportSlaState(a).overdue);
+    if (slaDelta) return slaDelta;
+    const priorityWeight = { urgent: 0, high: 1, normal: 2, low: 3 };
+    return (priority[a.status] ?? 9) - (priority[b.status] ?? 9)
+      || (priorityWeight[a.priority || "normal"] ?? 9) - (priorityWeight[b.priority || "normal"] ?? 9)
+      || new Date(b.updatedAt || b.createdAt) - new Date(a.updatedAt || a.createdAt);
   });
 }
 
@@ -6760,52 +11352,166 @@ function supportRequestsForUser() {
 
 function supportRequestSummary(request, selectable) {
   const unread = !request.readBy?.includes(state.user.id);
+  const sla = supportSlaState(request);
   return `<button class="child-row support-row ${state.selectedSupportRequestId === request.id ? "active" : ""}" ${selectable ? `data-open-support-request="${esc(request.id)}"` : `data-user-support-request="${esc(request.id)}"`}>
-    <span>${unread ? `<b class="badge danger">non lu</b>` : ""} ${esc(request.subject)}</span>
-    <small>${esc(request.userName)} - ${esc(roleLabel(request.userRole))} - ${esc(formatDateTime(request.createdAt))}</small>
-    ${supportStatusBadge(request.status)}
+    <span>${unread ? `<b class="badge danger">non lu</b>` : ""} ${esc(supportTicketNumber(request))} - ${esc(request.subject)}</span>
+    <small>${esc(request.userName)} - ${esc(roleLabel(request.userRole))} - ${esc(supportCategoryLabel(request.category))} - ${esc(supportAgeLabel(request))}</small>
+    <span class="support-row-badges">${supportPriorityBadge(request.priority)}${supportStatusBadge(request.status)}${sla.overdue ? `<b class="badge danger">en retard</b>` : ""}</span>
   </button>`;
 }
 
 function supportRequestDetail(request) {
   const messages = supportMessages(request.id);
+  const canManage = canManageSupportCenter();
+  const sla = supportSlaState(request);
   return `<article class="info-card message-panel">
     <div class="detail-head">
-      <div><p class="eyebrow">${esc(roleLabel(request.userRole))}</p><h2>${esc(request.subject)}</h2></div>
+      <div><p class="eyebrow">${esc(roleLabel(request.userRole))}</p><h2>${esc(supportTicketNumber(request))} - ${esc(request.subject)}</h2></div>
       ${supportStatusBadge(request.status)}
     </div>
-    ${sectionRows([["Utilisateur", request.userName], ["Rôle", roleLabel(request.userRole)], ["Date", formatDateTime(request.createdAt)], ["Message initial", request.message]])}
+    ${sectionRows([
+      ["Numéro de ticket", supportTicketNumber(request)],
+      ["Utilisateur", request.userName],
+      ["Rôle", roleLabel(request.userRole)],
+      ["Catégorie", supportCategoryLabel(request.category)],
+      ["Priorité", supportPriorityLabel(request.priority)],
+      ["Assigné à", supportAssignedLabel(request)],
+      ["Âge du ticket", supportAgeLabel(request)],
+      ["Échéance", sla.label],
+      ["Clôture automatique", supportAutoCloseState(request).label],
+      ["Conservation RGPD", supportRetentionState(request).label],
+      ["Dernier rappel SLA", request.lastOverdueDigestAt ? formatDateTime(request.lastOverdueDigestAt) : ""],
+      ["Date", formatDateTime(request.createdAt)],
+      ["Message initial", request.message]
+    ])}
     <article class="notice-card support-context"><div><h3>Contexte de la demande</h3>${supportContextRows(request.context || {}, request.userRole)}</div></article>
-    ${isSupport() ? `<div class="form-actions">
+    ${canManage ? supportMetadataForm(request) : ""}
+    ${canManage ? supportInternalNoteForm(request) : ""}
+    ${canManage ? `<div class="form-actions">
       <button class="secondary-button" data-support-status="${esc(request.id)}" data-status-value="pending">En attente</button>
       <button class="secondary-button" data-support-status="${esc(request.id)}" data-status-value="in_progress">En cours</button>
-      <button class="primary-button compact-action" data-support-status="${esc(request.id)}" data-status-value="resolved">Marquer résolue</button>
+      <button class="secondary-button" data-support-status="${esc(request.id)}" data-status-value="waiting_requester">Attente demandeur</button>
+      <button class="primary-button compact-action" data-support-status="${esc(request.id)}" data-status-value="resolved">Résolue</button>
+      <button class="secondary-button" data-support-status="${esc(request.id)}" data-status-value="closed">Fermer</button>
       <button class="danger-button" data-delete-support-request="${esc(request.id)}">Supprimer</button>
     </div>` : ""}
+    ${supportSatisfactionPanel(request)}
+    ${canManage ? supportHistoryPanel(request) : ""}
     <h3>Conversation support</h3>
     <div class="message-list">${messages.map((message) => supportMessageItem(message, request.id)).join("")}</div>
     <form class="mini-form" data-support-message-form="${esc(request.id)}">
+      ${canManage ? `<label><span>Modèle de réponse</span><select class="support-reply-template"><option value="">Réponse libre</option>${supportReplyTemplateOptions()}</select></label>` : ""}
       <label><span>Réponse</span><textarea name="supportMessageText" rows="3" placeholder="Écrire une réponse..."></textarea></label>
       <button class="primary-button compact-action" type="submit">Envoyer</button>
     </form>
   </article>`;
 }
 
+function supportCategoryOptions(selected = "technical") {
+  const categories = [
+    ["technical", "Technique"],
+    ["account", "Accès / compte"],
+    ["transport", "Transport"],
+    ["message", "Messages"],
+    ["medical", "Fiche médicale"],
+    ["other", "Autre"]
+  ];
+  return categories.map(([value, label]) => `<option value="${esc(value)}" ${selected === value ? "selected" : ""}>${esc(label)}</option>`).join("");
+}
+
+function supportPriorityOptions(selected = "normal") {
+  const priorities = [["low", "Basse"], ["normal", "Normale"], ["high", "Haute"], ["urgent", "Urgente"]];
+  return priorities.map(([value, label]) => `<option value="${esc(value)}" ${selected === value ? "selected" : ""}>${esc(label)}</option>`).join("");
+}
+
+function supportMetadataForm(request) {
+  const dueAt = supportDueAt(request);
+  return `<form class="mini-form support-metadata-form" data-support-metadata-form="${esc(request.id)}">
+    <label><span>Assigné à</span><select name="assignedSupport"><option value="">Non assigné</option>${supportAssigneeOptions(request.assignedSupport)}</select></label>
+    <label><span>Catégorie</span><select name="category">${supportCategoryOptions(request.category || "technical")}</select></label>
+    <label><span>Priorité</span><select name="priority">${supportPriorityOptions(request.priority || "normal")}</select></label>
+    <label><span>Échéance</span><input name="dueAt" type="datetime-local" value="${esc(toDateTimeLocalValue(dueAt))}"></label>
+    <button class="secondary-button compact-action" type="submit">Mettre à jour le suivi</button>
+  </form>`;
+}
+
+function supportInternalNoteForm(request) {
+  return `<form class="mini-form support-internal-note-form" data-support-internal-note-form="${esc(request.id)}">
+    <label><span>Note interne support</span><textarea name="internalNote" rows="3" placeholder="Note visible uniquement par le support...">${esc(request.internalNote || "")}</textarea></label>
+    <button class="secondary-button compact-action" type="submit">Enregistrer la note interne</button>
+  </form>`;
+}
+
+function supportHistoryPanel(request) {
+  const history = supportHistoryEntries(request);
+  return `<article class="notice-card support-history-panel">
+    <div>
+      <h3>Historique du ticket</h3>
+      <div class="support-timeline">
+        ${history.map((entry) => `<div class="support-timeline-item">
+          <strong>${esc(entry.label)}</strong>
+          <small>${esc(formatDateTime(entry.at))}${entry.by ? ` - ${esc(entry.by)}` : ""}</small>
+        </div>`).join("")}
+      </div>
+    </div>
+  </article>`;
+}
+
+function supportHistoryEntries(request = {}) {
+  const base = [
+    { at: request.createdAt, label: "Ticket créé", by: request.userName },
+    ...(request.history || []).map((entry) => ({ at: entry.at, label: entry.label, by: entry.byName || entry.by || "" }))
+  ];
+  if (request.resolvedAt) base.push({ at: request.resolvedAt, label: "Ticket résolu", by: supportAssignedLabel(request) });
+  if (request.closedAt) base.push({ at: request.closedAt, label: "Ticket fermé", by: supportAssignedLabel(request) });
+  if (request.satisfactionRating) base.push({ at: request.satisfactionAt, label: `Satisfaction demandeur : ${request.satisfactionRating}/5`, by: request.userName });
+  return base
+    .filter((entry) => entry.at || entry.label)
+    .sort((a, b) => new Date(b.at || 0) - new Date(a.at || 0))
+    .slice(0, 20);
+}
+
+function supportSatisfactionPanel(request = {}) {
+  if (canManageSupportCenter()) return "";
+  if (!["resolved", "closed"].includes(request.status)) return "";
+  if (request.satisfactionRating) return `<article class="notice-card"><div><h3>Votre avis</h3><p class="muted">Merci, votre note ${esc(request.satisfactionRating)}/5 a été enregistrée.</p></div></article>`;
+  return `<article class="notice-card">
+    <div>
+      <h3>Votre avis</h3>
+      <p class="muted">La réponse du support a-t-elle résolu votre demande ?</p>
+      <div class="support-rating-actions">
+        ${[1, 2, 3, 4, 5].map((rating) => `<button class="secondary-button compact-action" type="button" data-support-rating="${esc(request.id)}" data-rating-value="${rating}">${rating}/5</button>`).join("")}
+      </div>
+    </div>
+  </article>`;
+}
+
+function supportReplyTemplateOptions() {
+  return [
+    ["Bonjour,\n\nNous avons bien pris en charge votre demande. Nous revenons vers vous dès que possible.\n\nCordialement,\nLe support GTS", "Prise en charge"],
+    ["Bonjour,\n\nPouvez-vous nous envoyer une précision complémentaire afin de traiter votre demande ?\n\nCordialement,\nLe support GTS", "Demande de précision"],
+    ["Bonjour,\n\nVotre demande est résolue. Vous pouvez fermer puis rouvrir l’application si l’affichage n’est pas encore à jour.\n\nCordialement,\nLe support GTS", "Résolution"],
+    ["Bonjour,\n\nVotre accès a été vérifié. Vous pouvez réessayer avec vos identifiants habituels.\n\nCordialement,\nLe support GTS", "Accès vérifié"]
+  ].map(([value, label]) => `<option value="${esc(value)}">${esc(label)}</option>`).join("");
+}
+
+function supportAssigneeOptions(selected = "") {
+  return (data.users || [])
+    .filter((user) => user.role === "support" && user.isActive !== false)
+    .map((user) => `<option value="${esc(user.id)}" ${selected === user.id ? "selected" : ""}>${esc(fullName(user))}</option>`)
+    .join("");
+}
+
 function supportContextRows(context, role = state.user?.role) {
   const rows = [
-    ["Enfant concerne", context.childName],
-    ["École", context.schoolName],
-    ["Circuit", context.circuitNumber],
-    ["Numéro bus", context.busNumber],
-    ["Chauffeur", context.driverName],
-    ["Convoyeuse", context.assistantName],
-    ["Nombre d'élèves liés", context.childrenCount],
-    ["Téléphone utilisateur", context.userPhone]
+    ["Nom", context.lastName],
+    ["Prénom", context.firstName],
+    ["Numéro de téléphone", context.userPhone || context.phone],
+    ["Adresse e-mail", context.userEmail || context.email]
   ].filter(([label, value]) => {
-    if (role === "assistant" && ["Numéro bus", "Chauffeur", "Nombre d'élèves liés"].includes(label)) return false;
     return value !== undefined && value !== null && value !== "";
   });
-  return rows.length ? sectionRows(rows) : `<p class="muted">Aucun contexte specifique.</p>`;
+  return rows.length ? sectionRows(rows) : `<p class="muted">Aucune coordonnée transmise.</p>`;
 }
 
 function supportMessageItem(message, requestId) {
@@ -6824,17 +11530,212 @@ function supportMessages(requestId) {
 
 function supportStatusBadge(status) {
   const label = supportStatusLabel(status);
-  const tone = status === "resolved" ? "ok" : "warning";
+  const tone = ["resolved", "closed"].includes(status) ? "ok" : "warning";
   return `<b class="badge ${tone}">${esc(label)}</b>`;
 }
 
 function supportStatusLabel(status) {
-  return { pending: "en attente", in_progress: "en cours", resolved: "résolu" }[status] || status || "en attente";
+  return { pending: "en attente", in_progress: "en cours", waiting_requester: "attente demandeur", resolved: "résolu", closed: "fermé" }[status] || status || "en attente";
+}
+
+function supportCategoryLabel(category = "technical") {
+  return {
+    technical: "Technique",
+    account: "Accès / compte",
+    transport: "Transport",
+    message: "Messages",
+    medical: "Fiche médicale",
+    other: "Autre"
+  }[category] || category || "Technique";
+}
+
+function supportPriorityLabel(priority = "normal") {
+  return { low: "basse", normal: "normale", high: "haute", urgent: "urgente" }[priority] || "normale";
+}
+
+function supportPriorityBadge(priority = "normal") {
+  const tone = priority === "urgent" ? "danger" : priority === "high" ? "warning" : "ok";
+  return `<b class="badge ${tone}">${esc(supportPriorityLabel(priority))}</b>`;
+}
+
+function supportDueAt(request = {}) {
+  if (request.dueAt) return request.dueAt;
+  const created = new Date(request.createdAt || Date.now());
+  const hours = { urgent: 4, high: 24, normal: 48, low: 120 }[request.priority || "normal"] || 48;
+  return new Date(created.getTime() + hours * 60 * 60 * 1000).toISOString();
+}
+
+function supportSlaState(request = {}) {
+  const dueAt = supportDueAt(request);
+  const dueTime = new Date(dueAt || "").getTime();
+  const done = ["resolved", "closed"].includes(request.status);
+  if (!Number.isFinite(dueTime)) return { label: "Non renseignée", overdue: false };
+  const overdue = !done && dueTime < Date.now();
+  return {
+    label: `${formatDateTime(dueAt)}${overdue ? " - en retard" : ""}`,
+    overdue
+  };
+}
+
+function supportAgeLabel(request = {}) {
+  const created = new Date(request.createdAt || "").getTime();
+  if (!Number.isFinite(created)) return "date inconnue";
+  const elapsedHours = Math.max(0, Math.floor((Date.now() - created) / (60 * 60 * 1000)));
+  if (elapsedHours < 24) return `${elapsedHours} h`;
+  const days = Math.floor(elapsedHours / 24);
+  return `${days} j`;
+}
+
+function supportAutoCloseState(request = {}) {
+  if (request.status !== "resolved") return { ready: false, label: "" };
+  const resolvedAt = new Date(request.resolvedAt || request.updatedAt || "").getTime();
+  if (!Number.isFinite(resolvedAt)) return { ready: false, label: "Résolution non datée" };
+  const closeAt = new Date(resolvedAt + 7 * 24 * 60 * 60 * 1000);
+  const ready = closeAt.getTime() <= Date.now();
+  return {
+    ready,
+    label: `${ready ? "Prête à clôturer" : "Prévue"} le ${formatDateTime(closeAt.toISOString())}`
+  };
+}
+
+function supportRetentionState(request = {}) {
+  if (request.anonymizedAt) return { ready: false, label: `Anonymisé le ${formatDateTime(request.anonymizedAt)}` };
+  if (request.status !== "closed") return { ready: false, label: "" };
+  const closedAt = new Date(request.closedAt || request.updatedAt || "").getTime();
+  if (!Number.isFinite(closedAt)) return { ready: false, label: "Clôture non datée" };
+  const anonymizeAt = new Date(closedAt + 365 * 24 * 60 * 60 * 1000);
+  const ready = anonymizeAt.getTime() <= Date.now();
+  return {
+    ready,
+    label: `${ready ? "À anonymiser" : "Anonymisation prévue"} le ${formatDateTime(anonymizeAt.toISOString())}`
+  };
+}
+
+function supportAssignedLabel(request = {}) {
+  if (!request.assignedSupport) return "Non assigné";
+  const user = (data.users || []).find((item) => item.id === request.assignedSupport);
+  return user ? fullName(user) : request.assignedSupport;
+}
+
+function toDateTimeLocalValue(value) {
+  const date = new Date(value || "");
+  if (!Number.isFinite(date.getTime())) return "";
+  const offsetDate = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+  return offsetDate.toISOString().slice(0, 16);
+}
+
+function fromDateTimeLocalValue(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : "";
 }
 
 function supportUnreadCount() {
   const requests = isSupport() ? data.supportRequests || [] : supportRequestsForUser();
   return requests.filter((request) => !request.readBy?.includes(state.user?.id) || supportMessages(request.id).some((message) => !message.readBy?.includes(state.user?.id))).length;
+}
+
+function addSupportHistoryEntry(request, label, options = {}) {
+  if (!request || !label) return;
+  const now = new Date().toISOString();
+  request.history = Array.isArray(request.history) ? request.history : [];
+  request.history.push({
+    id: `history-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+    label,
+    at: now,
+    by: options.byId || state.user?.id || "",
+    byName: options.byName || (state.user ? fullName(state.user) : "")
+  });
+  request.history = request.history.slice(-50);
+}
+
+function exportSupportTicketsCsv() {
+  if (!canManageSupportCenter()) return;
+  const rows = filteredSupportRequests().map((request) => ({
+    ticket: supportTicketNumber(request),
+    statut: supportStatusLabel(request.status),
+    priorite: supportPriorityLabel(request.priority),
+    categorie: supportCategoryLabel(request.category),
+    demandeur: request.userName || "",
+    role: roleLabel(request.userRole),
+    assigne: supportAssignedLabel(request),
+    age: supportAgeLabel(request),
+    echeance: supportDueAt(request),
+    cloture_auto: supportAutoCloseState(request).label,
+    conservation_rgpd: supportRetentionState(request).label,
+    anonymise_le: request.anonymizedAt || "",
+    rappel_sla: request.lastOverdueDigestAt || "",
+    cree_le: request.createdAt || "",
+    mis_a_jour_le: request.updatedAt || "",
+    sujet: request.subject || "",
+    satisfaction: request.satisfactionRating || ""
+  }));
+  const headers = ["ticket", "statut", "priorite", "categorie", "demandeur", "role", "assigne", "age", "echeance", "cloture_auto", "conservation_rgpd", "anonymise_le", "rappel_sla", "cree_le", "mis_a_jour_le", "sujet", "satisfaction"];
+  const csv = [
+    headers.join(";"),
+    ...rows.map((row) => headers.map((header) => csvCell(row[header])).join(";"))
+  ].join("\n");
+  downloadTextFile(`support-tickets-${new Date().toISOString().slice(0, 10)}.csv`, csv, "text/csv;charset=utf-8");
+}
+
+async function runSupportOverdueDigestNow() {
+  if (!canManageSupportCenter()) return alert("Action non autorisée.");
+  try {
+    const { functions } = await import("./src/firebaseConfig.js");
+    if (!functions) throw new Error("Firebase Functions indisponible.");
+    const { httpsCallable } = await import("firebase/functions");
+    const response = await httpsCallable(functions, "sendSupportOverdueDigestNow")({});
+    alert(response.data?.message || "Relance SLA terminée.");
+  } catch (error) {
+    console.error("Relance SLA impossible", error);
+    alert(`Relance SLA impossible : ${error?.message || "erreur inconnue"}`);
+  }
+}
+
+async function sendSupportWeeklyReportNow() {
+  if (!canManageSupportCenter()) return alert("Action non autorisée.");
+  try {
+    const { functions } = await import("./src/firebaseConfig.js");
+    if (!functions) throw new Error("Firebase Functions indisponible.");
+    const { httpsCallable } = await import("firebase/functions");
+    const response = await httpsCallable(functions, "sendSupportWeeklyReportNow")({});
+    alert(response.data?.message || "Rapport support envoyé.");
+  } catch (error) {
+    console.error("Rapport support impossible", error);
+    alert(`Rapport support impossible : ${error?.message || "erreur inconnue"}`);
+  }
+}
+
+async function runSupportAnonymizationNow() {
+  if (!canManageSupportCenter()) return alert("Action non autorisée.");
+  if (!confirm("Anonymiser les tickets support fermés depuis plus de 12 mois ? Cette action masque les messages et coordonnées personnelles.")) return;
+  try {
+    const { functions } = await import("./src/firebaseConfig.js");
+    if (!functions) throw new Error("Firebase Functions indisponible.");
+    const { httpsCallable } = await import("firebase/functions");
+    const response = await httpsCallable(functions, "anonymizeClosedSupportTicketsNow")({});
+    alert(response.data?.message || "Anonymisation terminée.");
+  } catch (error) {
+    console.error("Anonymisation support impossible", error);
+    alert(`Anonymisation impossible : ${error?.message || "erreur inconnue"}`);
+  }
+}
+
+function csvCell(value) {
+  const text = String(value ?? "").replace(/\r?\n/g, " ");
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+function downloadTextFile(filename, content, type = "text/plain;charset=utf-8") {
+  const blob = new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
 }
 
 function dashboardMessagesCard() {
@@ -6846,6 +11747,7 @@ function dashboardMessagesCard() {
   }
   const messages = dashboardRecentMessages();
   const unread = messages.filter((message) => message.unread).length;
+  if (!unread) return "";
   const destination = isSupport() ? "dashboard" : "messages";
   const parentLabels = isParent();
   const title = dashboardCardLabel("messages", parentLabels ? parentT("messages.recent") : "Messages récents");
@@ -6887,13 +11789,14 @@ function dashboardMessageItem(item) {
 }
 
 function dashboardRecentMessages() {
+  let messages = [];
   if (!state.user) return [];
   if (isPrimaryAdmin()) return [];
-  if (isSupport()) return supportDashboardMessages();
-  if (isAdmin()) return adminDashboardMessages();
-  if (isParent()) return parentDashboardMessages();
-  if (["driver", "assistant"].includes(state.user.role)) return transportDashboardMessages();
-  return [];
+  if (isSupport()) messages = supportDashboardMessages();
+  else if (isAdmin()) messages = adminDashboardMessages();
+  else if (isParent()) messages = parentDashboardMessages();
+  else if (["driver", "assistant"].includes(state.user.role)) messages = transportDashboardMessages();
+  return messages.filter((message) => message.unread);
 }
 
 function parentDashboardMessages() {
@@ -7021,82 +11924,39 @@ function recentMessageSort(a, b) {
 }
 
 function supportContextForUser() {
-  if (isParent()) {
-    const child = selectedParentChild() || visibleChildren()[0];
-    return child ? supportContextFromChild(child, state.user.phone) : { userPhone: state.user.phone || "" };
-  }
+  const user = state.user || {};
   if (state.user?.role === "driver") {
     const driver = data.drivers.find((item) => item.id === state.user.id) || {};
-    const children = visibleChildren();
-    const vehicle = visibleCollection("vehicles")[0] || {};
-    const assistant = visibleCollection("assistants")[0] || {};
-    const school = visibleCollection("schools")[0] || {};
-    const circuit = visibleCollection("circuits")[0] || {};
-    return {
-      circuitNumber: circuit.name || driver.schoolCircuit || "",
-      schoolName: school.name || driver.schoolName || "",
-      busNumber: vehicle.busNumber || driver.busNumber || "",
-      driverId: driver.id || state.user.id,
-      driverName: fullName(driver),
-      assistantId: assistant.id || "",
-      assistantName: assistant.id ? fullName(assistant) : "",
-      userPhone: driver.phone || "",
-      childrenCount: children.length
-    };
+    return supportIdentityContext({ ...user, ...driver, phone: driver.phone || user.phone, email: user.email || driver.email });
   }
   if (state.user?.role === "assistant") {
     const assistant = data.assistants.find((item) => item.id === state.user.id) || {};
-    const school = visibleCollection("schools")[0] || {};
-    const circuit = visibleCollection("circuits")[0] || {};
-    return {
-      circuitNumber: circuit.name || assistant.schoolCircuit || "",
-      schoolName: school.name || "",
-      assistantId: assistant.id || state.user.id,
-      assistantName: fullName(assistant),
-      userPhone: assistant.phone || ""
-    };
+    return supportIdentityContext({ ...user, ...assistant, phone: assistant.phone || user.phone, email: user.email || assistant.email });
   }
-  return { userPhone: state.user?.phone || "" };
+  return supportIdentityContext(user);
 }
 
-function supportContextFromChild(child, userPhone = "") {
-  const vehicle = childVehicle(child);
-  const driver = childDriver(child);
-  const assistant = childAssistant(child);
+function supportIdentityContext(person = {}) {
   return {
-    childId: child.id,
-    childName: fullName(child),
-    schoolName: child.schoolName || "",
-    circuitNumber: child.circuitNumber || "",
-    busNumber: vehicle?.busNumber || child.transferVehicleId || "",
-    driverId: driver?.id || child.driverId || "",
-    driverName: driver ? fullName(driver) : "",
-    assistantId: assistant?.id || child.assistantId || "",
-    assistantName: assistant ? fullName(assistant) : "",
-    userPhone: userPhone || ""
+    lastName: person.lastName || "",
+    firstName: person.firstName || "",
+    userPhone: person.phone || person.userPhone || "",
+    userEmail: person.email || person.userEmail || ""
   };
 }
 
+function supportContextFromChild(child, userPhone = "") {
+  return supportIdentityContext({ phone: userPhone });
+}
+
 function supportContextForRequest(localData, request) {
-  const child = (localData.children || []).find((item) => item.id === request.childId);
-  if (child) {
-    const vehicle = (localData.vehicles || []).find((item) => item.id === child.vehicleId || item.circuitId === child.circuitNumber);
-    const driver = (localData.drivers || []).find((item) => item.id === child.driverId);
-    const assistant = (localData.assistants || []).find((item) => item.id === child.assistantId);
-    return {
-      childId: child.id,
-      childName: fullName(child),
-      schoolName: child.schoolName || "",
-      circuitNumber: child.circuitNumber || "",
-      busNumber: vehicle?.busNumber || "",
-      driverId: driver?.id || child.driverId || "",
-      driverName: driver ? fullName(driver) : "",
-      assistantId: assistant?.id || child.assistantId || "",
-      assistantName: assistant ? fullName(assistant) : "",
-      userPhone: request.userPhone || ""
-    };
-  }
-  return {};
+  const [firstName = "", ...lastNameParts] = String(request.userName || "").trim().split(/\s+/).filter(Boolean);
+  return supportIdentityContext({
+    firstName: request.context?.firstName || firstName,
+    lastName: request.context?.lastName || lastNameParts.join(" "),
+    phone: request.context?.userPhone || request.userPhone || "",
+    email: request.context?.userEmail || request.userEmail || ""
+  });
 }
 
 function searchAll(term) {
@@ -7118,10 +11978,34 @@ function searchAll(term) {
     (source[type] || []).forEach((item) => {
       const baseText = type === "children" ? childSearchText(item) : collectSearchText(item);
       const text = normalizeSearch(`${baseText} ${relatedSearchText(type, item)} ${titleFor(type)} ${itemTitle(type, item)} ${itemDetail(type, item)}`);
+      if (type === "users" && ["admin", "support", "system_admin"].includes(item.role)) return;
       if (text.includes(needle)) results.push({ type, id: item.id, title: itemTitle(type, item), label: `${titleFor(type)} - ${itemDetail(type, item)}` });
     });
   });
-  return results;
+  if (canAccessSpwContacts()) {
+    spwContactRecords().forEach((contact) => {
+      const text = normalizeSearch([contact.name, contact.role, contact.phone, contact.mobile, contact.email, "contact spw br liege verviers"].join(" "));
+      if (text.includes(needle)) {
+        results.push({
+          type: "spwContacts",
+          id: contact.email || contact.name,
+          title: contact.name,
+          label: `Contact SPW - ${[contact.phone, contact.mobile, contact.email].filter(Boolean).join(" - ")}`
+        });
+      }
+    });
+  }
+  const seen = new Set();
+  const seenTypes = new Set();
+  return results.filter((result) => {
+    const key = `${result.type}:${result.id}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    if (result.type === "spwContacts") return true;
+    if (seenTypes.has(result.type)) return false;
+    seenTypes.add(result.type);
+    return true;
+  });
 }
 
 function searchChildren(term) {
@@ -7192,50 +12076,57 @@ function relatedSearchText(type, item) {
   const add = (value) => {
     if (value) parts.push(collectSearchText(value));
   };
-  const circuitsByName = (name) => data.circuits.filter((circuit) => circuit.name === name || circuit.id === name);
-  const schoolByName = (name) => data.schools.find((school) => school.name === name);
+  const drivers = scopeRecordsForCurrentTransportManager("drivers", data.drivers || []);
+  const assistants = scopeRecordsForCurrentTransportManager("assistants", data.assistants || []);
+  const vehicles = scopeRecordsForCurrentTransportManager("vehicles", data.vehicles || []);
+  const schools = scopeRecordsForCurrentTransportManager("schools", data.schools || []);
+  const circuits = scopeRecordsForCurrentTransportManager("circuits", data.circuits || []);
+  const children = visibleChildren();
+  const circuitsByName = (name) => circuits.filter((circuit) => circuit.name === name || circuit.id === name);
+  const schoolByName = (name) => schools.find((school) => school.name === name);
   if (type === "children") {
-    add(data.drivers.find((driver) => driver.id === item.driverId));
-    add(data.assistants.find((assistant) => assistant.id === item.assistantId));
-    const vehicle = data.vehicles.find((entry) => entry.id === item.vehicleId || entry.busNumber === item.transferVehicleId);
+    driverIdsFromRecord(item).map((id) => drivers.find((driver) => driver.id === id)).forEach(add);
+    add(assistants.find((assistant) => assistant.id === item.assistantId));
+    const vehicle = vehicles.find((entry) => entry.id === item.vehicleId || entry.busNumber === item.transferVehicleId);
     add(isParent() ? parentSafeVehicleText(vehicle) : vehicle);
     circuitsByName(item.circuitNumber).forEach(add);
     add(schoolByName(item.schoolName));
   }
   if (type === "drivers") {
-    add(data.vehicles.find((vehicle) => vehicle.driverId === item.id || vehicle.busNumber === item.busNumber || vehicle.licensePlate === item.licensePlate));
-    data.circuits.filter((circuit) => circuit.driverId === item.id || circuit.name === item.schoolCircuit).forEach(add);
+    add(vehicles.find((vehicle) => driverIdsFromRecord(vehicle).includes(item.id) || vehicle.busNumber === item.busNumber || vehicle.licensePlate === item.licensePlate));
+    circuits.filter((circuit) => driverIdsFromRecord(circuit).includes(item.id) || circuit.name === item.schoolCircuit).forEach(add);
     add(schoolByName(item.schoolName));
   }
   if (type === "assistants") {
-    data.circuits.filter((circuit) => circuit.assistantId === item.id || circuit.name === item.schoolCircuit).forEach(add);
-    data.vehicles.filter((vehicle) => vehicle.assistantId === item.id).forEach(add);
+    circuits.filter((circuit) => circuit.assistantId === item.id || circuit.name === item.schoolCircuit).forEach(add);
+    vehicles.filter((vehicle) => vehicle.assistantId === item.id).forEach(add);
   }
   if (type === "vehicles") {
-    add(data.drivers.find((driver) => driver.id === item.driverId));
-    add(data.assistants.find((assistant) => assistant.id === item.assistantId));
+    driverIdsFromRecord(item).map((id) => drivers.find((driver) => driver.id === id)).forEach(add);
+    add(assistants.find((assistant) => assistant.id === item.assistantId));
     circuitsByName(item.circuitId).forEach(add);
     add(schoolByName(item.schoolName));
   }
   if (type === "circuits") {
-    add(data.drivers.find((driver) => driver.id === item.driverId));
-    add(data.assistants.find((assistant) => assistant.id === item.assistantId));
-    add(data.vehicles.find((vehicle) => vehicle.id === item.vehicleId));
-    add(schoolByName(item.schoolName));
+    driverIdsFromRecord(item).map((id) => drivers.find((driver) => driver.id === id)).forEach(add);
+    add(assistants.find((assistant) => assistant.id === item.assistantId));
+    add(vehicles.find((vehicle) => vehicle.id === item.vehicleId));
+    circuitSelectedSchoolIds(item).map((id) => schools.find((school) => school.id === id)).forEach(add);
+    circuitSchoolNames(item).map(schoolByName).forEach(add);
   }
   if (type === "schools") {
-    data.circuits.filter((circuit) => circuit.schoolName === item.name).forEach(add);
-    data.children.filter((child) => child.schoolName === item.name).forEach(add);
+    circuitsForSchool(item).forEach(add);
+    children.filter((child) => child.schoolName === item.name).forEach(add);
   }
   if (type === "users") {
-    add(data.drivers.find((driver) => driver.id === item.id));
-    add(data.assistants.find((assistant) => assistant.id === item.id));
+    add(drivers.find((driver) => driver.id === item.id));
+    add(assistants.find((assistant) => assistant.id === item.id));
     (item.assignedCircuits || []).flatMap(circuitsByName).forEach(add);
-    add(data.vehicles.find((vehicle) => vehicle.id === item.assignedVehicleId));
+    add(vehicles.find((vehicle) => vehicle.id === item.assignedVehicleId));
     add(schoolByName(item.assignedSchool));
   }
   if (type === "parents") {
-    (item.linkedChildrenIds || []).map((id) => data.children.find((child) => child.id === id)).forEach(add);
+    (item.linkedChildrenIds || []).map((id) => children.find((child) => child.id === id)).forEach(add);
   }
   return parts.join(" ");
 }
@@ -7262,12 +12153,12 @@ function normalizeVehicleOutOfService(vehicle = {}) {
 }
 
 function activeOutOfServiceVehicles() {
-  return (data.vehicles || []).map(normalizeVehicleOutOfService).filter((vehicle) => vehicle.isOutOfService);
+  return scopeRecordsForCurrentTransportManager("vehicles", data.vehicles || []).map(normalizeVehicleOutOfService).filter((vehicle) => vehicle.isOutOfService);
 }
 
 function vehicleImpactedCircuits(vehicle) {
   if (!vehicle) return [];
-  return (data.circuits || []).filter((circuit) =>
+  return scopeRecordsForCurrentTransportManager("circuits", data.circuits || []).filter((circuit) =>
     circuit.vehicleId === vehicle.id ||
     circuit.name === vehicle.circuitId ||
     circuit.id === vehicle.circuitId
@@ -7278,7 +12169,7 @@ function vehicleImpactedChildren(vehicle) {
   if (!vehicle) return [];
   const circuitNames = new Set(vehicleImpactedCircuits(vehicle).map((circuit) => circuit.name).filter(Boolean));
   if (vehicle.circuitId) circuitNames.add(vehicle.circuitId);
-  return (data.children || []).filter((child) =>
+  return visibleChildren().filter((child) =>
     child.vehicleId === vehicle.id ||
     child.transferVehicleId === vehicle.id ||
     child.transferVehicleId === vehicle.busNumber ||
@@ -7298,13 +12189,13 @@ function outOfServiceVehiclesForCurrentUser(child = null) {
     const parentChildren = child ? [child] : visibleChildren();
     return active.filter((vehicle) => parentChildren.some((item) => vehicleImpactsChild(vehicle, item)));
   }
-  if (["admin", "driver", "assistant", "support"].includes(state.user.role)) return active;
+  if (["admin", "driver", "assistant"].includes(state.user.role)) return active;
   return [];
 }
 
 function resolvedOutOfServiceVehiclesForCurrentUser() {
   if (!state.user || ["admin", "support"].includes(state.user.role)) return [];
-  const resolved = (data.vehicles || []).map(normalizeVehicleOutOfService).filter((vehicle) => !vehicle.isOutOfService && vehicle.outOfServiceResolvedAt);
+  const resolved = scopeRecordsForCurrentTransportManager("vehicles", data.vehicles || []).map(normalizeVehicleOutOfService).filter((vehicle) => !vehicle.isOutOfService && vehicle.outOfServiceResolvedAt);
   if (state.user.role === "parent") {
     const children = visibleChildren();
     return resolved.filter((vehicle) => children.some((child) => vehicleImpactsChild(vehicle, child)));
@@ -7329,7 +12220,7 @@ function outOfServiceImpactedLabels(vehicle) {
 
 function vehicleCircuitLabel(vehicle) {
   if (!vehicle) return "Non renseigné";
-  const circuit = (data.circuits || []).find((item) => item.id === vehicle.circuitId || item.name === vehicle.circuitId || item.vehicleId === vehicle.id);
+  const circuit = scopeRecordsForCurrentTransportManager("circuits", data.circuits || []).find((item) => item.id === vehicle.circuitId || item.name === vehicle.circuitId || item.vehicleId === vehicle.id);
   return circuit?.name || vehicle.circuitId || "Non renseigné";
 }
 
@@ -7372,67 +12263,187 @@ function dashboard() {
   const vehicle = vehicles[0];
   const assistant = assistants[0];
   const circuits = circuitsList.map((circuit) => circuit.name).join(", ") || [...new Set(children.map((child) => child.circuitNumber))].join(", ") || "Non renseigné";
-  const schools = schoolsList.map((school) => school.name).join(", ") || [...new Set(children.map((child) => child.schoolName))].join(", ") || "Non renseigné";
+  const schools = uniqueText([
+    ...schoolsList.map((school) => school.name),
+    ...circuitsList.flatMap(circuitSchoolNames),
+    ...assignedSchoolNamesFromRecord(driver || {}),
+    ...assignedSchoolNamesFromRecord(assistant || {}),
+    ...vehicles.flatMap(assignedSchoolNamesFromRecord),
+    ...assignedSchoolNamesFromRecord(state.user || {}),
+    ...children.map((child) => child.schoolName)
+  ]).join(", ") || "Non renseigné";
+  logDriverAssignmentDiagnostic("dashboard");
+  if (isTransportManagerUser()) {
+    return `
+      <section class="view-stack dashboard-shell">
+        <div class="section-title dashboard-title-row"><h2>Tableau de bord</h2>${dashboardClockLabel()}</div>
+        ${maintenanceNoticeCard()}
+        ${dashboardUnreadMessageAlert()}
+        <div class="metric-grid">
+          ${dashboardOutOfServiceMetric("Véhicules hors service/retard")}
+          ${metricButton("Chauffeurs", visibleCollection("drivers").length, "drivers")}
+          ${metricButton("Nombre d’élèves", visibleChildren().length, "children")}
+        </div>
+      </section>`;
+  }
+  if (isSpwAccount()) {
+    const spwCards = [
+      { id: "children", label: "Nombre d'élèves", render: (label) => metricButton(label, children.length, "associated-children") },
+      { id: "outOfServiceVehicles", label: "Véhicule hors service / retard", render: (label) => dashboardOutOfServiceMetric(label) }
+    ];
+    return `
+      <section class="view-stack dashboard-shell">
+        <div class="section-title dashboard-title-row"><h2>Tableau de bord</h2>${dashboardClockLabel()}</div>
+        ${maintenanceNoticeCard()}
+        <div class="dashboard-lower-grid">
+          ${dashboardMessagesCard()}
+        </div>
+        <div class="metric-grid">
+          ${orderedDashboardCards("spw", spwCards)}
+        </div>
+      </section>`;
+  }
   if (state.user?.role === "assistant") {
     const summary = assistantDashboardSummary();
+    const assistantFirstName = state.user?.firstName || fullName(state.user);
     const cards = [
-      { id: "driver", label: "Chauffeur associé", render: (label) => metric(label, summary.driverNames) },
-      { id: "vehicle", label: "Numéro véhicule", render: (label) => metric(label, summary.vehicleNumbers) },
       { id: "circuit", label: "Numéro de circuit", render: (label) => metric(label, summary.circuitNumbers) },
-      { id: "outOfServiceVehicles", label: "Véhicules hors service", render: (label) => dashboardOutOfServiceMetric(label) },
-      { id: "children", label: "Nombre d'élèves", render: (label) => metricButton(label, summary.childrenCount, "associated-children") },
+      { id: "outOfServiceVehicles", label: "Véhicule hors service / retard", render: (label) => dashboardOutOfServiceMetric(label) },
+      { id: "driver", label: "Nom du chauffeur", render: (label) => metric(label, summary.driverNames) },
+      { id: "children", label: "Nombre d’élèves", render: (label) => metricButton(label, dashboardCircuitStudents().length, "circuit-students") },
       { id: "school", label: "École desservie", render: (label) => metricButton(label, summary.schoolNames, "associated-schools") }
     ];
     return `
-      <section class="view-stack">
-      <div class="section-title"><p class="eyebrow">Aujourd’hui</p><h2>Tableau de bord convoyeuse</h2></div>
+      <section class="view-stack dashboard-shell assistant-dashboard-shell">
+      <div class="section-title dashboard-title-row"><h2><span class="assistant-dashboard-title-desktop">Tableau de bord</span><span class="assistant-dashboard-title-mobile">Tableau de bord ${esc(assistantFirstName)}</span></h2>${dashboardClockLabel()}</div>
+        ${maintenanceNoticeCard()}
         ${vehicleOutOfServiceAlerts()}
         ${circuitReplacementAlerts()}
         ${transferDelayAlerts()}
+        ${quickTransferDelayDialog()}
         ${pendingRequestsPanel()}
         ${studentAbsencesDashboardCard()}
         ${studentIssuesDashboardCard()}
-        ${privateMessageNotification()}
+        ${dashboardUnreadMessageAlert()}
+        ${assistantSpwDutyPhoneCard()}
         <div class="metric-grid assistant-dashboard-grid">
           ${orderedDashboardCards("assistant", cards)}
+        </div>
+        <div class="dashboard-lower-grid">
+          ${dashboardMessagesCard()}
         </div>
       </section>`;
   }
   const dashboardRole = state.user?.role === "driver" ? "driver" : "admin";
   const cards = [
     { id: driver ? "driver" : "drivers", label: driver ? "Chauffeur sélectionné" : "Chauffeurs", render: (label) => driver ? metric(label, fullName(driver)) : usesSpwIdentity() ? "" : metric(label, visibleCollection("drivers").length) },
-    { id: "phone", label: "Téléphone chauffeur", render: (label) => driver ? metric(label, driver.phone || "Non renseigné") : "" },
-    { id: "bus", label: "Numéro identification bus KEOLIS", render: (label) => metric(label, vehicle ? vehicle.busNumber : "Non renseigné") },
-    { id: "outOfServiceVehicles", label: "Véhicules hors service", render: (label) => dashboardOutOfServiceMetric(label) },
+    { id: "phone", label: "Téléphone convoyeuse", render: () => driver ? metric("Téléphone convoyeuse", assistant?.phone || "Non renseigné") : "" },
+    { id: "bus", label: "Numéro identification bus KEOLIS", render: (label) => metric(label, vehicle ? vehicle.busNumber : "Non renseigné", "metric-card-bus-id") },
+    { id: "outOfServiceVehicles", label: state.user?.role === "driver" ? "Véhicule hors service / retard" : "Véhicules hors service", render: (label) => dashboardOutOfServiceMetric(label) },
     { id: "circuits", label: "Circuit effectué", render: (label) => metric(label, circuits) },
-    { id: "schools", label: "École desservie", render: (label) => usesSpwIdentity() ? metricButton(label, schools, "associated-schools") : metric(label, schools) },
-    { id: "assistant", label: "Convoyeuse associée", render: (label) => usesSpwIdentity() ? metricButton(label, assistant ? fullName(assistant) : "Non renseigné", "associated-assistants") : metric(label, assistant ? fullName(assistant) : "Non renseigné") },
-    { id: "children", label: "Nombre d'élèves", render: (label) => usesSpwIdentity() ? metricButton(label, children.length, "associated-children") : metric(label, children.length) }
+    { id: "schools", label: "École desservie", render: (label) => state.user?.role === "driver" ? metricButton(label, schools, "driver-school-detail") : usesSpwIdentity() ? metricButton(label, schools, "associated-schools") : metric(label, schools) },
+    { id: "assistant", label: "Convoyeuse associée", render: (label) => state.user?.role === "driver" ? metricButton(label, assistant ? fullName(assistant) : "Non renseigné", "driver-assistant-detail") : usesSpwIdentity() ? metricButton(label, assistant ? fullName(assistant) : "Non renseigné", "associated-assistants") : metric(label, assistant ? fullName(assistant) : "Non renseigné") },
+    { id: "children", label: "Nombre d'élèves", render: (label) => state.user?.role === "driver" ? metricButton(label, children.length, "circuit-students") : usesSpwIdentity() ? metricButton(label, children.length, "associated-children") : metric(label, children.length) }
   ];
+  const dashboardTitle = "Tableau de bord";
   return `
-    <section class="view-stack">
-      <div class="section-title"><p class="eyebrow">Aujourd’hui</p><h2>${driver ? "Tableau de bord chauffeur" : "Tableau de bord"}</h2></div>
+    <section class="view-stack dashboard-shell">
+      <div class="section-title dashboard-title-row"><h2>${esc(dashboardTitle)}</h2>${dashboardClockLabel()}</div>
+      ${maintenanceNoticeCard()}
       ${isPrimaryAdmin() ? "" : vehicleOutOfServiceAlerts()}
       ${isPrimaryAdmin() ? replacementRulesDashboardShortcut() : circuitReplacementAlerts()}
       ${transferDelayAlerts()}
+      ${state.user?.role === "driver" ? quickTransferDelayDialog() : ""}
       ${requestsDashboardAlerts()}
       ${pendingRequestsPanel()}
       ${studentAbsencesDashboardCard()}
       ${studentIssuesDashboardCard()}
-      ${privateMessageNotification()}
-      ${dashboardMessagesCard()}
+      ${dashboardUnreadMessageAlert()}
       <div class="metric-grid">
         ${orderedDashboardCards(dashboardRole, cards)}
+      </div>
+      <div class="dashboard-lower-grid">
+        ${dashboardMessagesCard()}
       </div>
     </section>`;
 }
 
+function assistantSpwDutyPhone() {
+  const now = new Date();
+  const minutes = now.getHours() * 60 + now.getMinutes();
+  const officeStart = 8 * 60;
+  const eveningDutyStart = 15 * 60 + 30;
+  const inOfficeHours = minutes >= officeStart && minutes < eveningDutyStart;
+  return inOfficeHours
+    ? { label: "Heures de bureau", phone: "04/230 39 00", note: "08h00 - 15h30" }
+    : { label: "Heures de garde", phone: "0800 23 093", note: "Avant 08h00 ou à partir de 15h30" };
+}
+
+function assistantSpwDutyPhoneCard() {
+  if (state.user?.role !== "assistant") return "";
+  const contact = assistantSpwDutyPhone();
+  return `<article class="info-card assistant-duty-phone-card">
+    <div class="pending-head">
+      <div><p class="eyebrow">${esc(contact.label)}</p><h3>Numéro SPW à appeler</h3><span>${esc(contact.note)}</span></div>
+      <a class="assistant-duty-phone-link" href="tel:${esc(telHref(contact.phone))}">${esc(contact.phone)}</a>
+    </div>
+  </article>`;
+}
+
+function dashboardRouteSnapshot(circuits = "", schools = "") {
+  if (isPrimaryAdmin() || isSupport()) return "";
+  return `<article class="info-card dashboard-side-card">
+    <div class="pending-head"><div><p class="eyebrow">Trajet</p><h3>Prochain repère</h3></div></div>
+    ${sectionRows([
+      ["Circuit", circuits],
+      ["École", schools]
+    ])}
+  </article>`;
+}
+
+function dashboardQuickActions() {
+  if (isPrimaryAdmin() || isSupport()) return "";
+  const canSeeStudents = state.user?.role === "driver" || state.user?.role === "assistant";
+  return `<article class="info-card dashboard-side-card dashboard-quick-actions">
+    <div class="pending-head"><div><p class="eyebrow">Actions</p><h3>Accès rapides</h3></div></div>
+    <div class="quick-list-inner">
+      <button class="secondary-button" type="button" data-screen="messages">Messages</button>
+      ${canSeeStudents ? `<button class="secondary-button" type="button" data-dashboard-action="circuit-students">Élèves du circuit</button>` : ""}
+      <button class="secondary-button" type="button" data-screen="settings">Réglages</button>
+    </div>
+  </article>`;
+}
+
 function transfersView() {
+  const managerView = isTransportManagerUser();
+  const spwView = isSpwAccount();
   const transfers = visibleTransportTransfers();
+  const title = spwView || managerView ? "Lieux de transfert" : "Mes transferts";
+  const emptyText = spwView
+    ? "Aucun transfert disponible pour le moment."
+    : managerView ? "Aucun transfert disponible pour le moment." : "Aucun transfert lié à vos circuits pour le moment.";
   return `<section class="view-stack">
-    <div class="section-title"><p class="eyebrow">Organisation transport</p><h2>Mes transferts</h2></div>
-    ${transfers.length ? `<div class="card-grid transfer-grid">${transfers.map(transferCard).join("")}</div>` : `<article class="info-card"><p>Aucun transfert lié à vos circuits pour le moment.</p></article>`}
+    <div class="section-title"><p class="eyebrow">Organisation transport</p><h2>${esc(title)}</h2></div>
+    ${managerView ? createTransferLocationForm() : ""}
+    ${transfers.length ? `<div class="card-grid transfer-grid">${transfers.map(transferCard).join("")}</div>` : `<article class="info-card"><p>${esc(emptyText)}</p></article>`}
   </section>`;
+}
+
+function createTransferLocationForm() {
+  const circuits = scopeRecordsForCurrentTransportManager("circuits", data.circuits || []);
+  return `<form class="edit-form" id="create-transfer-location-form">
+    <article class="info-card form-grid">
+      <h3>Ajouter un lieu de transfert</h3>
+      <p class="muted full-span">Le transporteur peut créer plusieurs lieux de transfert et les lier à un circuit si nécessaire.</p>
+      ${input("transferName", "Nom du lieu", "")}
+      ${input("transferLocation", "Adresse / endroit du transfert", "")}
+      <label><span>Circuit lié</span><select name="circuitId">
+        <option value="">Aucun circuit</option>
+        ${circuits.map((circuit) => `<option value="${esc(circuit.name || circuit.id)}">${esc([circuit.name || circuit.id, circuit.transferName].filter(Boolean).join(" - "))}</option>`).join("")}
+      </select></label>
+    </article>
+    <div class="form-actions"><button class="primary-button compact-action" type="submit">Ajouter le lieu</button></div>
+  </form>`;
 }
 
 function transferCard(transfer) {
@@ -7440,6 +12451,7 @@ function transferCard(transfer) {
   const students = (data.children || []).filter((child) => (transfer.studentsIds || []).includes(child.id));
   const circuit = circuitByRef(transfer.circuitId);
   const canManage = canManageTransferDelay(transfer);
+  const canManageLocation = canManageTransferLocation(transfer);
   return `<article class="record-card transfer-card">
     <div>
       <strong>${esc(transfer.transferName || "Transfert")}</strong>
@@ -7447,13 +12459,23 @@ function transferCard(transfer) {
     </div>
     ${delay ? `<b class="badge warning">Retard en cours</b>` : `<b class="badge ok">À l’heure</b>`}
     ${sectionRows([
+      ["Endroit de transfert", transferLocationForTransfer(transfer) || "Non renseigné"],
       ["Élèves liés", students.length],
-      ["Chauffeur", driverByRef(transfer.driverId) ? fullName(driverByRef(transfer.driverId)) : ""],
+      ["Chauffeurs", driverNamesByIds(driverIdsFromRecord(transfer)) || (driverByRef(transfer.driverId) ? fullName(driverByRef(transfer.driverId)) : "")],
       ["Convoyeuse", assistantByRef(transfer.convoyeurId || transfer.assistantId) ? fullName(assistantByRef(transfer.convoyeurId || transfer.assistantId)) : ""]
     ])}
     ${students.length ? `<div class="quick-list-inner compact-list">${students.slice(0, 6).map((child) => `<button class="child-row" type="button" data-open-child="${esc(child.id)}"><span>${esc(fullName(child))}</span><small>${esc(child.pickupStop || "")}</small>${delayBadge(child)}</button>`).join("")}${students.length > 6 ? `<p class="muted">+ ${esc(students.length - 6)} autre${students.length - 6 > 1 ? "s" : ""} élève${students.length - 6 > 1 ? "s" : ""}</p>` : ""}</div>` : ""}
-    ${delay ? activeDelayPanel(delay, canManage) : canManage ? transferDelayForm(transfer) : ""}
+    ${canManageLocation ? transferLocationForm(transfer) : ""}
+    ${canManageLocation ? `<div class="form-actions"><button class="danger-button compact-action" type="button" data-delete-transport-transfer="${esc(transfer.transferId || transfer.id)}">Supprimer ce lieu</button></div>` : ""}
+    ${delay ? activeDelayPanel(delay, false) : ""}
   </article>`;
+}
+
+function transferLocationForm(transfer) {
+  return `<form class="mini-form transfer-location-form" data-transfer-location-form="${esc(transfer.transferId)}">
+    <label><span>Endroit de transfert visible pour la convoyeuse</span><input name="transferLocation" type="text" value="${esc(transferLocationForTransfer(transfer))}" placeholder=""></label>
+    <button class="primary-button compact-action" type="submit">Enregistrer l’endroit</button>
+  </form>`;
 }
 
 function transferDelayForm(transfer) {
@@ -7482,52 +12504,115 @@ function transferDelayForm(transfer) {
 function activeDelayPanel(delay, canManage) {
   return `<div class="notice-card transfer-delay-panel">
     <p><strong>Retard en cours</strong><br>${esc(delay.delayMinutes)} minutes${delay.reason ? ` - ${esc(delay.reason)}` : ""}<br><small>${esc(formatDateTime(delay.createdAt))}</small></p>
-    ${canManage ? `<button class="secondary-button compact-action" type="button" data-resolve-transfer-delay="${esc(delay.id)}">Retard terminé</button>` : ""}
+    ${canManage ? `<button class="secondary-button compact-action" type="button" data-resolve-transfer-delay="${esc(delay.id)}">Retard terminé</button>${canCancelTransferDelay(delay) ? `<button class="secondary-button compact-action" type="button" data-cancel-transfer-delay="${esc(delay.id)}">Annuler le retard</button>` : ""}${canDeleteTransferDelay(delay) ? `<button class="danger-button compact-action" type="button" data-delete-transfer-delay="${esc(delay.id)}">Supprimer</button>` : ""}` : ""}
   </div>`;
 }
 
+function delayStatusLabel(status) {
+  return { active: "actif", cancelled: "annulé", resolved: "terminé" }[status] || status || "actif";
+}
+
+function delayStatusBadge(status) {
+  const tone = status === "active" ? "warning" : status === "cancelled" ? "danger" : "ok";
+  return `<b class="badge ${tone}">${esc(delayStatusLabel(status))}</b>`;
+}
+
+function globalDelayRecords() {
+  if (!canAccessGlobalDelayCenter()) return [];
+  return [...(data.transferDelays || [])]
+    .filter((delay) => !delay.transportManagerId || recordBelongsToTransportManager(delay, transportManagerIdForUser(state.user)))
+    .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+}
+
+function delayCenterView() {
+  if (!canAccessGlobalDelayCenter()) return dashboard();
+  const delays = globalDelayRecords();
+  const active = delays.filter((delay) => delay.status === "active");
+  const history = delays.filter((delay) => delay.status !== "active");
+  return `<section class="view-stack">
+    <div class="section-title">${dashboardClockLabel()}<h2>Véhicule hors service / retard</h2></div>
+    ${canCreateTransferDelay() ? `<div class="form-actions"><button class="primary-button compact-action" type="button" data-open-delay-create>Créer un retard</button></div>` : ""}
+    ${quickTransferDelayDialog()}
+    <article class="info-card">
+      <h3>Retards actifs</h3>
+      <div class="quick-list-inner">${active.map(delayRow).join("") || `<p class="muted">Aucun retard actif.</p>`}</div>
+    </article>
+    <article class="info-card">
+      <h3>Historique des retards</h3>
+      <div class="quick-list-inner">${history.map(delayRow).join("") || `<p class="muted">Aucun retard dans l’historique.</p>`}</div>
+    </article>
+  </section>`;
+}
+
+function delayRow(delay) {
+  const canCancel = canCancelTransferDelay(delay);
+  const canDelete = canDeleteTransferDelay(delay);
+  const rows = [
+    ["Circuit", delay.circuitId],
+    ["Durée", delay.delayMinutes ? `${delay.delayMinutes} min` : ""],
+    ["Message", delay.reason || delay.message],
+    ["Créé", formatDateTime(delay.createdAt)],
+    ["Annulé", delay.cancelledAt ? formatDateTime(delay.cancelledAt) : ""],
+    ["Terminé", delay.resolvedAt ? formatDateTime(delay.resolvedAt) : ""]
+  ];
+  return `<article class="message-item">
+    <strong>${esc(delay.transferName || "Retard transport")} ${delayStatusBadge(delay.status || "active")}</strong>
+    ${sectionRows(rows)}
+    <div class="form-actions">
+      <button class="secondary-button compact-action" type="button" data-mark-delay-read="${esc(delay.id)}">Marquer comme lu</button>
+      ${canCancel ? `<button class="secondary-button compact-action" type="button" data-cancel-transfer-delay="${esc(delay.id)}">Annuler le retard</button>` : ""}
+      ${canDelete ? `<button class="danger-button compact-action" type="button" data-delete-transfer-delay="${esc(delay.id)}">Supprimer</button>` : ""}
+    </div>
+  </article>`;
+}
+
 function assistantDashboardSummary() {
-  const currentAssistant = data.assistants.find((item) => item.id === state.user?.id) || state.user || {};
+  const scopedAssistants = scopeRecordsForCurrentTransportManager("assistants", data.assistants || []);
+  const scopedCircuits = scopeRecordsForCurrentTransportManager("circuits", data.circuits || []);
+  const scopedVehicles = scopeRecordsForCurrentTransportManager("vehicles", data.vehicles || []);
+  const scopedChildren = visibleChildren();
+  const scopedDrivers = scopeRecordsForCurrentTransportManager("drivers", data.drivers || []);
+  const currentAssistant = scopedAssistants.find((item) => item.id === state.user?.id) || state.user || {};
   const circuitNames = new Set([
     ...(state.user?.assignedCircuits || []),
     ...(currentAssistant.assignedCircuits || []),
     currentAssistant.schoolCircuit
   ].filter(Boolean));
 
-  (data.circuits || [])
+  scopedCircuits
     .filter((circuit) => circuit.assistantId === state.user?.id || circuitNames.has(circuit.name))
     .forEach((circuit) => circuit.name && circuitNames.add(circuit.name));
 
-  let circuits = (data.circuits || []).filter((circuit) => circuitNames.has(circuit.name) || circuit.assistantId === state.user?.id);
+  let circuits = scopedCircuits.filter((circuit) => circuitNames.has(circuit.name) || circuit.assistantId === state.user?.id);
   circuits.forEach((circuit) => circuit.name && circuitNames.add(circuit.name));
 
-  const vehicles = (data.vehicles || []).filter((vehicle) =>
+  const vehicles = scopedVehicles.filter((vehicle) =>
     circuitNames.has(vehicle.circuitId) ||
     circuits.some((circuit) => circuit.vehicleId === vehicle.id) ||
     vehicle.assistantId === state.user?.id
   );
   vehicles.forEach((vehicle) => vehicle.circuitId && circuitNames.add(vehicle.circuitId));
 
-  circuits = (data.circuits || []).filter((circuit) => circuitNames.has(circuit.name) || circuits.some((item) => item.id === circuit.id));
-  const circuitDriverIds = new Set(circuits.map((circuit) => circuit.driverId).filter(Boolean));
+  circuits = scopedCircuits.filter((circuit) => circuitNames.has(circuit.name) || circuits.some((item) => item.id === circuit.id));
+  const circuitDriverIds = new Set(circuits.flatMap((circuit) => driverIdsFromRecord(circuit)).filter(Boolean));
   const circuitAssistantIds = new Set(circuits.map((circuit) => circuit.assistantId).filter(Boolean));
   vehicles.forEach((vehicle) => {
-    if (vehicle.driverId) circuitDriverIds.add(vehicle.driverId);
+    driverIdsFromRecord(vehicle).forEach((driverId) => circuitDriverIds.add(driverId));
     if (vehicle.assistantId) circuitAssistantIds.add(vehicle.assistantId);
   });
 
-  const assistants = (data.assistants || []).filter((assistant) =>
+  const assistants = scopedAssistants.filter((assistant) =>
     assistant.id === state.user?.id ||
     circuitAssistantIds.has(assistant.id) ||
     circuitNames.has(assistant.schoolCircuit) ||
     (assistant.assignedCircuits || []).some((name) => circuitNames.has(name))
   );
-  const children = (data.children || []).filter((child) => circuitNames.has(child.circuitNumber));
-  const childDriverIds = new Set(children.map((child) => child.driverId).filter(Boolean));
-  const driversFromChildren = (data.drivers || []).filter((driver) => childDriverIds.has(driver.id));
+  const children = scopedChildren.filter((child) => circuitNames.has(child.circuitNumber));
+  const childDriverIds = new Set(children.flatMap((child) => driverIdsFromRecord(child)).filter(Boolean));
+  const driversFromChildren = scopedDrivers.filter((driver) => childDriverIds.has(driver.id));
   const drivers = driversFromChildren.length
     ? driversFromChildren
-    : (data.drivers || []).filter((driver) => circuitDriverIds.has(driver.id) || circuitNames.has(driver.schoolCircuit));
+    : scopedDrivers.filter((driver) => circuitDriverIds.has(driver.id) || circuitNames.has(driver.schoolCircuit));
   const childSchoolNames = uniqueText(children.map((child) => child.schoolName));
   const schoolNames = childSchoolNames.length ? childSchoolNames : uniqueText([
     ...circuits.map((circuit) => circuit.schoolName),
@@ -7547,7 +12632,7 @@ function assistantDashboardSummary() {
 function driverByRef(ref) {
   const value = String(ref || "").trim().toLowerCase();
   if (!value) return null;
-  return (data.drivers || []).find((driver) =>
+  return scopeRecordsForCurrentTransportManager("drivers", data.drivers || []).find((driver) =>
     String(driver.id || "").toLowerCase() === value ||
     fullName(driver).toLowerCase() === value ||
     `${driver.lastName || ""} ${driver.firstName || ""}`.trim().toLowerCase() === value ||
@@ -7563,7 +12648,8 @@ function circuitByRef(ref, source) {
   const store = source || data;
   const value = String(ref || "").trim().toLowerCase();
   if (!value) return null;
-  return (store.circuits || []).find((circuit) =>
+  const circuits = source ? (store.circuits || []) : scopeRecordsForCurrentTransportManager("circuits", store.circuits || []);
+  return circuits.find((circuit) =>
     String(circuit.id || "").toLowerCase() === value ||
     String(circuit.name || "").toLowerCase() === value ||
     circuitOptionLabel(circuit).toLowerCase() === value
@@ -7573,7 +12659,7 @@ function circuitByRef(ref, source) {
 function assistantByRef(ref) {
   const value = String(ref || "").trim().toLowerCase();
   if (!value) return null;
-  return (data.assistants || []).find((assistant) =>
+  return scopeRecordsForCurrentTransportManager("assistants", data.assistants || []).find((assistant) =>
     String(assistant.id || "").toLowerCase() === value ||
     fullName(assistant).toLowerCase() === value ||
     `${assistant.lastName || ""} ${assistant.firstName || ""}`.trim().toLowerCase() === value ||
@@ -7589,7 +12675,8 @@ function visibleParentRequests(status = "") {
   if (!state.user) return [];
   if (!["driver", "assistant"].includes(state.user.role)) return [];
   let requests = data.parentChangeRequests || [];
-  requests = requests.filter((request) => request.driverId === state.user.id || request.assistantId === state.user.id);
+  requests = requests.filter((request) => recordBelongsToTransportManager(request, transportManagerIdForUser(state.user)));
+  requests = requests.filter((request) => driverIdsFromRecord(request).includes(state.user.id) || request.driverId === state.user.id || request.assistantId === state.user.id);
   if (status) requests = requests.filter((request) => request.status === status);
   return requests.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 }
@@ -7620,7 +12707,7 @@ function driverSelector() {
   const drivers = matchingDrivers(query);
   const resultList = query
     ? `<div class="driver-results">${drivers.length ? drivers.map((driver) => {
-        const vehicle = data.vehicles.find((item) => item.driverId === driver.id || item.busNumber === driver.busNumber || item.licensePlate === driver.licensePlate);
+        const vehicle = data.vehicles.find((item) => driverIdsFromRecord(item).includes(driver.id) || item.busNumber === driver.busNumber || item.licensePlate === driver.licensePlate);
         return `<button class="child-row" data-pick-driver="${esc(driver.id)}"><span>${esc(fullName(driver))}</span><small>${esc(driver.phone || "Téléphone ?")} - ${esc(vehicle?.busNumber || driver.busNumber || "Bus ?")} - ${esc(vehicle?.licensePlate || driver.licensePlate || "Plaque ?")}</small></button>`;
       }).join("") : `<p class="muted">Aucun chauffeur trouvé.</p>`}</div>`
     : "";
@@ -7682,8 +12769,8 @@ function matchingAssistantCircuits(query) {
 function matchingDrivers(query) {
   return data.drivers.filter((driver) => {
     if (!query) return true;
-    const vehicles = data.vehicles.filter((vehicle) => vehicle.driverId === driver.id || vehicle.licensePlate === driver.licensePlate || vehicle.busNumber === driver.busNumber);
-    const circuits = data.circuits.filter((circuit) => circuit.driverId === driver.id || circuit.name === driver.schoolCircuit);
+    const vehicles = data.vehicles.filter((vehicle) => driverIdsFromRecord(vehicle).includes(driver.id) || vehicle.licensePlate === driver.licensePlate || vehicle.busNumber === driver.busNumber);
+    const circuits = data.circuits.filter((circuit) => driverIdsFromRecord(circuit).includes(driver.id) || circuit.name === driver.schoolCircuit);
     const text = [
       driver.firstName,
       driver.lastName,
@@ -7699,12 +12786,46 @@ function matchingDrivers(query) {
   });
 }
 
-function metric(label, value) {
-  return `<article class="metric-card"><span>${esc(label)}</span><strong>${esc(value)}</strong></article>`;
+function dashboardMetricIconType(label) {
+  const value = String(label || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+  if (value.includes("chauffeur")) return "driver";
+  if (value.includes("telephone")) return "phone";
+  if (value.includes("identification") || value.includes("bus")) return "bus";
+  if (value.includes("hors service") || value.includes("retard")) return "bus-smoke";
+  if (value.includes("circuit")) return "route";
+  if (value.includes("ecole")) return "school";
+  if (value.includes("convoyeuse")) return "assistant-stop";
+  if (value.includes("eleve")) return "children";
+  return "";
+}
+
+function dashboardMetricIcon(label) {
+  const type = dashboardMetricIconType(label);
+  const icons = {
+    driver: `<path d="M5 16V7.8C5 6.8 5.8 6 6.8 6h10.4c1 0 1.8.8 1.8 1.8V16"></path><path d="M6 12h12"></path><path d="M8 16h8"></path><path d="M7.5 19a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"></path><path d="M16.5 19a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"></path><path d="M8 9h8"></path>`,
+    phone: `<path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1.9.3 1.7.6 2.5a2 2 0 0 1-.5 2.1L8 9.5a16 16 0 0 0 6.5 6.5l1.2-1.2a2 2 0 0 1 2.1-.5c.8.3 1.6.5 2.5.6a2 2 0 0 1 1.7 2Z"></path>`,
+    bus: `<path d="M5 15V7.5C5 6.1 6.1 5 7.5 5h9C17.9 5 19 6.1 19 7.5V15"></path><path d="M6 11h12"></path><path d="M8 18a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"></path><path d="M16 18a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"></path><path d="M8 8h8"></path><path d="M7 21h10"></path>`,
+    "bus-smoke": `<path d="M5 15V7.5C5 6.1 6.1 5 7.5 5h7C15.9 5 17 6.1 17 7.5V15"></path><path d="M6 11h10"></path><path d="M8 18a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"></path><path d="M14 18a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"></path><path d="M7.5 8h7"></path><path d="M19 7c1.3-.7 2.4 0 2.4 1.1 0 .8-.7 1.2-1.5 1.5"></path><path d="M19.4 12c1.4-.8 2.6 0 2.6 1.2 0 .8-.7 1.3-1.6 1.6"></path>`,
+    route: `<path d="M6 19c3-4 3-10 0-14"></path><path d="M18 19c-3-4-3-10 0-14"></path><path d="M12 5v2"></path><path d="M12 10v2"></path><path d="M12 15v2"></path>`,
+    school: `<path d="m3 10 9-5 9 5-9 5-9-5Z"></path><path d="M5 12v5c2 1.3 4.3 2 7 2s5-.7 7-2v-5"></path><path d="M21 10v6"></path>`,
+    "assistant-stop": `<path d="M9 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"></path><path d="M3.5 21v-2.2A5.5 5.5 0 0 1 9 13.3"></path><path d="M14 8.5h4l3 3v4l-3 3h-4l-3-3v-4l3-3Z"></path><path d="M14.4 13.5h4.2"></path>`,
+    children: `<path d="M8 10a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"></path><path d="M16 10a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"></path><path d="M3.5 20a4.5 4.5 0 0 1 9 0"></path><path d="M11.5 20a4.5 4.5 0 0 1 9 0"></path>`
+  };
+  if (!type || !icons[type]) return "";
+  return `<span class="metric-icon metric-icon-${esc(type)}" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false">${icons[type]}</svg></span>`;
+}
+
+function metric(label, value, extraClass = "") {
+  const icon = dashboardMetricIcon(label);
+  return `<article class="metric-card ${icon ? "has-dashboard-icon" : ""} ${esc(extraClass)}">${icon}<span class="metric-label">${esc(label)}</span><strong>${esc(value)}</strong></article>`;
 }
 
 function metricButton(label, value, action) {
-  return `<button class="metric-card metric-button" type="button" data-dashboard-action="${esc(action)}"><span>${esc(label)}</span><strong>${esc(value)}</strong></button>`;
+  const icon = dashboardMetricIcon(label);
+  return `<button class="metric-card metric-button ${icon ? "has-dashboard-icon" : ""}" type="button" data-dashboard-action="${esc(action)}">${icon}<span class="metric-label">${esc(label)}</span><strong>${esc(value)}</strong></button>`;
 }
 
 function childrenList() {
@@ -7715,14 +12836,36 @@ function childrenList() {
       <div class="card-grid">${children.map((child) => `
         <button class="record-card" data-open-child="${esc(child.id)}">
           <div><strong>${esc(fullName(child))}</strong><span>${esc(child.schoolName)} - ${esc(child.circuitNumber)}</span></div>
-          ${badge(child)}${alternatingCustodyBadge(child)}${absenceBadge(child)}${delayBadge(child)}${specialAttentionBadge(child)}
+          ${badge(child)}${alternatingCustodyBadge(child)}${absenceBadge(child)}${delayBadge(child)}${specialAttentionBadge(child, false)}
           <small>${esc(child.pickupStop)}</small>
         </button>`).join("")}</div>
     </section>`;
 }
 
+function circuitStudentsView() {
+  const children = dashboardCircuitStudents();
+  const circuits = uniqueText([
+    ...scopedCircuits().map((circuit) => circuit.name),
+    ...children.flatMap((child) => childCircuitReferences(child))
+  ]).join(", ") || "Circuit non renseigné";
+  return `
+    <section class="view-stack">
+      <div class="section-title">
+        <div><p class="eyebrow">Circuit</p><h2>Élèves du circuit</h2></div>
+      </div>
+      <article class="info-card">
+        <h3>${esc(circuits)}</h3>
+        ${children.length ? `<div class="quick-list-inner">${children.map((child) => `
+          <button class="child-row" type="button" data-open-child="${esc(child.id)}">
+            <span>${esc(fullName(child))}</span>
+            <small>${esc(child.circuitNumber || childPickupCircuitLabel(child) || childSchoolCircuitLabel(child) || "Circuit non renseigné")}</small>
+          </button>`).join("")}</div>` : `<p class="muted">Aucun élève lié à votre circuit.</p>`}
+      </article>
+    </section>`;
+}
+
 function childRow(child) {
-  return `<button class="child-row" data-open-child="${esc(child.id)}"><span>${esc(fullName(child))}</span><small>${esc(child.pickupStop)} - ${esc(child.circuitNumber)}</small>${badge(child)}${alternatingCustodyBadge(child)}${absenceBadge(child)}${delayBadge(child)}${specialAttentionBadge(child)}</button>`;
+  return `<button class="child-row" data-open-child="${esc(child.id)}"><span>${esc(fullName(child))}</span><small>${esc(child.pickupStop)} - ${esc(child.circuitNumber)}</small>${badge(child)}${alternatingCustodyBadge(child)}${absenceBadge(child)}${delayBadge(child)}${specialAttentionBadge(child, false)}</button>`;
 }
 
 function childGeneralRows(child) {
@@ -7745,12 +12888,16 @@ function childTransportRows(child) {
   const hasTransfer = childHasTransfer(child);
   const rows = [
     ["Circuit de prise en charge", childPickupCircuitLabel(child)],
-    [parentT("child.driverLinked"), childDriver(child) ? fullName(childDriver(child)) : ""],
+    ["Chauffeurs associés", childDrivers(child).map(fullName).join(", ")],
     [parentT("child.assistantLinked"), childAssistant(child) ? fullName(childAssistant(child)) : ""],
+    ["Heure de passage matin", childMorningPassageTime(child)],
     [parentT("child.pickupStop"), child.pickupStop],
     ["Transfert", hasTransfer ? "oui" : "non"]
   ];
-  if (!isParent()) rows.splice(1, 0, [parentT("child.transferLocation"), child.transferLocation]);
+  if (!isParent()) {
+    rows.splice(1, 0, [parentT("child.transferLocation"), child.transferLocation]);
+    rows.splice(2, 0, ["Nom du transfert", transferNameForChild(child)]);
+  }
   if (hasTransfer) {
     rows.push(
       ["Circuit vers l’école après transfert", circuitLabelByRef(child.transferSchoolCircuitId || child.transferCircuitId || child.schoolCircuitId) || childSchoolCircuitLabel(child)],
@@ -7786,12 +12933,85 @@ function autonomySection(child) {
 function badge(child) {
   if (!canSeeMedicalHelpBadge(child)) return "";
   const completed = !!child.parentMedicalHelpCompletedAt;
-  return `<b class="badge ${completed ? "ok" : "warning"}">${completed ? "Fiche médicale complétée" : "Fiche médicale non complétée"}</b>`;
+  return `<b class="badge child-status-badge medical-status-badge ${completed ? "ok" : "warning"}">${completed ? "Fiche médicale complétée" : "Fiche médicale non complétée"}</b>`;
 }
 
 function alternatingCustodyBadge(child) {
   if (!canSeeAlternatingCustody(child) || !normalizeAlternatingResidence(child).enabled) return "";
-  return `<b class="badge warning">Garde alternée</b>`;
+  return `<b class="badge child-status-badge custody-status-badge warning">Garde alternée</b>`;
+}
+
+function childStatusAlerts(child) {
+  const alerts = [];
+  if (canSeeMedicalHelpBadge(child)) {
+    const completed = !!child.parentMedicalHelpCompletedAt;
+    alerts.push({
+      tone: completed ? "medical-ok" : "medical-warning",
+      marker: completed ? "OK" : "!",
+      title: completed ? "Fiche médicale complétée" : "Fiche médicale non complétée",
+      text: completed
+        ? "Les informations médicales ont été complétées pour cet enfant."
+        : "La fiche médicale doit encore être complétée pour cet enfant.",
+      parentMedicalChildId: isParent() ? child.id : ""
+    });
+  }
+  if (canSeeAlternatingCustody(child) && normalizeAlternatingResidence(child).enabled) {
+    alerts.push({
+      tone: "custody",
+      marker: "i",
+      title: "Garde alternée",
+      text: "Cet enfant a une organisation de garde alternée à prendre en compte."
+    });
+  }
+  if (canSeeSpecialAttention(child) && child.attentionSpeciale) {
+    alerts.push({
+      tone: "attention",
+      marker: "!",
+      title: "Élève nécessitant une attention particulière",
+      text: isParent()
+        ? "Une attention particulière est prévue pendant le transport."
+        : "Consultez les informations élève sensible avant le transport."
+    });
+  }
+  if (!alerts.length) return "";
+  const alertStyles = {
+    "medical-warning": {
+      box: "background:linear-gradient(135deg,#fff7ed,#fed7aa);border:3px solid #ea580c;color:#7c2d12;",
+      marker: "background:#ea580c;color:#fff;"
+    },
+    "medical-ok": {
+      box: "background:linear-gradient(135deg,#ecfdf5,#bbf7d0);border:3px solid #059669;color:#064e3b;",
+      marker: "background:#059669;color:#fff;"
+    },
+    custody: {
+      box: "background:linear-gradient(135deg,#eef2ff,#c7d2fe);border:3px solid #4f46e5;color:#1e1b4b;",
+      marker: "background:#4f46e5;color:#fff;"
+    },
+    attention: {
+      box: "background:linear-gradient(135deg,#fef2f2,#fecaca);border:3px solid #dc2626;color:#7f1d1d;",
+      marker: "background:#dc2626;color:#fff;"
+    }
+  };
+  const baseBoxStyle = "display:grid;grid-template-columns:52px minmax(0,1fr);align-items:center;gap:16px;width:100%;padding:18px 20px;border-radius:18px;box-shadow:0 18px 38px rgba(15,23,42,.22);";
+  const baseMarkerStyle = "display:inline-flex;align-items:center;justify-content:center;width:52px;height:52px;border-radius:16px;font-size:1.15rem;font-weight:950;box-shadow:0 10px 22px rgba(15,23,42,.24);";
+  return `<div class="child-status-alerts" style="display:grid;gap:14px;width:min(100%,880px);margin:12px 0 10px;" aria-label="Informations importantes enfant">
+    ${alerts.map((alert) => {
+      const styles = alertStyles[alert.tone] || alertStyles.attention;
+      const isClickableMedicalAlert = !!alert.parentMedicalChildId && alert.tone.startsWith("medical-");
+      const tag = isClickableMedicalAlert ? "button" : "article";
+      const attributes = isClickableMedicalAlert
+        ? `type="button" data-parent-medical-request="${esc(alert.parentMedicalChildId)}"`
+        : "";
+      const clickableStyle = isClickableMedicalAlert ? "border-width:3px;cursor:pointer;text-align:left;font:inherit;" : "";
+      return `<${tag} class="child-status-alert ${esc(alert.tone)}" ${attributes} style="${baseBoxStyle}${styles.box}${clickableStyle}">
+      <span class="child-status-marker" style="${baseMarkerStyle}${styles.marker}">${esc(alert.marker)}</span>
+      <div>
+        <strong style="display:block;font-size:1.08rem;font-weight:950;line-height:1.2;color:inherit;">${esc(alert.title)}</strong>
+        <small style="display:block;margin-top:5px;font-size:.95rem;font-weight:800;line-height:1.35;color:inherit;">${esc(alert.text)}</small>
+      </div>
+    </${tag}>`;
+    }).join("")}
+  </div>`;
 }
 
 function childDetail(child) {
@@ -7801,7 +13021,6 @@ function childDetail(child) {
   return `
     <section class="view-stack child-detail">
       <div class="detail-head">
-        <button class="icon-button" data-back title="${esc(parentT("common.back"))}">‹</button>
         <div><p class="eyebrow">${esc(parentT("child.fileTitle"))}</p><h2>${esc(fullName(child))}</h2></div>
         ${badge(child)}${alternatingCustodyBadge(child)}${specialAttentionBadge(child)}
       </div>
@@ -7818,8 +13037,8 @@ function childDetail(child) {
         ${transportStatusSection(child)}
         ${parentTransferCard(child)}
         ${autonomySection(child)}
-        ${canSeeChildPeople(child) ? peopleSection("Personnes responsables", child.responsiblePersons || child.guardians) : ""}
-        ${canSeeChildPeople(child) ? peopleSection(parentT("people.authorized"), child.authorizedPersons || child.authorizedPickupPersons) : ""}
+        ${canSeeChildPeople(child) ? peopleSection("Personnes responsables", responsiblePeopleForChild(child)) : ""}
+        ${canSeeChildPeople(child) ? peopleSection(parentT("people.authorized"), authorizedPeopleForChild(child)) : ""}
         ${medicalHelpSection(child)}
         ${canSeeChildSchoolSection(child) ? section(parentT("child.schoolSection"), [[parentT("child.schoolName"), child.schoolName], [parentT("child.phone"), child.schoolPhone], [parentT("child.email"), child.schoolEmail], ["Adresse école", child.schoolAddress], ["Remarques école", child.schoolNotes]]) : ""}
         ${studentIssuesSection(child)}
@@ -7841,11 +13060,12 @@ function visibleStudentIssuesForCurrentUser() {
 function canSeeStudentIssue(issue = {}) {
   if (!state.user || isSupport()) return false;
   if (isPrimaryAdmin()) return false;
+  if (!recordBelongsToTransportManager(issue, transportManagerIdForUser(state.user))) return false;
   if (isAdmin()) return true;
   const child = data.children.find((item) => item.id === issue.childId);
   if (!child) return false;
   if (isParent()) return parentLinkedToChild(state.user, child);
-  if (state.user.role === "driver") return issue.driverId === state.user.id || userCircuitNames().has(child.circuitNumber);
+  if (state.user.role === "driver") return driverIdsFromRecord(child).includes(state.user.id) || issue.driverId === state.user.id || userCircuitNames().has(child.circuitNumber);
   if (state.user.role === "assistant") return issue.assistantId === state.user.id || userCircuitNames().has(child.circuitNumber);
   return false;
 }
@@ -7861,7 +13081,7 @@ function canManageStudentIssue(issue) {
 }
 
 function canSeeSpecialAttention(child) {
-  return canSeeSensitiveStudent(child);
+  return isSpwAccount() && canSeeSensitiveStudent(child);
 }
 
 function canEditSpecialAttention() {
@@ -7874,25 +13094,42 @@ function specialAttentionLevelTone(level = "") {
   return "ok";
 }
 
-function specialAttentionBadge(child) {
+function specialAttentionBadge(child, interactive = true) {
   if (!canSeeSpecialAttention(child) || !child.attentionSpeciale) return "";
-  if (isParent()) return `<b class="badge warning">Élève nécessitant une attention particulière</b>`;
-  return `<button class="badge warning attention-badge" type="button" data-special-attention="${esc(child.id)}">⚠️ Attention</button>`;
+  if (isParent()) return `<b class="badge child-status-badge attention-status-badge warning">Élève nécessitant une attention particulière</b>`;
+  const label = "Attention particulière";
+  if (!interactive) return `<span class="badge child-status-badge attention-status-badge warning attention-badge">${esc(label)}</span>`;
+  return `<button class="badge child-status-badge attention-status-badge warning attention-badge" type="button" data-special-attention="${esc(child.id)}">${esc(label)}</button>`;
 }
 
 function specialAttentionBox(child) {
   if (!canSeeSpecialAttention(child) || !child.attentionSpeciale) return "";
-  if (isSupportAssistanceSession()) return `<article class="info-card privacy-masked-card"><h3>Élève sensible</h3><p>${esc(supportAssistanceMaskedValue())}</p></article>`;
-  if (isParent()) return `<article class="info-card special-attention-card"><h3>Élève sensible</h3><b class="badge warning">Élève nécessitant une attention particulière</b></article>`;
+  if (isSupportAssistanceSession()) return `<article class="info-card privacy-masked-card"><h3>Informations élève sensible</h3><p>${esc(supportAssistanceMaskedValue())}</p></article>`;
+  if (isParent()) return `<article class="info-card special-attention-card special-attention-clear-card"><div class="special-attention-title"><div><p class="eyebrow">Information</p><h3>Informations élève sensible</h3></div><b class="badge warning">Attention particulière</b></div><p class="muted">Cet enfant nécessite une attention particulière pendant le transport.</p></article>`;
+  const type = child.typeAttention || "information";
+  const level = child.niveauAttention || child.sensitiveStudent?.attentionLevel || "information";
+  const instructions = child.noteAttention || child.sensitiveStudent?.instructions || "Aucune consigne spécifique renseignée.";
+  const internalNotes = child.sensitiveStudent?.internalNotes || "";
+  const showLevel = level && level !== "information";
   return `<article class="info-card special-attention-card">
-    <div class="pending-head"><div><p class="eyebrow">Élève sensible</p><h3>${esc(child.typeAttention || "Information")}</h3><span>${esc(child.noteAttention || child.sensitiveStudent?.instructions || "Information importante à connaître.")}</span>${child.sensitiveStudent?.internalNotes ? `<small>${esc(child.sensitiveStudent.internalNotes)}</small>` : ""}</div><b class="badge ${esc(specialAttentionLevelTone(child.niveauAttention))}">${esc(child.niveauAttention || "information")}</b></div>
+    <div class="special-attention-title">
+      <div><p class="eyebrow">Attention particulière</p><h3>Informations élève sensible</h3></div>
+      ${showLevel ? `<b class="badge ${esc(specialAttentionLevelTone(level))}">${esc(level)}</b>` : ""}
+    </div>
+    <div class="special-attention-details">
+      <span><strong>Type</strong>${esc(type)}</span>
+      ${showLevel ? `<span><strong>Niveau</strong>${esc(level)}</span>` : ""}
+      <span class="full-span"><strong>Consignes spécifiques</strong>${esc(instructions)}</span>
+      ${internalNotes ? `<span class="full-span sensitive-internal-note"><strong>Remarques internes</strong>${esc(internalNotes)}</span>` : ""}
+    </div>
   </article>`;
 }
 
 function specialAttentionEditSection(child) {
   if (!canEditSpecialAttention()) return "";
   return `<article class="info-card form-grid">
-    <h3>Élève sensible</h3>
+    <h3>Informations élève sensible</h3>
+    <p class="muted full-span">Ces informations servent à signaler clairement une attention particulière pour l’accompagnement de l’élève.</p>
     <label class="check-field"><input name="attentionSpeciale" type="checkbox" ${child.attentionSpeciale ? "checked" : ""}>Élève sensible</label>
     <label><span>Type d’attention</span><select name="typeAttention">
       ${["médical", "comportement", "allergie", "TSA/TDAH", "mobilité", "autre"].map((value) => `<option value="${esc(value)}" ${child.typeAttention === value ? "selected" : ""}>${esc(value)}</option>`).join("")}
@@ -8022,7 +13259,7 @@ function childLinkedToCurrentTransport(child = {}) {
     child.returnCircuit
   ].filter(Boolean);
   if (state.user.role === "driver") {
-    return child.driverId === state.user.id ||
+    return driverIdsFromRecord(child).includes(state.user.id) ||
       childDriver(child)?.id === state.user.id ||
       childCircuits.some((name) => circuitNames.has(name));
   }
@@ -8056,6 +13293,7 @@ function canSeeAutonomy(child = {}) {
 }
 
 function canSeeMedicalHelpSheet(child = {}) {
+  if (isChildParent(child)) return true;
   if (!child?.parentMedicalHelpCompletedAt) return false;
   return canSeeSpwChildSection(child);
 }
@@ -8207,8 +13445,8 @@ function editChildView(id) {
           ${input("firstName", parentT("child.firstName"), child.firstName, "text", false, true)}
           ${input("lastName", parentT("child.lastName"), child.lastName, "text", false, true)}
           ${input("birthDate", parentT("child.birthDate"), child.birthDate, "date", false, true)}
-          ${input("computedAge", parentT("child.age"), age(child.birthDate), "text", true)}
-          ${dataListInput("schoolName", parentT("child.school"), child.schoolName, schoolNameOptions())}
+          ${input("computedAge", parentT("child.age"), child.birthDate ? age(child.birthDate) : "", "text", true)}
+          ${schoolSelectInput("schoolName", parentT("child.school"), child.schoolId || child.schoolName)}
           ${input("circuitNumber", parentT("child.circuitNumber"), child.circuitNumber)}
           ${addressInput("streetName", "Rue", child.streetName || splitStreetAndNumber(child.homeAddress).street)}
           ${input("streetNumber", "Numéro", child.streetNumber || splitStreetAndNumber(child.homeAddress).number)}
@@ -8219,6 +13457,8 @@ function editChildView(id) {
         <article class="info-card form-grid">
           <h3>${esc(parentT("child.transport"))}</h3>
           ${childTransportAssociationFields(child)}
+          ${input("displayTransferName", "Nom du transfert", transferNameForChild(child), "text", true)}
+          ${input("morningPickupTime", "Heure de passage matin", childMorningPassageTime(child), "time")}
           ${tecStopInput("pickupStop", parentT("child.pickupStop"), child.pickupStop)}
           ${input("transferLocation", parentT("child.transferLocation"), child.transferLocation)}
           <label><span>Transfert</span><select name="hasTransfer"><option value="false" ${!childHasTransfer(child) ? "selected" : ""}>Non</option><option value="true" ${childHasTransfer(child) ? "selected" : ""}>Oui</option></select></label>
@@ -8244,16 +13484,12 @@ function editChildView(id) {
           ${textArea("autonomy.notes", "Remarques autonomie", child.autonomy?.notes || "")}
         </article>` : ""}
         ${transportStatusEditSection(child)}
-        ${canEditSpwChildSection() ? peopleEditSection("Personnes responsables", "guardians", child.responsiblePersons || child.guardians || []) : ""}
-        ${canEditSpwChildSection() ? peopleEditSection(parentT("people.authorized"), "authorizedPickupPersons", child.authorizedPersons || child.authorizedPickupPersons || []) : ""}
+        ${canEditSpwChildSection() ? peopleEditSection("Personnes responsables", "guardians", responsiblePeopleForChild(child)) : ""}
+        ${canEditSpwChildSection() ? peopleEditSection(parentT("people.authorized"), "authorizedPickupPersons", authorizedPeopleForChild(child)) : ""}
         ${specialAttentionEditSection(child)}
         <article class="info-card form-grid">
           <h3>${esc(parentT("child.schoolSection"))}</h3>
-          ${input("schoolName", parentT("child.schoolName"), child.schoolName)}
-          ${input("schoolPhone", parentT("child.phone"), child.schoolPhone)}
-          ${input("schoolEmail", parentT("child.email"), child.schoolEmail, "email")}
-          ${addressInput("schoolAddress", "Adresse école", child.schoolAddress || "")}
-          ${textArea("schoolNotes", "Remarques école", child.schoolNotes || "")}
+          ${childSchoolLinkedFields(child)}
         </article>
         <div class="form-actions">
           <button class="primary-button compact-action" type="submit">${esc(parentT("action.save"))}</button>
@@ -8264,41 +13500,178 @@ function editChildView(id) {
 }
 
 function blankChild() {
-  const circuitNumber = state.user?.role === "assistant"
-    ? [...userCircuitNames()][0] || "C-12"
-    : "C-12";
-  const child = makeChild(`child-${Date.now()}`, "", "", "", circuitNumber, "", "", "", true);
-  return applyLinkedChildData(child);
+  return {
+    id: `child-${Date.now()}`,
+    transportManagerId: transportManagerIdForUser(state.user),
+    firstName: "",
+    lastName: "",
+    birthDate: "",
+    age: "",
+    schoolId: "",
+    schoolName: "",
+    schoolPhone: "",
+    schoolEmail: "",
+    schoolAddress: "",
+    schoolNotes: "",
+    schoolManagerName: "",
+    circuitNumber: "",
+    morningCircuit: "",
+    transferCircuit: "",
+    returnCircuit: "",
+    pickupStop: "",
+    morningPickupTime: "",
+    driverId: "",
+    driverIds: [],
+    assistantId: "",
+    vehicleId: "",
+    transferVehicleId: "",
+    transferLocation: "",
+    transferDriverId: "",
+    transferAssistantId: "",
+    transferCircuitId: "",
+    pickupCircuitId: "",
+    schoolCircuitId: "",
+    transferSchoolCircuitId: "",
+    changesBusAtTransfer: false,
+    hasTransfer: false,
+    staysInSameBus: true,
+    parentIds: [],
+    parentAccessCode: "",
+    parentNotes: "",
+    transportStatus: "Trajet prévu",
+    exclusionType: "",
+    exclusionReason: "",
+    exclusionStartDate: "",
+    exclusionEndDate: "",
+    autonomyStatus: "",
+    homeAddress: "",
+    streetName: "",
+    street: "",
+    streetNumber: "",
+    houseNumber: "",
+    postalCode: "",
+    city: "",
+    phone: "",
+    alternatingResidence: {
+      enabled: false,
+      currentWeek: "",
+      evenWeekParent: "Maman",
+      oddWeekParent: "Papa",
+      motherAddress: "",
+      motherPostalCode: "",
+      motherCity: "",
+      motherPickupStop: "",
+      fatherAddress: "",
+      fatherPostalCode: "",
+      fatherCity: "",
+      fatherPickupStop: "",
+      notes: ""
+    },
+    alternatingCustody: {
+      enabled: false,
+      evenWeekAddress: "",
+      oddWeekAddress: "",
+      evenWeekParent: "",
+      oddWeekParent: "",
+      notes: ""
+    },
+    autonomy: {
+      autonomous: false,
+      accompanimentRequired: false,
+      boardingHelp: "",
+      exitHelp: "",
+      enhancedSupervision: false,
+      notes: ""
+    },
+    transportExclusion: {
+      status: "actif",
+      startDate: "",
+      endDate: "",
+      reason: "",
+      notes: ""
+    },
+    medicalDisabilityType: "",
+    allergies: "",
+    medicalConditions: "",
+    medicalSymptoms: "",
+    medicalNotes: "",
+    communicationHelp: "",
+    mobilityHelp: "",
+    transportSickness: "",
+    importantInstructions: "",
+    medicalHelpSheet: {
+      disabilityType: "",
+      disabilityForm: "",
+      hasAllergies: "",
+      allergiesDetails: "",
+      hasMedicalConditions: "",
+      medicalConditionsDetails: "",
+      medicalSymptoms: "",
+      symptomInstructions: "",
+      transitionObject: "",
+      mobilityHelp: "",
+      tripOccupation: "",
+      transportSickness: "",
+      communicationHelp: "",
+      nonVerbalCommunication: "",
+      pictograms: "",
+      signs: "",
+      careAdviceNotes: ""
+    },
+    guardians: [],
+    responsiblePersons: [],
+    authorizedPickupPersons: [],
+    authorizedPersons: [],
+    sensitiveStudent: {
+      enabled: false,
+      attentionLevel: "information",
+      instructions: "",
+      internalNotes: ""
+    }
+  };
 }
 
 function applyLinkedChildData(child) {
-  const circuit = data.circuits.find((item) => item.name === child.circuitNumber || item.id === child.circuitNumber);
+  const circuit = circuitByRef(child.pickupCircuitId) ||
+    circuitByRef(child.schoolCircuitId) ||
+    circuitByRef(child.circuitNumber);
   const vehicle = data.vehicles.find((item) => item.id === circuit?.vehicleId || item.circuitId === child.circuitNumber || item.id === child.vehicleId);
-  const school = data.schools.find((item) => item.name === circuit?.schoolName || item.name === child.schoolName);
   if (circuit) {
+    child.transportManagerId = child.transportManagerId || circuit.transportManagerId || "";
     child.circuitNumber = circuit.name || child.circuitNumber;
     child.pickupCircuitId = child.pickupCircuitId || circuit.id || circuit.name || "";
     child.schoolCircuitId = child.schoolCircuitId || child.pickupCircuitId || circuit.id || circuit.name || "";
     child.morningCircuit = circuitLabelByRef(child.pickupCircuitId) || child.morningCircuit || `${child.circuitNumber} prise en charge`;
     child.returnCircuit = circuitLabelByRef(child.schoolCircuitId) || child.returnCircuit || `${child.circuitNumber} vers école`;
-    child.driverId = circuit.driverId || child.driverId || "";
+    child.driverIds = uniqueText([...driverIdsFromRecord(child), ...driverIdsFromRecord(circuit)]);
+    child.driverId = child.driverId || child.driverIds[0] || "";
     child.assistantId = circuit.assistantId || child.assistantId || "";
     child.vehicleId = circuit.vehicleId || vehicle?.id || child.vehicleId || "";
-    child.schoolName = circuit.schoolName || child.schoolName || "";
+    child.schoolName = child.schoolName || circuit.schoolName || "";
   }
   if (vehicle) {
+    child.transportManagerId = child.transportManagerId || vehicle.transportManagerId || "";
     child.vehicleId = vehicle.id;
-    child.driverId = child.driverId || vehicle.driverId || "";
+    child.driverIds = uniqueText([...driverIdsFromRecord(child), ...driverIdsFromRecord(vehicle)]);
+    child.driverId = child.driverId || child.driverIds[0] || "";
     child.assistantId = child.assistantId || vehicle.assistantId || "";
     child.transferVehicleId = vehicle.busNumber || child.transferVehicleId || "";
   }
   if (state.user?.role === "assistant") {
     child.assistantId = state.user.id;
   }
+  const school = schoolByRef(child.schoolId) ||
+    schoolByRef(child.schoolName) ||
+    schoolByRef(circuit?.schoolIds?.[0]) ||
+    schoolByRef(circuit?.schoolName);
   if (school) {
+    child.schoolId = school.id || child.schoolId || "";
     child.schoolName = school.name || child.schoolName || "";
     child.schoolPhone = school.phone || child.schoolPhone || "";
     child.schoolEmail = school.email || child.schoolEmail || "";
+    child.schoolAddress = school.address || child.schoolAddress || "";
+    child.schoolNotes = school.notes || child.schoolNotes || "";
+    child.schoolManagerName = school.managerName || child.schoolManagerName || "";
   }
   return child;
 }
@@ -8332,6 +13705,10 @@ function cityInput(name, label, value, disabled = false) {
 
 function fieldInputFor(type, key, label, value, disabled = false) {
   if (key === "address") return addressInput(key, label, value, disabled);
+  if (key === "driverId") return dataListInput(key, label, driverOptionLabel(driverByRef(value) || {}), scopeRecordsForCurrentTransportManager("drivers", data.drivers || []).map(driverOptionLabel));
+  if (key === "assistantId") return dataListInput(key, label, assistantOptionLabel(assistantByRef(value) || {}), scopeRecordsForCurrentTransportManager("assistants", data.assistants || []).map(assistantOptionLabel));
+  if (key === "vehicleId") return dataListInput(key, label, vehicleOptionLabel(vehicleByRef(value) || {}), scopeRecordsForCurrentTransportManager("vehicles", data.vehicles || []).map(vehicleOptionLabel));
+  if (key === "circuitId") return dataListInput(key, label, circuitOptionLabel(circuitByRef(value) || {}) || value || "", scopeRecordsForCurrentTransportManager("circuits", data.circuits || []).map(circuitOptionLabel));
   return input(key, label, value, "text", disabled);
 }
 
@@ -8341,18 +13718,36 @@ function readonlyAssociationInput(name, label, ref) {
 
 function circuitSearchInput(name, label, value) {
   const circuit = circuitByRef(value);
-  return dataListInput(name, label, circuitOptionLabel(circuit || {}) || value || "", (data.circuits || []).map(circuitOptionLabel));
+  return dataListInput(name, label, circuitOptionLabel(circuit || {}) || value || "", scopeRecordsForCurrentTransportManager("circuits", data.circuits || []).map(circuitOptionLabel));
 }
 
 function driverOptionLabel(driver) {
-  const vehicle = data.vehicles.find((item) => item.driverId === driver.id || item.busNumber === driver.busNumber);
-  const circuit = data.circuits.find((item) => item.driverId === driver.id || item.name === driver.schoolCircuit);
-  return [fullName(driver), vehicle?.busNumber || driver.busNumber, circuit?.name || driver.schoolCircuit].filter(Boolean).join(" - ");
+  const vehicle = scopeRecordsForCurrentTransportManager("vehicles", data.vehicles || []).find((item) => driverIdsFromRecord(item).includes(driver.id) || item.busNumber === driver.busNumber);
+  const circuit = scopeRecordsForCurrentTransportManager("circuits", data.circuits || []).find((item) => driverIdsFromRecord(item).includes(driver.id) || item.name === driver.schoolCircuit);
+  return [fullName(driver), driver.phone, vehicle?.busNumber || driver.busNumber, circuit?.name || driver.schoolCircuit].filter(Boolean).join(" - ");
 }
 
 function assistantOptionLabel(assistant) {
-  const circuit = data.circuits.find((item) => item.assistantId === assistant.id || item.name === assistant.schoolCircuit);
-  return [fullName(assistant), circuit?.name || assistant.schoolCircuit].filter(Boolean).join(" - ");
+  const circuit = scopeRecordsForCurrentTransportManager("circuits", data.circuits || []).find((item) => item.assistantId === assistant.id || item.name === assistant.schoolCircuit);
+  return [fullName(assistant), assistant.phone, circuit?.name || assistant.schoolCircuit].filter(Boolean).join(" - ");
+}
+
+function vehicleOptionLabel(vehicle = {}) {
+  const circuit = scopeRecordsForCurrentTransportManager("circuits", data.circuits || []).find((item) => item.vehicleId === vehicle.id || item.name === vehicle.circuitId || item.id === vehicle.circuitId);
+  const driverNames = driverNamesByIds(driverIdsFromRecord(vehicle));
+  const assistant = scopeRecordsForCurrentTransportManager("assistants", data.assistants || []).find((item) => item.id === vehicle.assistantId);
+  return [vehicle.busNumber || vehicle.id, vehicle.licensePlate, circuit?.name || vehicle.circuitId, driverNames, assistant ? fullName(assistant) : ""].filter(Boolean).join(" - ");
+}
+
+function vehicleByRef(ref) {
+  const value = String(ref || "").trim().toLowerCase();
+  if (!value) return null;
+  return scopeRecordsForCurrentTransportManager("vehicles", data.vehicles || []).find((vehicle) =>
+    String(vehicle.id || "").toLowerCase() === value ||
+    String(vehicle.busNumber || "").toLowerCase() === value ||
+    String(vehicle.licensePlate || "").toLowerCase() === value ||
+    vehicleOptionLabel(vehicle).toLowerCase() === value
+  ) || null;
 }
 
 function childTransportAssociationFields(child) {
@@ -8366,10 +13761,24 @@ function childTransportAssociationFields(child) {
   return `
     ${circuitSearchInput("pickupCircuitId", parentT("child.pickupCircuit"), pickupCircuitId)}
     ${circuitSearchInput("schoolCircuitId", parentT("child.schoolCircuit"), schoolCircuitId)}
-    ${dataListInput("driverId", "Chauffeur associé", driverOptionLabel(childDriver(child) || data.drivers.find((driver) => driver.id === child.driverId) || {}), (data.drivers || []).map(driverOptionLabel))}
-    
-    ${dataListInput("assistantId", "Convoyeuse associée", assistantOptionLabel(childAssistant(child) || data.assistants.find((assistant) => assistant.id === child.assistantId) || {}), (data.assistants || []).map(assistantOptionLabel))}
+    ${dataListInput("driverId", "Chauffeur associé", child.driverId ? driverOptionLabel(childDriver(child) || scopeRecordsForCurrentTransportManager("drivers", data.drivers || []).find((driver) => driver.id === child.driverId) || {}) : "", scopeRecordsForCurrentTransportManager("drivers", data.drivers || []).map(driverOptionLabel))}
+
+    ${dataListInput("assistantId", "Convoyeuse associée", child.assistantId ? assistantOptionLabel(childAssistant(child) || scopeRecordsForCurrentTransportManager("assistants", data.assistants || []).find((assistant) => assistant.id === child.assistantId) || {}) : "", scopeRecordsForCurrentTransportManager("assistants", data.assistants || []).map(assistantOptionLabel))}
     `;
+}
+
+function updateChildTransportLinkedDisplays(form) {
+  const circuit = circuitByRef(form?.elements?.pickupCircuitId?.value) ||
+    circuitByRef(form?.elements?.schoolCircuitId?.value);
+  if (!circuit) return;
+  const drivers = driverIdsFromRecord(circuit).map(driverByRef).filter(Boolean);
+  const assistant = assistantByRef(circuit.assistantId);
+  if (form?.elements?.driverId && drivers.length) {
+    form.elements.driverId.value = driverOptionLabel(drivers[0]);
+  }
+  if (form?.elements?.assistantId && assistant) {
+    form.elements.assistantId.value = assistantOptionLabel(assistant);
+  }
 }
 
 function childOptionLabel(child) {
@@ -8378,10 +13787,176 @@ function childOptionLabel(child) {
 
 function childMultiSelect(name, label, selectedIds = []) {
   const selected = new Set(selectedIds || []);
-  const size = Math.min(Math.max((data.children || []).length, 3), 6);
+  const children = visibleChildren();
+  const size = Math.min(Math.max(children.length, 3), 6);
   return `<label><span>${esc(label)}</span><select name="${esc(name)}" multiple size="${size}">
-    ${(data.children || []).map((child) => `<option value="${esc(child.id)}" ${selected.has(child.id) ? "selected" : ""}>${esc(childOptionLabel(child))}</option>`).join("")}
+    ${children.map((child) => `<option value="${esc(child.id)}" ${selected.has(child.id) ? "selected" : ""}>${esc(childOptionLabel(child))}</option>`).join("")}
   </select><small class="muted">Maintenez Cmd/Ctrl pour sélectionner plusieurs enfants.</small></label>`;
+}
+
+function schoolOptionLabel(school = {}) {
+  return [school.name, school.city || school.commune, school.address].filter(Boolean).join(" - ");
+}
+
+function schoolByRef(ref) {
+  const value = normalizeTextSearch(ref);
+  if (!value) return null;
+  return scopeRecordsForCurrentTransportManager("schools", data.schools || []).find((school) =>
+    normalizeTextSearch(school.id) === value ||
+    normalizeTextSearch(school.name) === value ||
+    normalizeTextSearch(schoolOptionLabel(school)) === value
+  ) || null;
+}
+
+function schoolSelectInput(name, label, value) {
+  const school = schoolByRef(value);
+  return dataListInput(name, label, schoolOptionLabel(school || {}) || value || "", scopeRecordsForCurrentTransportManager("schools", data.schools || []).map(schoolOptionLabel));
+}
+
+function linkedSchoolForChild(child = {}) {
+  return schoolByRef(child.schoolId) || schoolByRef(child.schoolName) || null;
+}
+
+function childSchoolLinkedFields(child = {}) {
+  const school = linkedSchoolForChild(child);
+  return `
+    ${input("schoolDisplayName", parentT("child.schoolName"), school?.name || child.schoolName || "", "text", true)}
+    ${input("schoolManagerDisplay", "Responsable école", school?.managerName || child.schoolManagerName || "", "text", true)}
+    ${input("schoolPhoneDisplay", parentT("child.phone"), school?.phone || child.schoolPhone || "", "text", true)}
+    ${input("schoolEmailDisplay", parentT("child.email"), school?.email || child.schoolEmail || "", "email", true)}
+    ${input("schoolAddressDisplay", "Adresse école", school?.address || child.schoolAddress || "", "text", true)}
+    ${textArea("schoolNotesDisplay", "Remarques école", school?.notes || child.schoolNotes || "", true)}
+  `;
+}
+
+function updateChildSchoolLinkedDisplays(form) {
+  const school = schoolByRef(form?.elements?.schoolName?.value);
+  const values = {
+    schoolDisplayName: school?.name || "",
+    schoolManagerDisplay: school?.managerName || "",
+    schoolPhoneDisplay: school?.phone || "",
+    schoolEmailDisplay: school?.email || "",
+    schoolAddressDisplay: school?.address || "",
+    schoolNotesDisplay: school?.notes || ""
+  };
+  Object.entries(values).forEach(([name, value]) => {
+    const field = form?.elements?.[name];
+    if (field) field.value = value;
+  });
+}
+
+function circuitSelectedSchoolIds(circuit = {}) {
+  const ids = new Set(Array.isArray(circuit.schoolIds) ? circuit.schoolIds.filter(Boolean) : []);
+  const names = Array.isArray(circuit.schoolNames) ? circuit.schoolNames : [circuit.schoolName].filter(Boolean);
+  names.forEach((name) => {
+  const school = scopeRecordsForCurrentTransportManager("schools", data.schools || []).find((item) => item.name === name);
+    if (school?.id) ids.add(school.id);
+  });
+  return [...ids];
+}
+
+function circuitSchoolNames(circuit = {}) {
+  const ids = circuitSelectedSchoolIds(circuit);
+  const names = ids
+    .map((id) => scopeRecordsForCurrentTransportManager("schools", data.schools || []).find((school) => school.id === id)?.name)
+    .filter(Boolean);
+  return uniqueText([...names, ...(Array.isArray(circuit.schoolNames) ? circuit.schoolNames : []), circuit.schoolName].filter(Boolean));
+}
+
+function schoolMultiSelect(name, label, selectedIds = []) {
+  const selected = new Set(selectedIds || []);
+  const schools = scopeRecordsForCurrentTransportManager("schools", data.schools || []);
+  return `<div class="school-multi-field multi-check-field full-span">
+    <label><span>${esc(label)}</span><input type="text" data-school-multi-search placeholder="Rechercher une école existante"></label>
+    <div class="multi-check-options" data-circuit-school-checkboxes>
+      ${schools.map((school) => `<label class="check-field compact-check" data-search="${esc(normalizeTextSearch(schoolOptionLabel(school)))}"><input name="${esc(name)}" type="checkbox" value="${esc(school.id)}" ${selected.has(school.id) ? "checked" : ""}>${esc(schoolOptionLabel(school))}</label>`).join("") || `<small class="muted">Aucune école disponible.</small>`}
+    </div>
+    <div class="selected-badges" data-school-selected-badges>${schoolBadgesHtml([...selected])}</div>
+  </div>`;
+}
+
+function schoolBadgesHtml(ids = []) {
+  const labels = ids
+    .map((id) => scopeRecordsForCurrentTransportManager("schools", data.schools || []).find((school) => school.id === id))
+    .filter(Boolean)
+    .map((school) => school.name);
+  return labels.length ? labels.map((label) => `<b class="badge ok">${esc(label)}</b>`).join("") : `<small class="muted">Aucune école sélectionnée.</small>`;
+}
+
+function circuitMultiSelect(name, label, selectedIds = []) {
+  const selected = new Set(selectedIds || []);
+  const circuits = scopeRecordsForCurrentTransportManager("circuits", data.circuits || []);
+  const size = Math.min(Math.max(circuits.length, 4), 8);
+  return `<div class="school-multi-field full-span">
+    <label><span>${esc(label)}</span><input type="text" data-circuit-multi-search placeholder="Rechercher un circuit existant"></label>
+    <select name="${esc(name)}" multiple size="${size}" data-linked-circuit-select>
+      ${circuits.map((circuit) => `<option value="${esc(circuit.id)}" data-search="${esc(normalizeTextSearch(circuitOptionLabel(circuit)))}" ${selected.has(circuit.id) ? "selected" : ""}>${esc(circuitOptionLabel(circuit))}</option>`).join("")}
+    </select>
+    <div class="selected-badges" data-circuit-selected-badges>${circuitBadgesHtml([...selected])}</div>
+  </div>`;
+}
+
+function circuitBadgesHtml(ids = []) {
+  const labels = ids
+    .map((id) => scopeRecordsForCurrentTransportManager("circuits", data.circuits || []).find((circuit) => circuit.id === id))
+    .filter(Boolean)
+    .map((circuit) => circuit.name || circuit.id);
+  return labels.length ? labels.map((label) => `<b class="badge ok">${esc(label)}</b>`).join("") : `<small class="muted">Aucun circuit sélectionné.</small>`;
+}
+
+function selectedIdsFromMultiSelect(field) {
+  if (!field?.selectedOptions) return [];
+  return Array.from(field.selectedOptions).map((option) => option.value).filter(Boolean);
+}
+
+function driverIdsFromRecord(record = {}) {
+  return uniqueText([...(Array.isArray(record.driverIds) ? record.driverIds : []), record.driverId].filter(Boolean));
+}
+
+function driverNamesByIds(ids = []) {
+  return driverIdsFromRecord({ driverIds: ids })
+    .map((id) => scopeRecordsForCurrentTransportManager("drivers", data.drivers || []).find((driver) => driver.id === id))
+    .filter(Boolean)
+    .map(fullName)
+    .join(", ");
+}
+
+function driverMultiSelect(name, label, selectedIds = []) {
+  const selected = new Set(driverIdsFromRecord({ driverIds: selectedIds }));
+  const drivers = scopeRecordsForCurrentTransportManager("drivers", data.drivers || []);
+  const size = Math.min(Math.max(drivers.length, 4), 8);
+  return `<div class="driver-multi-field full-span">
+    <label><span>${esc(label)}</span><input type="text" data-driver-multi-search placeholder="Rechercher un chauffeur existant"></label>
+    <select name="${esc(name)}" multiple size="${size}" data-driver-multi-select>
+      ${drivers.map((driver) => `<option value="${esc(driver.id)}" data-search="${esc(normalizeTextSearch(driverOptionLabel(driver)))}" ${selected.has(driver.id) ? "selected" : ""}>${esc(driverOptionLabel(driver))}</option>`).join("")}
+    </select>
+    <div class="selected-badges" data-driver-selected-badges>${driverBadgesHtml([...selected])}</div>
+  </div>`;
+}
+
+function driverBadgesHtml(ids = []) {
+  const labels = ids
+    .map((id) => driverByRef(id))
+    .filter(Boolean)
+    .map(fullName);
+  return labels.length ? labels.map((label) => `<b class="badge ok">${esc(label)}</b>`).join("") : `<small class="muted">Aucun chauffeur sélectionné.</small>`;
+}
+
+function filterDriverMultiSelect(input) {
+  const container = input.closest(".driver-multi-field");
+  const select = container?.querySelector("[data-driver-multi-select]");
+  if (!select) return;
+  const text = normalizeTextSearch(input.value);
+  Array.from(select.options).forEach((option) => {
+    const match = !text || String(option.dataset.search || "").includes(text);
+    option.hidden = !match && !option.selected;
+  });
+}
+
+function updateDriverMultiBadges(select) {
+  const container = select.closest(".driver-multi-field");
+  const target = container?.querySelector("[data-driver-selected-badges]");
+  if (target) target.innerHTML = driverBadgesHtml(selectedIdsFromMultiSelect(select));
 }
 
 function childAssociationAutoField(name, label, selectedIds = []) {
@@ -8418,12 +13993,62 @@ function setSelectedChildIds(field, ids = []) {
   if (display) display.value = childAssociationLabel(ids);
 }
 
+function filterSchoolMultiSelect(input) {
+  const container = input.closest(".school-multi-field");
+  const checks = container?.querySelectorAll("[data-circuit-school-checkboxes] .compact-check");
+  if (checks?.length) {
+    const text = normalizeTextSearch(input.value);
+    checks.forEach((option) => {
+      const checked = option.querySelector("input")?.checked;
+      const match = !text || String(option.dataset.search || "").includes(text);
+      option.hidden = !match && !checked;
+    });
+    return;
+  }
+  const select = container?.querySelector("[data-circuit-school-select]");
+  if (!select) return;
+  const text = normalizeTextSearch(input.value);
+  Array.from(select.options).forEach((option) => {
+    const match = !text || String(option.dataset.search || "").includes(text);
+    option.hidden = !match && !option.selected;
+  });
+}
+
+function updateSchoolMultiBadges(select) {
+  const container = select.closest(".school-multi-field");
+  const target = container?.querySelector("[data-school-selected-badges]");
+  const checkboxValues = container?.querySelectorAll("[data-circuit-school-checkboxes] input:checked");
+  const ids = checkboxValues?.length ? Array.from(checkboxValues).map((input) => input.value).filter(Boolean) : selectedIdsFromMultiSelect(select);
+  if (target) target.innerHTML = schoolBadgesHtml(ids);
+}
+
+function filterCircuitMultiSelect(input) {
+  const container = input.closest(".school-multi-field");
+  const select = container?.querySelector("[data-linked-circuit-select]");
+  if (!select) return;
+  const text = normalizeTextSearch(input.value);
+  Array.from(select.options).forEach((option) => {
+    const match = !text || String(option.dataset.search || "").includes(text);
+    option.hidden = !match && !option.selected;
+  });
+}
+
+function updateCircuitMultiBadges(select) {
+  const container = select.closest(".school-multi-field");
+  const target = container?.querySelector("[data-circuit-selected-badges]");
+  if (target) target.innerHTML = circuitBadgesHtml(selectedIdsFromMultiSelect(select));
+}
+
 function schoolNameOptions() {
-  return uniqueText([...(data.schools || []).map((school) => school.name), ...(data.circuits || []).map((circuit) => circuit.schoolName), ...(data.children || []).map((child) => child.schoolName)]);
+  return uniqueText([
+    ...scopeRecordsForCurrentTransportManager("schools", data.schools || []).map((school) => school.name),
+    ...scopeRecordsForCurrentTransportManager("circuits", data.circuits || []).map((circuit) => circuit.schoolName),
+    ...visibleChildren().map((child) => child.schoolName)
+  ]);
 }
 
 function driverNameOptions() {
-  return (data.drivers || []).map((driver) => fullName(driver));
+  return scopeRecordsForCurrentTransportManager("drivers", data.drivers || []).map((driver) => fullName(driver));
 }
 
 function driverDisplayName(ref) {
@@ -8431,8 +14056,8 @@ function driverDisplayName(ref) {
   return driver ? fullName(driver) : ref || "";
 }
 
-function textArea(name, label, value) {
-  return `<label><span>${esc(label)}</span><textarea name="${esc(name)}" rows="3">${esc(value || "")}</textarea></label>`;
+function textArea(name, label, value, disabled = false) {
+  return `<label><span>${esc(label)}</span><textarea name="${esc(name)}" rows="3" ${disabled ? "disabled" : ""}>${esc(value || "")}</textarea></label>`;
 }
 
 function transportStatusEditSection(child) {
@@ -8460,21 +14085,42 @@ function peopleEditSection(title, key, people = []) {
   const entries = [...people, { lastName: "", firstName: "", phone: "", email: "", address: "", relation: "", note: "" }];
   return `<article class="info-card people-edit-card"><h3>${esc(title)}</h3>
     <p class="muted">Ajoutez plusieurs personnes si nécessaire. Les lignes vides ne seront pas enregistrées.</p>
-    <div class="people-edit-list">
-      ${entries.map((person, index) => `<div class="person-edit-row">
-        <strong>${index < people.length ? `Personne ${index + 1}` : "Ajouter une personne"}</strong>
-        <div class="form-grid">
-          ${input(`${key}.${index}.lastName`, parentT("child.lastName"), person.lastName)}
-          ${input(`${key}.${index}.firstName`, parentT("child.firstName"), person.firstName)}
-          ${input(`${key}.${index}.phone`, parentT("child.phone"), person.phone, "tel")}
-          ${key === "guardians" ? input(`${key}.${index}.email`, parentT("child.email"), person.email || "", "email") : ""}
-          ${addressInput(`${key}.${index}.address`, parentT("child.address"), person.address)}
-          ${input(`${key}.${index}.relation`, parentT("people.relation"), person.relation)}
-          ${textArea(`${key}.${index}.note`, "Remarque", person.note || "")}
-        </div>
-      </div>`).join("")}
+    <div class="people-edit-list" data-person-list="${esc(key)}">
+      ${entries.map((person, index) => personEditRow(key, person, index, index < people.length ? `Personne ${index + 1}` : "Ajouter une personne")).join("")}
     </div>
+    <div class="form-actions"><button class="secondary-button compact-action" type="button" data-add-person-row="${esc(key)}">Ajouter une personne</button></div>
   </article>`;
+}
+
+function personEditRow(key, person = {}, index = 0, title = "Personne") {
+  return `<div class="person-edit-row" data-person-row="${esc(key)}">
+    <div class="person-edit-row-head">
+      <strong>${esc(title)}</strong>
+      <button class="secondary-button compact-action" type="button" data-remove-person-row>Retirer cette ligne</button>
+    </div>
+    <div class="form-grid">
+      ${input(`${key}.${index}.lastName`, parentT("child.lastName"), person.lastName || "")}
+      ${input(`${key}.${index}.firstName`, parentT("child.firstName"), person.firstName || "")}
+      ${input(`${key}.${index}.phone`, parentT("child.phone"), person.phone || "", "tel")}
+      ${key === "guardians" ? input(`${key}.${index}.email`, parentT("child.email"), person.email || "", "email") : ""}
+      ${addressInput(`${key}.${index}.address`, parentT("child.address"), person.address || "")}
+      ${input(`${key}.${index}.relation`, parentT("people.relation"), person.relation || "")}
+      ${textArea(`${key}.${index}.note`, "Remarque", person.note || "")}
+    </div>
+  </div>`;
+}
+
+function addPersonEditRow(key) {
+  const list = [...document.querySelectorAll("[data-person-list]")].find((element) => element.dataset.personList === key);
+  if (!list) return;
+  const usedIndexes = [...list.querySelectorAll(`[name^="${key}."]`)]
+    .map((input) => Number(String(input.name).match(new RegExp(`^${key}\\.(\\d+)\\.`))?.[1] || -1))
+    .filter((index) => index >= 0);
+  const nextIndex = usedIndexes.length ? Math.max(...usedIndexes) + 1 : 0;
+  list.insertAdjacentHTML("beforeend", personEditRow(key, {}, nextIndex, `Personne ${nextIndex + 1}`));
+  const addedRow = list.lastElementChild;
+  addedRow?.querySelector("[data-remove-person-row]")?.addEventListener("click", () => addedRow.remove());
+  bindAddressAutocomplete();
 }
 
 function searchView() {
@@ -8589,8 +14235,8 @@ function extraTransportPanel() {
 
 function transportRequestForm(kind) {
   const pool = kind === "pool";
-  const drivers = data.drivers || [];
-  const vehicles = data.vehicles || [];
+  const drivers = scopeRecordsForCurrentTransportManager("drivers", data.drivers || []);
+  const vehicles = scopeRecordsForCurrentTransportManager("vehicles", data.vehicles || []);
   return `<form class="edit-form" data-transport-request-form="${pool ? "poolTransport" : "extraSchoolTransport"}">
     <article class="info-card form-grid">
       <h3>${pool ? "Transport piscine" : "Transport extra-scolaire"}</h3>
@@ -8613,8 +14259,8 @@ function transportRequestForm(kind) {
 }
 
 function transportRequestCard(item, collection) {
-  const driver = data.drivers.find((entry) => entry.id === item.driverId);
-  const vehicle = data.vehicles.find((entry) => entry.id === item.vehicleId);
+  const driver = scopeRecordsForCurrentTransportManager("drivers", data.drivers || []).find((entry) => entry.id === item.driverId);
+  const vehicle = scopeRecordsForCurrentTransportManager("vehicles", data.vehicles || []).find((entry) => entry.id === item.vehicleId);
   return `<article class="info-card request-card">
     <div class="pending-head"><div><p class="eyebrow">${collection === "poolTransport" ? "Piscine" : "Extra-scolaire"}</p><h3>${esc(item.destination || item.poolLocation || item.school || "Transport")}</h3></div>${requestStatusBadge(item.status)}</div>
     ${sectionRows([["École", item.school], ["Date", item.date], ["Départ", item.departureTime], ["Retour", item.returnTime], ["Élèves", item.studentCount || item.studentList], ["Chauffeur", driver ? fullName(driver) : ""], ["Véhicule", vehicle?.busNumber], ["Contact", item.responsibleContact], ["Remarques", item.notes]])}
@@ -8693,14 +14339,42 @@ function replacementRulesView() {
     <div class="section-title action-title">
       <div><p class="eyebrow">Organisation transport</p><h2>Organisation transferts</h2></div>
     </div>
+    ${replacementTransferRuleNotice()}
     ${canManage ? replacementRuleForm(editingRule) : ""}
-    <article class="info-card replacement-table-card">
+    ${rules.length || canManage ? `<article class="info-card replacement-table-card">
       <h3>Règles de remplacement circuits</h3>
       <div class="replacement-rule-list">
         ${rules.map((rule) => replacementRuleCard(rule, canManage)).join("") || `<p class="muted">Aucune règle active visible.</p>`}
       </div>
-    </article>
+    </article>` : ""}
   </section>`;
+}
+
+function replacementTransferRuleNotice() {
+  const replacementRows = [
+    ["4101", "4104", "4153 si surplus d’élèves"],
+    ["4102", "4105", "4103 si surplus d’élèves"],
+    ["4103", "4105", "4102 si surplus d’élèves"],
+    ["4104", "4101", "4153 si surplus d’élèves"],
+    ["4105", "4102", "4103 si surplus d’élèves"],
+    ["4106", "4154 + 4103", "élèves à répartir"],
+    ["4153", "4157", "4102 si surplus d’élèves"],
+    ["4154", "4106 + 4103", "élèves à répartir"],
+    ["4155", "4104", "Commune de Flemalle"],
+    ["4157", "4153", "4102 si surplus d’élèves"]
+  ];
+  return `<article class="notice-card replacement-transfer-rule-notice">
+    <div class="replacement-transfer-rule-inner">
+      <h3>Règles en cas d’absence de circuit</h3>
+      <p>Quand un circuit est absent, le ou les circuits de remplacement indiqués prennent en charge les élèves du circuit absent et les amènent à l’école.</p>
+      <div class="replacement-transfer-rule-table" role="table" aria-label="Règles de remplacement des circuits">
+        <div class="replacement-transfer-rule-row is-head" role="row"><span>Circuit absent</span><span>Reprise prévue</span><span>Complément</span></div>
+        ${replacementRows.map(([absent, primary, detail]) => `<div class="replacement-transfer-rule-row" role="row"><strong>${esc(absent)}</strong><span>${esc(primary)}</span><small>${esc(detail)}</small></div>`).join("")}
+      </div>
+      <p><strong>Cas particulier 4102 :</strong> les élèves de La Buissonnière sont pris en charge par le 4153 et le 4157 en cas de surplus.</p>
+      <p class="replacement-transfer-rule-warning">En cas d’absence de plusieurs circuits empêchant le bon déroulement de l’organisation, chaque circuit récupère ou dépose les enfants dans son école respective.</p>
+    </div>
+  </article>`;
 }
 
 function canManageReplacementRules() {
@@ -8748,17 +14422,21 @@ function replacementRuleCard(rule, canManage = false) {
 
 function transportGroupView() {
   const tabs = [
+    ...(isTransportManagerUser() ? [["circuitAssignments", "Affectation circuits"]] : []),
     ["children", "Élèves"],
     ["drivers", "Chauffeurs"],
     ["assistants", "Convoyeuses"],
     ["vehicles", "Véhicules"],
     ["schools", "Écoles"],
-    ["circuits", "Circuits"]
+    ["circuits", "Circuits"],
+    ...((isTransportManagerUser() || isSpwAccount()) ? [["transfers", "Lieux de transfert"]] : [])
   ];
-  const tab = tabs.some(([value]) => value === state.transportGroupTab) ? state.transportGroupTab : "children";
-  const body = tab === "children" ? childrenList() : tab === "replacementRules" ? replacementRulesView() : genericListView(tab);
+  const defaultTab = isTransportManagerUser() ? "circuitAssignments" : "children";
+  const tab = tabs.some(([value]) => value === state.transportGroupTab) ? state.transportGroupTab : defaultTab;
+  const body = tab === "children" ? childrenList() : tab === "circuitAssignments" ? circuitAssignmentsView() : tab === "transfers" ? transfersView() : tab === "replacementRules" ? replacementRulesView() : genericListView(tab);
+  const ownerLabel = isSpwAccount() ? "SPW" : "Gestionnaire de transport";
   return `<section class="view-stack">
-    <div class="section-title"><p class="eyebrow">Gestionnaire de transport</p><h2>Gestion transport</h2></div>
+    <div class="section-title"><p class="eyebrow">${esc(ownerLabel)}</p><h2>Gestion transport</h2></div>
     <div class="support-filters grouped-admin-tabs">
       ${tabs.map(([value, label]) => `<button class="${tab === value ? "active" : ""}" type="button" data-transport-group-tab="${esc(value)}">${esc(label)}</button>`).join("")}
     </div>
@@ -8766,16 +14444,71 @@ function transportGroupView() {
   </section>`;
 }
 
+function circuitAssignmentsView() {
+  if (!isTransportManagerUser()) return `<article class="info-card"><p class="muted">Accès réservé au transporteur.</p></article>`;
+  const circuits = scopeRecordsForCurrentTransportManager("circuits", data.circuits || [])
+    .slice()
+    .sort((a, b) => String(a.name || a.id || "").localeCompare(String(b.name || b.id || ""), "fr", { numeric: true }));
+  return `<section class="view-stack compact-stack">
+    <div class="section-title"><p class="eyebrow">Affectations</p><h2>Affectation circuits</h2></div>
+    <article class="info-card circuit-assignment-card">
+      <div class="circuit-assignment-list">
+        ${circuits.map(circuitAssignmentRow).join("") || `<p class="muted">Aucun circuit disponible.</p>`}
+      </div>
+    </article>
+  </section>`;
+}
+
+function circuitAssignmentRow(circuit) {
+  const drivers = scopeRecordsForCurrentTransportManager("drivers", data.drivers || []);
+  const vehicles = scopeRecordsForCurrentTransportManager("vehicles", data.vehicles || []);
+  const assistants = scopeRecordsForCurrentTransportManager("assistants", data.assistants || []);
+  const schools = scopeRecordsForCurrentTransportManager("schools", data.schools || []);
+  const selectedDrivers = new Set(driverIdsFromRecord(circuit));
+  const selectedSchools = new Set(circuitSelectedSchoolIds(circuit));
+  return `<form class="circuit-assignment-row" data-circuit-assignment-form data-circuit-id="${esc(circuit.id)}">
+    <div class="circuit-assignment-main">
+      <strong>${esc(circuit.name || circuit.id || "Circuit")}</strong>
+      <span>${esc([circuit.transferName, circuitSchoolNames(circuit).join(", ") || circuit.schoolName].filter(Boolean).join(" - ") || "Circuit sans école")}</span>
+    </div>
+    <div class="circuit-assignment-school-field"><span>École(s)</span><div class="circuit-assignment-school-options">
+      ${schools.map((school) => `<label class="check-field compact-check"><input name="schoolIds" type="checkbox" value="${esc(school.id)}" ${selectedSchools.has(school.id) ? "checked" : ""}>${esc(schoolOptionLabel(school))}</label>`).join("") || `<small class="muted">Aucune école disponible.</small>`}
+    </div></div>
+    <label class="circuit-assignment-driver-field"><span>Chauffeur(s)</span><select name="driverIds" multiple size="3">
+      ${drivers.map((driver) => `<option value="${esc(driver.id)}" ${selectedDrivers.has(driver.id) ? "selected" : ""}>${esc(driverOptionLabel(driver))}</option>`).join("")}
+    </select></label>
+    <label class="circuit-assignment-vehicle-field"><span>Véhicule</span><select name="vehicleId">
+      <option value="">Non assigné</option>
+      ${vehicles.map((vehicle) => `<option value="${esc(vehicle.id)}" ${vehicle.id === circuit.vehicleId ? "selected" : ""}>${esc(vehicleOptionLabel(vehicle))}</option>`).join("")}
+    </select></label>
+    <label class="circuit-assignment-assistant-field"><span>Convoyeuse</span><select name="assistantId">
+      <option value="">Non assignée</option>
+      ${assistants.map((assistant) => `<option value="${esc(assistant.id)}" ${assistant.id === circuit.assistantId ? "selected" : ""}>${esc(assistantOptionLabel(assistant))}</option>`).join("")}
+    </select></label>
+    <button class="primary-button compact-action" type="submit">Enregistrer</button>
+  </form>`;
+}
+
 function securityGroupView() {
-  const tabs = [
-    ["users", "Codes d’accès"],
-    ["loginLogs", "Connexions"],
-    ["admins", "Gestionnaires de transport"]
-  ];
+  const tabs = isSpwAccount()
+    ? [["users", "Codes d’accès"]]
+    : isPrimaryAdmin()
+      ? [
+        ["users", "Codes d’accès"],
+        ["loginLogs", "Connexions"],
+        ["admins", "Gestionnaires de transport"],
+        ["spw", "SPW"]
+      ]
+      : [
+        ["users", "Codes d’accès"],
+        ["loginLogs", "Connexions"],
+        ["admins", "Gestionnaires de transport"]
+      ];
   const tab = tabs.some(([value]) => value === state.securityGroupTab) ? state.securityGroupTab : "users";
-  const body = tab === "loginLogs" ? loginLogsView() : tab === "admins" ? adminManagementPanel() : adminUsersView();
+  const body = tab === "loginLogs" ? loginLogsView() : tab === "admins" ? adminManagementPanel() : tab === "spw" ? spwManagementPanel() : adminUsersView();
+  const ownerLabel = isSpwAccount() ? "SPW" : "Gestionnaire de transport";
   return `<section class="view-stack">
-    <div class="section-title"><p class="eyebrow">Gestionnaire de transport</p><h2>Accès & sécurité</h2></div>
+    <div class="section-title"><p class="eyebrow">${esc(ownerLabel)}</p><h2>Accès & sécurité</h2></div>
     <div class="support-filters grouped-admin-tabs">
       ${tabs.map(([value, label]) => `<button class="${tab === value ? "active" : ""}" type="button" data-security-group-tab="${esc(value)}">${esc(label)}</button>`).join("")}
     </div>
@@ -8805,9 +14538,11 @@ function historyView() {
     })
     .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
   const types = ["children", "drivers", "assistants", "vehicles", "schools", "circuits", "replacementRules", "roleAnnouncements", "studentIssues", "transferDelays"];
+  const visibleLogIds = logs.map((log) => log.id).filter(Boolean).join(",");
   return `<section class="view-stack">
     <div class="section-title action-title">
       <div><p class="eyebrow">Suivi des changements</p><h2>Historique</h2></div>
+      ${logs.length ? `<button class="danger-button" type="button" data-clear-visible-history="${esc(visibleLogIds)}">Supprimer l’historique affiché</button>` : ""}
     </div>
     <form class="info-card history-filter-card" id="history-filter-form">
       <div class="form-grid">
@@ -8839,7 +14574,7 @@ function historyLogCard(log) {
         <p class="eyebrow">${esc(historyEntityTypeLabel(log.entityType))}</p>
         <h3>${esc(log.entityName || "Élément")}</h3>
       </div>
-      <span class="badge">${esc(formatDateTime(log.createdAt))}</span>
+      <div class="action-row"><span class="badge">${esc(formatDateTime(log.createdAt))}</span><button class="secondary-button compact-action" type="button" data-delete-history-log="${esc(log.id)}">Supprimer</button></div>
     </div>
     ${sectionRows([
       ["Utilisateur", log.modifiedByName],
@@ -8856,18 +14591,19 @@ function settingsView() {
   if (isSupport()) return supportSettingsView();
   if (["driver", "assistant"].includes(state.user?.role)) return operationalSettingsView();
   if (isPrimaryAdmin()) return primaryAdminSettingsView();
-  const tab = ["admin", "config", "contact", "interface", "services"].includes(state.settingsTab) ? state.settingsTab : "admin";
+  const tab = ["admin", "config", "contact", "interface", "info"].includes(state.settingsTab) ? state.settingsTab : "admin";
   return `<section class="view-stack">
     <div class="section-title"><p class="eyebrow">Réglages</p><h2>Réglages</h2></div>
     <div class="support-filters">
       <button class="${tab === "admin" ? "active" : ""}" data-settings-tab="admin">Gestionnaires de transport</button>
       <button class="${tab === "config" ? "active" : ""}" data-settings-tab="config">Paramètres de configuration</button>
       <button class="${tab === "interface" ? "active" : ""}" data-settings-tab="interface">Personnalisation interface</button>
-      <button class="${tab === "services" ? "active" : ""}" data-settings-tab="services">État des services</button>
       <button class="${tab === "contact" ? "active" : ""}" data-settings-tab="contact">Contact SPW</button>
+      <button class="${tab === "info" ? "active" : ""}" data-settings-tab="info">Informations application</button>
     </div>
     ${temporarySupportAccessPanel()}
-    ${tab === "admin" ? adminManagementPanel() : tab === "contact" ? contactSpwSettingsPanel() : tab === "interface" ? interfaceCustomizationPanel() : tab === "services" ? serviceStatusSettingsPanel() : configurationSettingsPanel()}
+    ${tab === "admin" ? adminManagementPanel() : tab === "contact" ? contactSpwSettingsPanel() : tab === "interface" ? interfaceCustomizationPanel() : tab === "info" ? applicationInfoPanel() : configurationSettingsPanel()}
+    ${legalLinksPanel()}
   </section>`;
 }
 
@@ -8881,19 +14617,21 @@ function primaryAdminSettingsView() {
       <button class="${tab === "info" ? "active" : ""}" data-settings-tab="info">Informations application</button>
     </div>
     ${tab === "services" ? serviceStatusSettingsPanel() : tab === "info" ? applicationInfoPanel() : configurationSettingsPanel()}
+    ${legalLinksPanel()}
   </section>`;
 }
 
 function applicationInfoPanel() {
-  return `<article class="info-card">
+  const version = state.appVersion || normalizeAppVersionInfo({});
+  const updatedAt = version.updatedAt && version.updatedAt.includes("/") ? version.updatedAt : formatDateOnly(version.updatedAt);
+  return `<article class="info-card app-version-card">
     <h3>Informations application</h3>
     ${sectionRows([
       ["Application", "Gestion Transport Scolaire"],
-      ["Projet interne", "gts-mobile"],
-      ["Stockage fichiers", "Aucun upload PDF, photo ou document"],
-      ["Données", "Texte uniquement avec Firestore et fallback localStorage"],
-      ["Session", "Expiration après 2 heures d’inactivité"]
+      ["Version", version.version || "Chargement..."],
+      ["Date de mise à jour", updatedAt || "Non renseignée"]
     ])}
+    ${state.updateCheckError ? `<p class="muted">Vérification version indisponible : ${esc(state.updateCheckError)}</p>` : ""}
   </article>`;
 }
 
@@ -8903,6 +14641,8 @@ function supportSettingsView() {
     ${ownCodeFormView()}
     ${themePreferenceView()}
     ${notificationPreferenceView()}
+    ${applicationInfoPanel()}
+    ${legalLinksPanel()}
   </section>`;
 }
 
@@ -8917,7 +14657,7 @@ function temporarySupportAccessPanel() {
       <div>
         <p class="eyebrow">Code à transmettre au support</p>
         <h3>${esc(state.generatedSupportAccessCode)}</h3>
-        <p>Valable jusqu’à ${esc(formatDateTime(state.generatedSupportAccessExpiresAt))}. Il fonctionne une seule fois.</p>
+        <p>Valable jusqu’à ${esc(formatDateTime(state.generatedSupportAccessExpiresAt))}. Il peut être réutilisé pendant sa période de validité.</p>
       </div>
     </article>` : "";
   return `<article class="info-card support-temp-access-panel">
@@ -8931,7 +14671,7 @@ function temporarySupportAccessPanel() {
     ${generated}
     <div class="quick-list-inner">
       ${visibleAccess.map((access) => `<div class="child-row support-row">
-        <span>${access.status === "used" ? "Assistance en cours" : "Code actif"} généré le ${esc(formatDateTime(access.createdAt))}</span>
+        <span>${access.status === "used" ? "Assistance en cours" : "Code actif"} généré le ${esc(formatDateTime(access.createdAt))}${access.displayCode ? ` · <strong class="support-temp-inline-code">${esc(access.displayCode)}</strong>` : ""}</span>
         <small>${access.status === "used" ? `Utilisé par ${esc(access.supportUserId || "support")} · ` : ""}Expire le ${esc(formatDateTime(access.expiresAt))}</small>
         <button class="danger-button compact-action" type="button" data-revoke-support-access="${esc(access.id)}">Révoquer</button>
       </div>`).join("") || `<p class="muted">Aucun accès temporaire actif.</p>`}
@@ -8944,16 +14684,18 @@ function parentSettingsView() {
     <div class="section-title"><p class="eyebrow">${esc(parentT("settings.preferences"))}</p><h2>${esc(parentT("settings.display"))}</h2></div>
     ${themePreferenceView()}
     ${notificationPreferenceView()}
+    ${legalLinksPanel()}
   </section>`;
 }
 
 function operationalSettingsView() {
   return `<section class="view-stack">
     <div class="section-title"><p class="eyebrow">Réglages</p><h2>Réglages</h2></div>
-    ${state.user?.role === "assistant" ? assistantCircuitSettingsView() : ""}
     ${ownCodeFormView()}
     ${themePreferenceView()}
     ${notificationPreferenceView()}
+    ${applicationInfoPanel()}
+    ${legalLinksPanel()}
   </section>`;
 }
 
@@ -9000,15 +14742,38 @@ function configurationSettingsPanel() {
 }
 
 function serviceStatusSettingsPanel() {
-  if (!isAdmin()) return "";
+  return serviceStatusManagementPanel();
+}
+
+function serviceStatusManagementView() {
+  if (!isPrimaryAdmin() && !isSupport()) return dashboard();
+  return `<section class="view-stack">
+    <div class="section-title"><p class="eyebrow">Services</p><h2>État des services</h2></div>
+    ${serviceStatusDashboardCard()}
+    ${serviceStatusManagementPanel()}
+  </section>`;
+}
+
+function maintenancePlanningView() {
+  if (!isPrimaryAdmin() && !isSupport()) return dashboard();
+  return `<section class="view-stack">
+    <div class="section-title"><p class="eyebrow">Services</p><h2>Planification maintenance</h2></div>
+    ${serviceStatusDashboardCard()}
+    ${maintenancePlanningPanel()}
+  </section>`;
+}
+
+function serviceStatusManagementPanel() {
+  if (!isPrimaryAdmin() && !isSupport()) return "";
   const saved = { ...seed.serviceStatus, ...(data.serviceStatus || {}) };
   const status = currentServiceStatus();
   return `<form class="edit-form" id="service-status-form">
     <article class="info-card form-grid">
       <h3>Gestion état des services</h3>
-      <p class="muted">La vérification automatique est désactivée. L’état affiché est modifié manuellement.</p>
+      <p class="muted">La vérification automatique contrôle régulièrement la disponibilité et met à jour l’état affiché.</p>
+      <label class="check-field"><input name="autoMode" type="checkbox" ${saved.autoMode !== false ? "checked" : ""}>Vérification automatique</label>
       <label><span>État actuel</span><select name="status">
-        <option value="operational" ${saved.status === "operational" ? "selected" : ""}>Tout fonctionne</option>
+        <option value="operational" ${saved.status === "operational" ? "selected" : ""}>Normal</option>
         <option value="degraded" ${saved.status === "degraded" ? "selected" : ""}>Perturbation</option>
         <option value="incident" ${saved.status === "incident" ? "selected" : ""}>Incident</option>
       </select></label>
@@ -9016,25 +14781,61 @@ function serviceStatusSettingsPanel() {
       ${sectionRows([
         ["État affiché", serviceStatusMeta(status.status).label],
         ["Dernière mise à jour", formatDateTime(status.updatedAt || status.lastCheckedAt)],
-        ["Mode", "manuel"],
+        ["Dernière vérification", saved.lastCheckedAt ? formatDateTime(saved.lastCheckedAt) : "Non vérifié"],
+        ["Mode", saved.autoMode !== false ? "automatique" : "manuel"],
         ["Modifié par", saved.updatedBy]
       ])}
     </article>
-    <div class="form-actions"><button class="primary-button compact-action" type="submit">Enregistrer l’état</button></div>
+    <div class="form-actions">
+      <button class="secondary-button compact-action" type="button" id="check-service-now">Vérifier maintenant</button>
+      <button class="primary-button compact-action" type="submit">Enregistrer l’état</button>
+    </div>
+  </form>`;
+}
+
+function maintenancePlanningPanel() {
+  if (!isPrimaryAdmin() && !isSupport()) return "";
+  const saved = { ...seed.serviceStatus, ...(data.serviceStatus || {}) };
+  const schedule = currentMaintenanceSchedule();
+  return `<form class="edit-form" id="maintenance-form">
+    <article class="info-card form-grid">
+      <h3>Planification de maintenance</h3>
+      <p class="muted">Pendant la plage indiquée, l’accès au site est bloqué pour tous sauf admin et support.</p>
+      <label class="check-field"><input name="maintenanceEnabled" type="checkbox" ${saved.maintenanceEnabled === true ? "checked" : ""}>Activer le blocage de maintenance</label>
+      ${input("maintenanceStartAt", "Début maintenance", isoToDateTimeLocal(saved.maintenanceStartAt), "datetime-local")}
+      ${input("maintenanceEndAt", "Fin maintenance", isoToDateTimeLocal(saved.maintenanceEndAt), "datetime-local")}
+      ${input("maintenanceTitle", "Titre affiché", saved.maintenanceTitle || "Maintenance planifiée")}
+      ${textArea("maintenanceMessage", "Message affiché", saved.maintenanceMessage || "")}
+      ${sectionRows([
+        ["Statut", schedule.enabled ? (isMaintenanceActive() ? "active" : isMaintenancePlanned() ? "planifiée" : "programmation passée") : "désactivée"],
+        ["Début", schedule.startAt ? formatDateTime(schedule.startAt) : "Non planifié"],
+        ["Fin", schedule.endAt ? formatDateTime(schedule.endAt) : "Non planifié"],
+        ["Accès autorisé pendant maintenance", "admin et support uniquement"],
+        ["Modifié par", saved.updatedBy]
+      ])}
+    </article>
+    <div class="form-actions">
+      <button class="secondary-button compact-action" type="button" id="disable-maintenance">Désactiver maintenance</button>
+      <button class="primary-button compact-action" type="submit">Enregistrer la maintenance</button>
+    </div>
   </form>`;
 }
 
 function notificationPreferenceView() {
   const prefs = notificationPreferences();
+  const platform = currentPushPlatform();
+  const supportMessage = platform === "ios-browser"
+    ? "Sur iPhone, ajoutez d’abord l’app à l’écran d’accueil avec Safari pour autoriser les notifications."
+    : (typeof Notification !== "undefined" && Notification.permission === "denied")
+      ? "Les notifications sont bloquées dans les réglages du navigateur ou de l’iPhone."
+      : "Les notifications respectent les permissions existantes et ne dévoilent pas les conversations privées interdites.";
   return `<article class="info-card form-grid">
     <h3>Notifications</h3>
     <div class="support-filters">
       <button class="${prefs.enabled ? "active" : ""}" data-notification-choice="enabled" type="button">Activer notifications</button>
       <button class="${!prefs.enabled ? "active" : ""}" data-notification-choice="disabled" type="button">Désactiver notifications</button>
-      <button class="${prefs.sound ? "active" : ""}" data-notification-sound="enabled" type="button">Activer son notifications</button>
-      <button class="${!prefs.sound ? "active" : ""}" data-notification-sound="disabled" type="button">Désactiver son notifications</button>
     </div>
-    <p class="muted">Les notifications respectent les permissions existantes et ne dévoilent pas les conversations privées interdites.</p>
+    <p class="muted">${esc(supportMessage)}</p>
   </article>`;
 }
 
@@ -9058,7 +14859,7 @@ function contactSpwSettingsPanel() {
 
 function interfaceCustomizationPanel() {
   if (!isAdmin() || isPrimaryAdmin()) return "";
-  const roles = ["admin", "driver", "assistant", "parent", "support"];
+  const roles = ["admin", "spw", "driver", "assistant", "parent", "support"];
   return `<form class="edit-form" id="interface-config-form">
     <article class="notice-card">
       <p><strong>Personnalisation visuelle uniquement.</strong><br>Ces réglages changent les noms, l’ordre et la visibilité dans l’interface. Ils ne modifient jamais les permissions, les accès aux données, les messages privés ou les informations sensibles.</p>
@@ -9126,7 +14927,7 @@ function saveInterfaceConfig(event) {
   if (!isAdmin() || isPrimaryAdmin()) return;
   const form = event.currentTarget;
   const formData = new FormData(form);
-  const roles = ["admin", "driver", "assistant", "parent", "support"];
+  const roles = ["admin", "spw", "driver", "assistant", "parent", "support"];
   const next = defaultInterfaceConfig();
   next.menuLabels = {};
   next.menuLayout = {};
@@ -9190,28 +14991,43 @@ function adminUsersView() {
 
 function usersAccessPanel() {
   const driverOption = isTransportManagerUser() ? `<option value="driver">Chauffeur</option>` : "";
+  const spwOption = isSpwAccount() ? `<option value="spw">Utilisateur SPW</option>` : "";
   const assistantOption = canManageAssistantAccounts() ? `<option value="assistant">Convoyeuse</option>` : "";
-  const managerOption = isSpwAccount() ? "" : `<option value="admin">Gestionnaire de transport</option>`;
-  const supportOption = isSpwAccount() ? "" : `<option value="support">Support</option>`;
-  return `${accessPersonEditView()}
+  const managerOption = "";
+  const supportOption = "";
+  const roleOptions = isSpwAccount()
+    ? `${assistantOption}${spwOption}`
+    : `${driverOption}${spwOption}${assistantOption}${managerOption}${supportOption}`;
+  const spwAssistantFields = isSpwAccount() ? `
+        <label class="spw-convoyeur-field"><span>Téléphone</span><input name="phone" type="tel"></label>
+        <label class="spw-convoyeur-field"><span>Circuit(s) associé(s)</span><input name="assignedCircuits" type="text" placeholder=""></label>
+        <label class="spw-convoyeur-field"><span>École associée</span><input name="assignedSchool" type="text" list="school-options" placeholder=""></label>
+        <p class="muted full-span spw-convoyeur-field">Si le rôle choisi est Convoyeuse, le compte ouvrira automatiquement l’espace convoyeuse avec les règles convoyeuse.</p>
+      ` : "";
+  const relevantAccessUsers = isSpwAccount()
+    ? data.users.filter((user) => isSpwAccount(user) || user.role === "assistant")
+    : isTransportManagerUser()
+      ? data.users.filter((user) => ["driver", "assistant"].includes(user.role) || isSpwAccount(user))
+      : data.users;
+  const scopedAccessUsers = (isSpwAccount() || isTransportManagerUser())
+    ? scopeRecordsForCurrentTransportManager("users", relevantAccessUsers)
+    : relevantAccessUsers;
+  const visibleUsers = scopedAccessUsers.length ? scopedAccessUsers : relevantAccessUsers;
+  const createForm = isSupportAssistanceSession() ? "" : `
     <form class="edit-form" id="create-user-form">
       <article class="info-card form-grid">
         <h3>Créer un utilisateur</h3>
-        ${input("lastName", "Nom", "")}
         ${input("firstName", "Prénom", "")}
-        <label><span>Rôle</span><select name="role" id="create-user-role">${driverOption}${assistantOption}${managerOption}${supportOption}</select></label>
+        ${input("lastName", "Nom", "")}
+        <label><span>Rôle</span><select name="role" id="create-user-role">${roleOptions}</select></label>
+        ${spwAssistantFields}
         <p class="muted full-span">L’identifiant utilisateur et le code temporaire de première connexion sont générés automatiquement.</p>
-        <div class="admin-hidden-fields">
-          ${input("assignedCircuits", "Circuits associés (séparés par virgule)", "C-12")}
-          ${input("assignedVehicleId", "Véhicule associé", "vehicle-1")}
-          ${dataListInput("assignedSchool", "École associée", "", schoolNameOptions())}
-          <div class="driver-association-field">${dataListInput("driverId", "Chauffeur associé", "", driverNameOptions())}</div>
-          <label class="check-field driver-sncb-access-field"><input name="hasSncbReplacementAccess" type="checkbox">Accès Bus de remplacement SNCB</label>
-        </div>
+        <datalist id="school-options">${schoolNameOptions().map((name) => `<option value="${esc(name)}"></option>`).join("")}</datalist>
       </article>
       <div class="form-actions"><button class="primary-button compact-action" type="submit">Créer l’utilisateur</button></div>
-    </form>
-    <div class="card-grid">${data.users.map(userCard).join("")}</div>`;
+    </form>`;
+  return `${accessPersonEditView()}${createForm}
+    <div class="card-grid">${visibleUsers.map(userCard).join("")}</div>`;
 }
 
 function supportAccessCodesView() {
@@ -9384,9 +15200,12 @@ function accessCardPayload(type, id) {
 }
 
 function openAccessCardPrintPreview(type, id) {
-  if (!canPrintAccessCard()) return alert("Impression accès non autorisée.");
   const payload = accessCardPayload(type, id);
   if (!payload) return alert("Fiche non disponible.");
+  const person = type === "parents"
+    ? (data.parents || []).find((item) => item.id === id)
+    : (data.users || []).find((item) => item.id === id);
+  if (!canPrintAccessCard(person)) return alert("Impression accès non autorisée.");
   const printWindow = window.open("", "_blank");
   if (!printWindow) return alert("Autorisez les fenêtres pop-up pour imprimer la fiche d’accès.");
   const url = loginPageUrl();
@@ -9449,31 +15268,96 @@ function adminManagementView() {
 }
 
 function adminManagementPanel() {
-  const admins = data.users.filter((user) => user.role === "admin");
-  return `
-    <div class="section-title"><p class="eyebrow">Gestionnaire de transport</p><h2>Gestion des gestionnaires de transport</h2></div>
-    ${accessPersonEditView()}
+  if (!isPrimaryAdmin() && !isTransportManagerUser()) return `<article class="info-card"><p class="muted">La gestion des gestionnaires de transport est réservée à l’administrateur système ou au transporteur.</p></article>`;
+  const ownManagerId = transportManagerIdForUser(state.user);
+  const admins = isPrimaryAdmin()
+    ? transportManagerAccounts()
+    : scopeRecordsForCurrentTransportManager("users", data.users || [])
+      .filter((user) => isTransportManagerUser(user) && !isPrimaryAdminUser(user) && !isSpwAccount(user));
+  const currentCompanyName = state.user?.companyName || (data.transportManagers || []).find((manager) => manager.id === ownManagerId)?.companyName || "";
+  const createForm = isSupportAssistanceSession() ? "" : `
     <form class="edit-form" id="create-admin-form">
       <article class="info-card form-grid">
-        <h3>Ajouter un gestionnaire de transport</h3>
-        ${input("companyName", "Nom société", "")}
+        <h3>${esc(isPrimaryAdmin() ? "Ajouter un gestionnaire de transport" : "Ajouter un gestionnaire à mon organisation")}</h3>
+        ${isPrimaryAdmin() ? input("companyName", "Nom société", "") : `${input("companyNameDisplay", "Organisation", currentCompanyName || "Organisation actuelle", "text", true)}<input name="companyName" type="hidden" value="${esc(currentCompanyName)}">`}
         ${input("lastName", "Nom", "")}
         ${input("firstName", "Prénom", "")}
         ${input("phone", "Téléphone", "", "tel")}
         ${input("email", "Adresse e-mail", "", "email")}
         <p class="muted full-span">Le numéro identifiant et le code temporaire sont générés automatiquement.</p>
         <label class="check-field"><input name="isActive" type="checkbox" checked>Actif</label>
-        <label class="check-field"><input name="visualThemeSpw" type="checkbox">Identité visuelle SPW</label>
       </article>
       <div class="form-actions"><button class="primary-button compact-action" type="submit">Créer gestionnaire de transport</button></div>
-    </form>
+    </form>`;
+  return `
+    <div class="section-title"><p class="eyebrow">Gestionnaire de transport</p><h2>Gestion des gestionnaires de transport</h2></div>
+    ${accessPersonEditView()}
+    ${createForm}
     <div class="card-grid">${admins.map(adminCard).join("")}</div>
     ${accessRequestsPanel()}
   `;
 }
 
+function spwAccounts() {
+  return (data.users || []).filter((user) => isSpwAccount(user));
+}
+
+function spwManagementPanel() {
+  return legacySpwManagementPanel();
+}
+
+function primaryAdminSpwUsersView() {
+  if (!isPrimaryAdmin()) return primaryAdminDashboard();
+  return `<section class="view-stack">${legacySpwManagementPanel()}</section>`;
+}
+
+function legacySpwManagementPanel() {
+  if (!isPrimaryAdmin()) return "";
+  const accounts = spwAccounts();
+  const createForm = isSupportAssistanceSession() ? "" : `
+    <form class="edit-form" id="create-spw-form">
+      <article class="info-card form-grid">
+        <h3>Créer un utilisateur SPW</h3>
+        ${input("firstName", "Prénom", "")}
+        ${input("lastName", "Nom", "")}
+        ${input("phone", "Téléphone", "", "tel")}
+        ${input("email", "Adresse e-mail", "", "email")}
+        <p class="muted full-span">L’identifiant SPW et le code temporaire sont générés automatiquement.</p>
+        <label class="check-field"><input name="isActive" type="checkbox" checked>Actif</label>
+      </article>
+      <div class="form-actions"><button class="primary-button compact-action" type="submit">Ajouter un utilisateur SPW</button></div>
+    </form>`;
+  return `
+    <div class="section-title"><p class="eyebrow">SPW</p><h2>Création utilisateur SPW</h2></div>
+    ${createForm}
+    <div class="card-grid">${accounts.map(spwCard).join("") || `<article class="info-card"><p class="muted">Aucun utilisateur SPW créé.</p></article>`}</div>
+  `;
+}
+
+function spwCard(user) {
+  const resetButton = canResetUserAccess(user) ? `<button class="secondary-button" type="button" data-reset-code="${esc(user.id)}">Réinitialiser accès</button>` : "";
+  const printButton = accessPrintButton("users", user.id);
+  const canManage = canManageUserAccess(user);
+  const canDelete = canManage && canRemoveAdmin(user);
+  const rows = [
+    ["Rôle", accountRoleLabel(user)],
+    ["Téléphone", user.phone],
+    ["Adresse e-mail", user.email],
+    ["Numéro identifiant", user.identifier || user.identifierNumber],
+    ["Accès", accessSecurityStatus(user)],
+    ["Première connexion", user.firstLoginCompleted === false ? "à faire" : "effectuée"],
+    ["Statut", user.isActive === false ? "désactivé" : "actif"],
+    ["Date création", user.createdAt ? formatDateTime(user.createdAt) : "Non renseignée"]
+  ];
+  return `<article class="info-card"><h3>${esc(fullName(user))}</h3>${sectionRows(rows)}<div class="form-actions">${canManage ? `<button class="secondary-button" type="button" data-edit-access-type="users" data-edit-access-id="${esc(user.id)}">Modifier la personne</button>${printButton}${resetButton}${canDelete ? `<button class="danger-button" type="button" data-delete-user="${esc(user.id)}">Supprimer</button>` : ""}` : `${printButton}${resetButton}${!printButton && !resetButton ? `<span class="muted">Compte SPW séparé du gestionnaire de transport</span>` : ""}`}</div></article>`;
+}
+
 function adminCard(admin) {
   const canRemove = canRemoveAdmin(admin);
+  const canManage = canManageUserAccess(admin);
+  const canToggle = canToggleAdminAccess(admin);
+  const resetButton = canResetUserAccess(admin) ? `<button class="secondary-button" type="button" data-reset-code="${esc(admin.id)}">Réinitialiser accès</button>` : "";
+  const printButton = accessPrintButton("users", admin.id);
   const rows = [
     ["Nom société", admin.companyName],
     ["Téléphone", admin.phone],
@@ -9485,21 +15369,50 @@ function adminCard(admin) {
     ["Cree par", admin.createdBy],
     ["Date creation", formatDateTime(admin.createdAt)]
   ];
-  return `<article class="info-card"><h3>${esc(fullName(admin))}</h3>${sectionRows(rows)}<div class="form-actions"><button class="secondary-button" type="button" data-edit-access-type="users" data-edit-access-id="${esc(admin.id)}">Modifier la personne</button><button class="secondary-button" type="button" data-toggle-admin="${esc(admin.id)}">${admin.isActive === false ? "Activer" : "Désactiver"}</button>${canRemove ? `<button class="danger-button" type="button" data-delete-admin="${esc(admin.id)}">Supprimer</button>` : ""}</div></article>`;
+  return `<article class="info-card"><h3>${esc(fullName(admin))}</h3>${sectionRows(rows)}<div class="form-actions">${canManage ? `<button class="secondary-button" type="button" data-edit-access-type="users" data-edit-access-id="${esc(admin.id)}">Modifier la personne</button>${printButton}${resetButton}${canToggle ? `<button class="secondary-button" type="button" data-toggle-admin="${esc(admin.id)}">${admin.isActive === false ? "Activer" : "Désactiver"}</button>` : ""}${canRemove ? `<button class="danger-button" type="button" data-delete-admin="${esc(admin.id)}">Supprimer</button>` : ""}` : `${printButton}${resetButton}${!printButton && !resetButton ? `<span class="muted">Consultation uniquement</span>` : ""}`}</div></article>`;
+}
+
+function canToggleAdminAccess(admin) {
+  if (!canManageUserAccess(admin)) return false;
+  if (isPrimaryTransportManagerProfile(admin)) return false;
+  return true;
 }
 
 function canRemoveAdmin(admin) {
   if (!admin || admin.id === state.user.id || admin.id === "admin") return false;
+  if (!canManageUserAccess(admin)) return false;
+  if (isPrimaryAdmin()) return isTransportManagerUser(admin) || isSpwAccount(admin);
+  if (isPrimaryTransportManagerProfile(admin)) return false;
   const activeAdmins = data.users.filter((user) => user.role === "admin" && user.isActive !== false);
   return admin.isActive === false || activeAdmins.length > 1;
 }
 
 function loginLogsView() {
-  const logs = [...(data.loginLogs || [])].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 100);
+  const logs = visibleLoginLogsForCurrentUser().sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 100);
   return `<section class="view-stack">
     <div class="section-title"><p class="eyebrow">Sécurité</p><h2>Connexions</h2></div>
     <div class="quick-list">${logs.map(loginLogRow).join("") || `<article class="info-card"><p class="muted">Aucune connexion enregistrée.</p></article>`}</div>
   </section>`;
+}
+
+function visibleLoginLogsForCurrentUser() {
+  const logs = [...(data.loginLogs || [])];
+  if (!isSupport()) return logs;
+  return logs.filter((log) => supportCanSeeLoginLog(log));
+}
+
+function supportCanSeeLoginLog(log = {}) {
+  const role = String(log.userRole || "").toLowerCase();
+  const label = String(log.userRoleLabel || "").toLowerCase();
+  return [
+    "support",
+    "admin",
+    "system_admin",
+    "admin_system",
+    "spw",
+    "transport_manager",
+    "gestionnaire_transport"
+  ].includes(role) || label.includes("admin") || label.includes("support") || label.includes("spw") || label.includes("transporteur");
 }
 
 function loginLogRow(log) {
@@ -9515,7 +15428,7 @@ function loginLogRow(log) {
         : "refusée";
   return `<article class="info-card">
     <h3>${esc(isPrimaryAdmin() ? "Connexion utilisateur" : log.userName || "Utilisateur inconnu")}</h3>
-    ${sectionRows(isPrimaryAdmin()
+    ${sectionRows((isPrimaryAdmin() || isSupport())
       ? [["Rôle", log.userRoleLabel || roleLabel(log.userRole)], ["Date de connexion", day], ["Heure de connexion", time], ["Appareil", log.deviceInfo], ["Navigateur", browserLabel(log.browserInfo)], ["Statut", status]]
       : [["Rôle", log.userRoleLabel || roleLabel(log.userRole)], ["Code utilisé", log.accessCodeMasked], ["Date de connexion", day], ["Heure de connexion", time], ["Appareil", log.deviceInfo], ["Navigateur", browserLabel(log.browserInfo)], ["Statut", status]])}
   </article>`;
@@ -9533,8 +15446,9 @@ function parentCodesView() {
 }
 
 function parentCodesPanel() {
-  return `
-    ${accessPersonEditView()}
+  const parents = scopeRecordsForCurrentTransportManager("parents", data.parents || []);
+  const children = visibleChildren();
+  const createForm = isSupportAssistanceSession() ? "" : `
     <form class="edit-form" id="create-parent-form">
       <article class="info-card form-grid">
         <h3>Créer un accès parent</h3>
@@ -9548,9 +15462,12 @@ function parentCodesPanel() {
         <p class="muted full-span">Le nom de l’élève sert d’identifiant parent. Le code temporaire sert uniquement à la première connexion.</p>
       </article>
       <div class="form-actions"><button class="primary-button compact-action" type="submit">Créer le code parent</button></div>
-    </form>
-    <div class="card-grid">${data.parents.map(parentCodeCard).join("")}</div>
-    <article class="info-card"><h3>Élèves et parents liés</h3>${data.children.map((child) => {
+    </form>`;
+  return `
+    ${accessPersonEditView()}
+    ${createForm}
+    <div class="card-grid">${parents.map(parentCodeCard).join("")}</div>
+    <article class="info-card"><h3>Élèves et parents liés</h3>${children.map((child) => {
       const parents = parentListForChild(child);
       return `<div class="field-row"><span>${esc(fullName(child))}<br><small>${esc(child.schoolName)} - ${esc(child.circuitNumber)}</small></span><strong>${parents.map((parent) => `${fullName(parent)} (${parent.phone || "tel ?"}) - ${accessSecurityStatus(parent)}`).join(" / ") || "Aucun parent lié"}</strong></div>`;
     }).join("")}</article>`;
@@ -9558,21 +15475,28 @@ function parentCodesPanel() {
 
 function parentCodeCard(parent) {
   const linkedChildren = (parent.linkedChildrenIds || []).map((id) => data.children.find((child) => child.id === id)).filter(Boolean);
+  const canManage = isAdmin() && !isSupportAssistanceSession();
   return `<article class="info-card">
     <h3>${esc(fullName(parent))}</h3>
     ${sectionRows([["Identifiant parent", parentStudentIdentifier(parent) || parent.username], ["Téléphone", parent.phone], ["Adresse e-mail", parent.email], ["Accès", accessSecurityStatus(parent)], ["Première connexion", parent.firstLoginCompleted === false ? "à faire" : "effectuée"], ["Statut", parent.isActive === false ? "désactivé" : "actif"], ["Enfants liés", linkedChildren.map(fullName).join(", ")]])}
-    <div class="form-actions">
+    <div class="form-actions">${canManage ? `
       <button class="secondary-button" type="button" data-edit-access-type="parents" data-edit-access-id="${esc(parent.id)}">Modifier la personne</button>
       ${accessPrintButton("parents", parent.id)}
       <button class="secondary-button" type="button" data-reset-parent-code="${esc(parent.id)}">Réinitialiser accès</button>
       <button class="danger-button" type="button" data-disable-parent="${esc(parent.id)}">${parent.isActive === false ? "Réactiver" : "Désactiver accès"}</button>
       <button class="danger-button" type="button" data-delete-parent="${esc(parent.id)}">Supprimer</button>
+    ` : `<span class="muted">Consultation uniquement</span>`}
     </div>
   </article>`;
 }
 
 function parentListForChild(child) {
-  return (data.parents || []).filter((parent) => (parent.linkedChildrenIds || []).includes(child.id));
+  if (!child?.id) return [];
+  const parentIds = new Set((child.parentIds || []).filter(Boolean));
+  return scopeRecordsForCurrentTransportManager("parents", data.parents || []).filter((parent) =>
+    parentIds.has(parent.id)
+    || (parent.linkedChildrenIds || []).includes(child.id)
+  );
 }
 
 function normalizePhoneNumber(value = "") {
@@ -9595,9 +15519,10 @@ function childrenForTransfer(transfer = {}) {
 
 function childrenForVehicleService(vehicle = {}) {
   const circuit = vehicleCircuitLabel(vehicle);
+  const vehicleDriverIds = driverIdsFromRecord(vehicle);
   return (data.children || []).filter((child) =>
     child.vehicleId === vehicle.id ||
-    child.driverId === vehicle.driverId ||
+    driverIdsFromRecord(child).some((driverId) => vehicleDriverIds.includes(driverId)) ||
     child.assistantId === vehicle.assistantId ||
     [child.circuitNumber, childPickupCircuitLabel(child), childSchoolCircuitLabel(child)].filter(Boolean).includes(circuit)
   );
@@ -9673,26 +15598,46 @@ function queueSmsAlerts(type, children = [], details = {}) {
 }
 
 function accessPrintButton(type, id) {
-  if (!canPrintAccessCard()) return "";
+  const person = type === "parents"
+    ? (data.parents || []).find((item) => item.id === id)
+    : (data.users || []).find((item) => item.id === id);
+  if (!canPrintAccessCard(person)) return "";
   return `<button class="secondary-button" type="button" data-print-access-card-type="${esc(type)}" data-print-access-card-id="${esc(id)}">Imprimer accès</button>`;
 }
 
 function userCard(user) {
-  const canRemove = user.id !== state.user.id;
+  const canRemove = user.id !== state.user.id && user.role !== "support";
   const canManageAccess = canManageUserAccess(user);
+  const canResetAccess = canResetUserAccess(user);
   const rows = ["admin", "support"].includes(user.role)
-    ? [["Rôle", accountRoleLabel(user)], ["Téléphone", user.phone], ["Adresse e-mail", user.email], ["Numéro identifiant", user.identifier || user.identifierNumber], ["Identité visuelle", user.visualTheme === "spw" ? "SPW" : "Standard"], ["Accès", accessSecurityStatus(user)], ["Première connexion", user.firstLoginCompleted === false ? "à faire" : "effectuée"], ["Date création", user.createdAt ? formatDateTime(user.createdAt) : "Non renseignée"]]
+    ? [["Rôle", accountRoleLabel(user)], ["Téléphone", user.phone], ["Adresse e-mail", user.email], ["Numéro identifiant", user.identifier || user.identifierNumber], ["Identité visuelle", user.visualTheme === "spw" ? "SPW" : "Standard"], ["Accès", accessSecurityStatus(user)], ["Première connexion", user.firstLoginCompleted === false ? "à faire" : "effectuée"], ["Statut", user.isActive === false ? "désactivé" : "actif"], ["Date création", user.createdAt ? formatDateTime(user.createdAt) : "Non renseignée"]]
     : [["Rôle", accountRoleLabel(user)], ["Numéro identifiant", user.identifier || user.identifierNumber], ["Circuit associé", (user.assignedCircuits || []).join(", ")], ["Véhicule associé", user.assignedVehicleId], ["Accès", accessSecurityStatus(user)], ["Première connexion", user.firstLoginCompleted === false ? "à faire" : "effectuée"], ["Date création", user.createdAt ? formatDateTime(user.createdAt) : "Non renseignée"], ["École associée", user.assignedSchool]];
-  if (user.role === "driver") rows.push(["Accès Bus SNCB", user.hasSncbReplacementAccess === true ? "activé" : "désactivé"]);
-  return `<article class="info-card"><h3>${esc(fullName(user))}</h3>${sectionRows(rows)}<div class="form-actions">${canManageAccess ? `<button class="secondary-button" type="button" data-edit-access-type="users" data-edit-access-id="${esc(user.id)}">Modifier la personne</button>${accessPrintButton("users", user.id)}<button class="secondary-button" type="button" data-reset-code="${esc(user.id)}">Réinitialiser accès</button>${canRemove ? `<button class="danger-button" type="button" data-delete-user="${esc(user.id)}">Supprimer</button>` : ""}` : `<span class="muted">Consultation uniquement</span>`}</div></article>`;
+  const printButton = accessPrintButtonForUser(user);
+  const resetButton = canResetAccess ? `<button class="secondary-button" type="button" data-reset-code="${esc(user.id)}">Réinitialiser accès</button>` : "";
+  return `<article class="info-card"><h3>${esc(fullName(user))}</h3>${sectionRows(rows)}<div class="form-actions">${canManageAccess ? `<button class="secondary-button" type="button" data-edit-access-type="users" data-edit-access-id="${esc(user.id)}">Modifier la personne</button>${printButton}${resetButton}${canManageSupportAccounts() && user.role === "support" ? `<button class="secondary-button" type="button" data-toggle-support="${esc(user.id)}">${user.isActive === false ? "Réactiver" : "Désactiver"}</button>` : ""}${canRemove ? `<button class="danger-button" type="button" data-delete-user="${esc(user.id)}">Supprimer</button>` : ""}` : `${printButton}${resetButton}${!printButton && !resetButton ? `<span class="muted">Consultation uniquement</span>` : ""}`}</div></article>`;
 }
 
 function canManageUserAccess(user = {}) {
+  if (isSupportAssistanceSession()) return false;
   if (!isAdmin() || !user) return false;
-  if (isPrimaryAdmin()) return false;
+  if (isPrimaryAdmin()) return user.role === "support" || isTransportManagerUser(user) || isSpwAccount(user);
+  if (isSpwAccount()) return (user.role === "assistant" || isSpwAccount(user)) && recordBelongsToTransportManager(user, transportManagerIdForUser(state.user));
+  if (isTransportManagerUser() && (isPrimaryAdminUser(user) || isSpwAccount(user) || user.role === "support")) return false;
+  if (isTransportManagerUser() && !recordBelongsToTransportManager(user, transportManagerIdForUser(state.user))) return false;
   if (user.role === "assistant") return canManageAssistantAccounts();
-  if (isSpwAccount() && user.role !== "assistant") return false;
   return true;
+}
+
+function canResetUserAccess(user = {}) {
+  if (isSupportAssistanceSession()) return false;
+  if (!isAdmin() || !user) return false;
+  if (isPrimaryAdmin()) return user.role === "support" || isTransportManagerUser(user) || isSpwAccount(user);
+  if (isSpwAccount()) return (user.role === "assistant" || isSpwAccount(user)) && recordBelongsToTransportManager(user, transportManagerIdForUser(state.user));
+  if (isTransportManagerUser() && isSpwAccount(user)) return recordBelongsToTransportManager(user, transportManagerIdForUser(state.user));
+  if (isTransportManagerUser() && (isPrimaryAdminUser(user) || isSpwAccount(user))) return false;
+  if (isTransportManagerUser() && !recordBelongsToTransportManager(user, transportManagerIdForUser(state.user))) return false;
+  if (user.role === "admin") return isTransportManagerUser(user);
+  return canManageUserAccess(user);
 }
 
 function accessSecurityStatus(person = {}) {
@@ -9719,9 +15664,36 @@ function generatedTemporaryAccessData(code, now = new Date().toISOString()) {
   };
 }
 
+async function applyTemporaryAccessReset(person, temporaryCode, now = new Date().toISOString()) {
+  Object.assign(person, generatedTemporaryAccessData(temporaryCode, now));
+  person.temporaryAccessHash = await hashSecret(temporaryCode);
+  person.accessCodeHash = "";
+  person.passwordHash = "";
+  person.recoveryCodeHash = "";
+  person.recoveryAnswerHash = "";
+  person.firstLoginCompleted = false;
+  person.resetRequired = true;
+  person.updatedAt = now;
+  person.updatedBy = state.user?.id || "system";
+  person.accessCodeUpdatedAt = now;
+  if (person.role !== "parent") {
+    const stableIdentifier = stableIdentifierForUser(person, new Set(
+      (data.users || [])
+        .filter((user) => user.id !== person.id)
+        .flatMap((user) => [user.identifier, user.identifierNumber, user.username])
+        .filter(Boolean)
+        .map(normalizeLoginValue)
+    ));
+    person.identifier = stableIdentifier;
+    person.identifierNumber = stableIdentifier;
+    person.username = stableIdentifier;
+  }
+  return person;
+}
+
 function identifierPrefixForRole(role, options = {}) {
   if (role === "admin" && options.visualTheme === "spw") return "SPW";
-  if (role === "admin") return "ADM";
+  if (role === "admin") return "GTR";
   if (role === "driver") return "CHF";
   if (role === "assistant") return "CNV";
   if (role === "support") return "SUP";
@@ -9736,13 +15708,15 @@ function generateUniqueIdentifier(role, options = {}) {
     user.username
   ]).filter(Boolean).map(normalizeLoginValue));
   for (let index = 1; index <= 9999; index += 1) {
-    const identifier = `${prefix}${String(index).padStart(4, "0")}`;
+    const separator = ["support", "admin"].includes(role) ? "-" : "";
+    const identifier = `${prefix}${separator}${String(index).padStart(4, "0")}`;
     if (!used.has(normalizeLoginValue(identifier))) return identifier;
   }
   return `${prefix}${Date.now()}`;
 }
 
 function accessPersonEditView() {
+  if (isSupportAssistanceSession()) return "";
   if (!isAdmin() || !state.editingAccessType || !state.editingAccessId) return "";
   const isParentAccess = state.editingAccessType === "parents";
   const person = isParentAccess
@@ -9764,7 +15738,6 @@ function accessPersonEditView() {
     fields.push(input("assignedVehicleId", "Véhicule associé", person.assignedVehicleId || linkedVehicleIdForDriver(person.id)));
     fields.push(input("assignedCircuits", "Circuits associés", (person.assignedCircuits || [linked?.schoolCircuit]).filter(Boolean).join(", ")));
     fields.push(dataListInput("assignedSchool", "Écoles associées", person.assignedSchool || linked?.schoolName || "", schoolNameOptions()));
-    fields.push(`<label class="check-field"><input name="hasSncbReplacementAccess" type="checkbox" ${person.hasSncbReplacementAccess === true || linked?.hasSncbReplacementAccess === true ? "checked" : ""}>Accès Bus de remplacement SNCB</label>`);
   }
   if (role === "assistant") {
     fields.push(input("assignedCircuits", "Circuits associés", (person.assignedCircuits || [linked?.schoolCircuit]).filter(Boolean).join(", ")));
@@ -9774,12 +15747,17 @@ function accessPersonEditView() {
   if (role === "parent") {
     fields.push(childMultiSelect("linkedChildrenIds", "Élèves associés", person.linkedChildrenIds || []));
   }
-  if (role === "admin") {
+  if (role === "admin" && !isSpwAccount(person)) {
     fields.splice(0, 0, input("companyName", "Nom société", person.companyName || ""));
     fields.push(`<label class="check-field"><input name="isActive" type="checkbox" ${person.isActive !== false ? "checked" : ""}>Actif</label>`);
-    fields.push(`<label class="check-field"><input name="visualThemeSpw" type="checkbox" ${person.visualTheme === "spw" ? "checked" : ""}>Identité visuelle SPW</label>`);
     fields.push(input("createdBy", "Créé par", person.createdBy || ""));
     fields.push(input("createdAt", "Date création", person.createdAt || "", "datetime-local"));
+  }
+  if (isSpwAccount(person)) {
+    fields.push(`<label class="check-field"><input name="isActive" type="checkbox" ${person.isActive !== false ? "checked" : ""}>Actif</label>`);
+  }
+  if (role === "support") {
+    fields.push(`<label class="check-field"><input name="isActive" type="checkbox" ${person.isActive !== false ? "checked" : ""}>Actif</label>`);
   }
   return `<div class="modal-backdrop" data-cancel-access-edit>
     <form class="edit-form info-card access-edit-dialog" id="access-person-form" data-access-type="${esc(state.editingAccessType)}" data-access-id="${esc(state.editingAccessId)}" onclick="event.stopPropagation()">
@@ -9804,12 +15782,14 @@ function linkedAccessRecord(person) {
 }
 
 function linkedVehicleIdForDriver(driverId) {
-  return data.vehicles.find((vehicle) => vehicle.driverId === driverId)?.id || "";
+  return data.vehicles.find((vehicle) => driverIdsFromRecord(vehicle).includes(driverId))?.id || "";
 }
 
 function driverIdForAssistant(assistantId) {
-  return data.vehicles.find((vehicle) => vehicle.assistantId === assistantId)?.driverId
-    || data.circuits.find((circuit) => circuit.assistantId === assistantId)?.driverId
+  const vehicle = data.vehicles.find((item) => item.assistantId === assistantId);
+  const circuit = data.circuits.find((item) => item.assistantId === assistantId);
+  return driverIdsFromRecord(vehicle || {})[0]
+    || driverIdsFromRecord(circuit || {})[0]
     || "";
 }
 
@@ -9830,7 +15810,7 @@ const historyTrackedFields = {
     "firstName", "lastName", "birthDate", "age", "schoolName", "circuitNumber",
     "streetName", "streetNumber", "street", "houseNumber", "postalCode", "city", "phone",
     "pickupCircuitId", "schoolCircuitId", "morningCircuit", "returnCircuit",
-    "driverId", "assistantId", "vehicleId", "pickupStop", "transferLocation", "hasTransfer",
+    "driverId", "driverIds", "assistantId", "vehicleId", "pickupStop", "morningPickupTime", "transferLocation", "hasTransfer",
     "transferSchoolCircuitId", "transferDriverId", "transferAssistantId",
     "transportStatus", "exclusionType", "exclusionReason", "exclusionStartDate", "exclusionEndDate", "transportExclusion",
     "alternatingCustody", "alternatingResidence", "autonomy",
@@ -9838,11 +15818,11 @@ const historyTrackedFields = {
     "medicalHelpSheet", "sensitiveStudent", "attentionSpeciale", "typeAttention", "noteAttention", "niveauAttention",
     "parentNotes", "importantInstructions"
   ],
-  drivers: ["firstName", "lastName", "phone", "busNumber", "licensePlate", "schoolCircuit", "schoolName", "replacementDriverName", "hasSncbReplacementAccess"],
-  assistants: ["firstName", "lastName", "phone", "schoolCircuit", "schoolName", "driverId"],
-  vehicles: ["busNumber", "licensePlate", "driverId", "assistantId", "circuitId", "schoolName", "isOutOfService", "outOfServiceReason", "outOfServiceMessage", "outOfServiceStartDate", "outOfServiceEndDate"],
+  drivers: ["firstName", "lastName", "phone", "email", "vehicleId", "busNumber", "licensePlate", "schoolCircuit", "schoolName", "replacementDriverName"],
+  assistants: ["firstName", "lastName", "phone", "vehicleId", "schoolCircuit", "schoolName", "driverId"],
+  vehicles: ["busNumber", "licensePlate", "driverId", "driverIds", "assistantId", "circuitId", "schoolIds", "schoolName", "isOutOfService", "outOfServiceReason", "outOfServiceMessage", "outOfServiceStartDate", "outOfServiceEndDate"],
   schools: ["name", "managerName", "address", "phone", "email", "notes"],
-  circuits: ["name", "schoolName", "driverId", "assistantId", "vehicleId", "notes"],
+  circuits: ["name", "transferName", "schoolName", "schoolIds", "schoolNames", "vehicleId", "driverId", "driverIds", "assistantId"],
   replacementRules: ["zone", "inactiveCircuitId", "primaryReplacementCircuitId", "secondaryReplacementCircuitId", "schoolId", "message", "isActive"],
   roleAnnouncements: ["title", "content", "targetRole", "important"],
   studentIssues: ["type", "description", "importance", "status"],
@@ -9855,6 +15835,8 @@ const historyFieldLabels = {
   birthDate: "Date de naissance",
   age: "Âge",
   schoolName: "École",
+  schoolIds: "Écoles associées",
+  schoolNames: "Écoles associées",
   circuitNumber: "Numéro de circuit",
   streetName: "Rue",
   streetNumber: "Numéro",
@@ -9867,11 +15849,13 @@ const historyFieldLabels = {
   schoolCircuitId: "Circuit vers l’école",
   morningCircuit: "Circuit de prise en charge",
   returnCircuit: "Circuit vers l’école",
+  morningPickupTime: "Heure de passage matin",
   driverId: "Chauffeur associé",
   assistantId: "Convoyeuse associée",
   vehicleId: "Véhicule associé",
   pickupStop: "Arrêt de bus",
   transferLocation: "Lieu de transfert",
+  transferName: "Nom du transfert",
   hasTransfer: "Transfert",
   transferSchoolCircuitId: "Circuit après transfert",
   transferDriverId: "Chauffeur après transfert",
@@ -9901,7 +15885,6 @@ const historyFieldLabels = {
   licensePlate: "Plaque",
   schoolCircuit: "Circuit",
   replacementDriverName: "Chauffeur de remplacement",
-  hasSncbReplacementAccess: "Accès Bus de remplacement",
   outOfServiceReason: "Raison hors service",
   outOfServiceMessage: "Message hors service",
   outOfServiceStartDate: "Début hors service",
@@ -9927,7 +15910,6 @@ const historyFieldLabels = {
   description: "Description",
   importance: "Importance",
   status: "Statut",
-  transferName: "Transfert",
   delayMinutes: "Retard",
   reason: "Motif"
 };
@@ -10040,8 +16022,30 @@ function recordHistoryDeletion(entityType, item) {
   saveCollectionItemToFirestore("historyLogs", log);
 }
 
+function deleteHistoryLog(logId) {
+  if (!canViewHistoryLogs()) return;
+  if (!logId) return;
+  if (!confirm("Supprimer cette ligne d’historique ?")) return;
+  data.historyLogs = (data.historyLogs || []).filter((log) => log.id !== logId);
+  saveData();
+  deleteCollectionItemFromFirestore("historyLogs", logId);
+  render();
+}
+
+function clearVisibleHistoryLogs(idsText = "") {
+  if (!canViewHistoryLogs()) return;
+  const ids = idsText.split(",").map((id) => id.trim()).filter(Boolean);
+  if (!ids.length) return;
+  if (!confirm(`Supprimer ${ids.length} ligne${ids.length > 1 ? "s" : ""} d’historique affichée${ids.length > 1 ? "s" : ""} ?`)) return;
+  const idsSet = new Set(ids);
+  data.historyLogs = (data.historyLogs || []).filter((log) => !idsSet.has(log.id));
+  saveData();
+  ids.forEach((id) => deleteCollectionItemFromFirestore("historyLogs", id));
+  render();
+}
+
 function selectedOutOfServiceVehicle() {
-  const vehicles = data.vehicles || [];
+  const vehicles = scopeRecordsForCurrentTransportManager("vehicles", data.vehicles || []);
   return vehicles.find((vehicle) => vehicle.id === state.outOfServiceVehicleId) || vehicles[0] || null;
 }
 
@@ -10066,7 +16070,7 @@ function vehicleOutOfServiceSection() {
       <h3>Véhicule hors service</h3>
       <label>Sélectionner un véhicule
         <select id="out-of-service-vehicle-select" name="vehicleId">
-          ${(data.vehicles || []).map((vehicle) => `<option value="${esc(vehicle.id)}" ${vehicle.id === selected.id ? "selected" : ""}>${esc(vehicle.busNumber || vehicle.id)} - ${esc(vehicle.schoolName || vehicle.circuitId || "Non renseigné")}</option>`).join("")}
+          ${scopeRecordsForCurrentTransportManager("vehicles", data.vehicles || []).map((vehicle) => `<option value="${esc(vehicle.id)}" ${vehicle.id === selected.id ? "selected" : ""}>${esc(vehicle.busNumber || vehicle.id)} - ${esc(vehicle.schoolName || vehicle.circuitId || "Non renseigné")}</option>`).join("")}
         </select>
       </label>
       ${input("busNumber", "Numéro du bus", selected.busNumber || "", "text", true)}
@@ -10147,24 +16151,86 @@ function vehicleOutOfServiceAlertsForRecord(vehicle) {
 function genericListView(type) {
   const items = visibleCollection(type);
   const addLabel = type === "schools" ? "Ajouter une école" : "Ajouter";
-  return `<section class="view-stack"><div class="section-title action-title"><div><p class="eyebrow">Gestion</p><h2>${esc(titleFor(type))}</h2></div>${canCreateGeneric(type) ? `<button class="primary-button compact-action" data-new-type="${esc(type)}">${esc(addLabel)}</button>` : ""}</div>${type === "vehicles" ? vehicleOutOfServiceSection() : ""}<div class="card-grid">${items.map((item) => `<button class="record-card" data-open-type="${esc(type)}" data-open-id="${esc(item.id)}"><div><strong>${esc(itemTitle(type, item))}</strong><span>${esc(itemDetail(type, item))}</span></div><small>${canEditGeneric(type, item) ? "Consulter / modifier" : "Consulter"}</small></button>`).join("") || `<article class="info-card"><p class="muted">Aucune donnée visible.</p></article>`}</div></section>`;
+  const assistanceBack = isSupportAssistanceSession() ? `<button class="secondary-button compact-action" type="button" data-assistance-back-dashboard>Retour tableau de bord</button>` : "";
+  return `<section class="view-stack"><div class="section-title action-title"><div><p class="eyebrow">Gestion</p><h2>${esc(titleFor(type))}</h2></div><div class="action-row">${assistanceBack}${canCreateGeneric(type) ? `<button class="primary-button compact-action" data-new-type="${esc(type)}">${esc(addLabel)}</button>` : ""}</div></div>${type === "vehicles" && !isTransportManagerUser() ? vehicleOutOfServiceSection() : ""}<div class="card-grid">${items.map((item) => `<button class="record-card" data-open-type="${esc(type)}" data-open-id="${esc(item.id)}"><div><strong>${esc(itemTitle(type, item))}</strong><span>${esc(itemDetail(type, item))}</span></div><small>${canEditGeneric(type, item) ? "Consulter / modifier" : "Consulter"}</small></button>`).join("") || `<article class="info-card"><p class="muted">Aucune donnée visible.</p></article>`}</div></section>`;
 }
 
 function genericDetailView(type, id) {
   const item = visibleCollection(type).find((entry) => entry.id === id);
   if (!item) return `<article class="info-card"><p>Fiche introuvable.</p></article>`;
-  const rows = fieldsFor(type)
+  const rows = limitedDriverDirectoryRows(type, item) || fieldsFor(type)
     .filter(([key]) => !(usesSpwIdentity() && type === "vehicles" && key === "licensePlate"))
     .filter(([key]) => !(usesSpwIdentity() && type === "drivers" && key === "licensePlate"))
-    .map(([key, label]) => [label, Array.isArray(item[key]) ? item[key].join(", ") : item[key]]);
+    .map(([key, label]) => [label, genericDisplayValue(type, key, item[key])]);
+  if (type === "circuits") rows.push(["École(s) associée(s)", circuitSchoolNames(item).join(", ")]);
+  if (type === "circuits") rows.push(["Chauffeurs associés", driverNamesByIds(driverIdsFromRecord(item)) || item.driverId]);
+  if (type === "vehicles") rows.push(["Chauffeurs associés", driverNamesByIds(driverIdsFromRecord(item)) || item.driverId]);
+  if (type === "circuits") rows.push(["Convoyeuse associée", assistantByRef(item.assistantId) ? fullName(assistantByRef(item.assistantId)) : item.assistantId]);
+  if (type === "schools") rows.push(["Circuit(s) lié(s)", circuitsForSchool(item).map((circuit) => circuit.name).filter(Boolean).join(", ")]);
   return `<section class="view-stack"><div class="detail-head"><button class="icon-button" data-back title="Retour">‹</button><div><p class="eyebrow">${esc(titleFor(type))}</p><h2>${esc(itemTitle(type, item))}</h2></div>${canEditGeneric(type, item) ? `<div class="action-row"><button class="action-button as-button" data-edit-type="${esc(type)}" data-edit-id="${esc(id)}">Modifier</button>${canDeleteGeneric(type, item) ? `<button class="danger-button" data-delete-type="${esc(type)}" data-delete-id="${esc(id)}">Supprimer</button>` : ""}</div>` : ""}</div><div class="detail-grid">${section("Informations", rows)}${vehicleOutOfServiceInfoSection(type, item)}</div></section>`;
+}
+
+function genericDisplayValue(type, key, value) {
+  if (key === "driverIds") return driverNamesByIds(value);
+  if (key === "driverId") return driverByRef(value) ? fullName(driverByRef(value)) : value;
+  if (key === "assistantId") return assistantByRef(value) ? fullName(assistantByRef(value)) : value;
+  if (key === "vehicleId") return vehicleByRef(value) ? vehicleOptionLabel(vehicleByRef(value)) : value;
+  if (key === "circuitId") return circuitByRef(value) ? circuitOptionLabel(circuitByRef(value)) : value;
+  if (Array.isArray(value)) return value.join(", ");
+  return value;
+}
+
+function limitedDriverDirectoryRows(type, item = {}) {
+  if (type !== "drivers" || !["driver", "assistant"].includes(state.user?.role)) return null;
+  if (state.user?.role === "assistant") {
+    return [
+      ["Nom", item.lastName],
+      ["Prénom", item.firstName],
+      ["Téléphone", item.phone],
+      ["Numéro de bus", item.busNumber || vehicleByRef(item.vehicleId)?.busNumber || ""],
+      ["Circuit", item.schoolCircuit],
+      ["Chauffeur de remplacement", item.replacementDriverName],
+      ["École", item.schoolName]
+    ];
+  }
+  return [
+    ["Téléphone", item.phone],
+    ["Numéro de circuit", item.schoolCircuit],
+    ["École", item.schoolName]
+  ];
 }
 
 function genericEditView(type, id) {
   const item = id === "new" ? blankFor(type) : visibleCollection(type).find((entry) => entry.id === id);
   if (!item) return `<article class="info-card"><p>Fiche introuvable.</p></article>`;
   if (id !== "new" && !canEditGeneric(type, item)) return `<article class="info-card"><p>Modification non autorisée.</p></article>`;
-  return `<section class="view-stack"><div class="detail-head"><button class="icon-button" data-cancel-generic title="Annuler">‹</button><div><p class="eyebrow">Edition</p><h2>${esc(titleFor(type))}</h2></div></div><form class="edit-form" id="generic-form" data-type="${esc(type)}" data-id="${esc(id)}"><article class="info-card form-grid"><h3>Informations</h3>${fieldsFor(type).filter(([key]) => !isGenericFieldHidden(type, key)).map(([key, label]) => fieldInputFor(type, key, label, Array.isArray(item[key]) ? item[key].join(", ") : item[key], isGenericFieldReadonly(type, key))).join("")}</article><div class="form-actions"><button class="primary-button compact-action" type="submit">Enregistrer</button><button class="secondary-button" type="button" data-cancel-generic>Annuler</button></div></form></section>`;
+  return `<section class="view-stack"><div class="detail-head"><button class="icon-button" data-cancel-generic title="Annuler">‹</button><div><p class="eyebrow">Edition</p><h2>${esc(titleFor(type))}</h2></div></div><form class="edit-form" id="generic-form" data-type="${esc(type)}" data-id="${esc(id)}"><article class="info-card form-grid"><h3>Informations</h3>${fieldsFor(type).filter(([key]) => !isGenericFieldHidden(type, key)).map(([key, label]) => fieldInputFor(type, key, label, Array.isArray(item[key]) ? item[key].join(", ") : item[key], isGenericFieldReadonly(type, key))).join("")}${genericExtraEditFields(type, id, item)}</article><div class="form-actions"><button class="primary-button compact-action" type="submit">Enregistrer</button><button class="secondary-button" type="button" data-cancel-generic>Annuler</button></div></form></section>`;
+}
+
+function genericExtraEditFields(type, id, item = {}) {
+  if (type === "drivers" && id === "new" && isTransportManagerUser()) {
+    return `<label class="check-field full-span"><input name="createSiteAccess" type="checkbox" checked>Créer aussi l’accès au site</label>
+      <p class="muted full-span">Un identifiant chauffeur et un code temporaire seront générés automatiquement.</p>`;
+  }
+  if (type === "drivers" && isTransportManagerUser() && !(data.users || []).some((user) => user.id === item.id && user.role === "driver")) {
+    return `<label class="check-field full-span"><input name="createSiteAccess" type="checkbox">Créer l’accès au site pour ce chauffeur</label>
+      <p class="muted full-span">Un identifiant chauffeur et un code temporaire seront générés automatiquement.</p>`;
+  }
+  if (type === "vehicles" && isTransportManagerUser()) {
+    return `${driverMultiSelect("driverIds", "Chauffeurs associés", driverIdsFromRecord(item))}`;
+  }
+  if (type === "schools" && isAdmin()) {
+    return `${circuitMultiSelect("linkedCircuitIds", "Circuit(s) lié(s)", circuitsForSchool(item).map((circuit) => circuit.id))}`;
+  }
+  if (type === "circuits" && (isTransportManagerUser() || isSpwAccount())) {
+    return `
+      ${schoolMultiSelect("schoolIds", "École(s) associée(s)", circuitSelectedSchoolIds(item))}
+      ${dataListInput("vehicleId", "Véhicule associé", vehicleOptionLabel(vehicleByRef(item.vehicleId) || {}), scopeRecordsForCurrentTransportManager("vehicles", data.vehicles || []).map(vehicleOptionLabel))}
+      ${driverMultiSelect("driverIds", "Chauffeurs associés", driverIdsFromRecord(item))}
+      ${dataListInput("assistantId", "Convoyeuse associée", assistantOptionLabel(assistantByRef(item.assistantId) || {}), scopeRecordsForCurrentTransportManager("assistants", data.assistants || []).map(assistantOptionLabel))}
+    `;
+  }
+  return "";
 }
 
 function isGenericFieldHidden(type, key) {
@@ -10173,9 +16239,6 @@ function isGenericFieldHidden(type, key) {
 
 function isGenericFieldReadonly(type, key) {
   if (type === "drivers" && key === "replacementDriverName" && !isAdmin()) return true;
-  if (usesSpwIdentity() && type === "drivers" && !isPrimaryAdmin()) {
-    return !["schoolCircuit", "schoolName"].includes(key);
-  }
   return false;
 }
 
@@ -10196,35 +16259,49 @@ function itemTitle(type, item) {
 
 function itemDetail(type, item) {
   if (type === "children") return `${item.pickupStop || ""} ${item.circuitNumber || ""}`.trim();
-  if (type === "vehicles") return usesSpwIdentity() ? (item.schoolName || item.circuitId || "") : (item.licensePlate || item.schoolName || "");
+  if (type === "vehicles") return usesSpwIdentity() ? (item.schoolName || item.circuitId || "") : [item.licensePlate, item.circuitId, driverNamesByIds(driverIdsFromRecord(item))].filter(Boolean).join(" - ");
   if (type === "schools") return item.phone || item.email || "";
-  if (type === "circuits") return `${item.type || ""} ${item.schoolName || ""}`.trim();
+  if (type === "circuits") return [item.transferName, circuitSchoolNames(item).join(", ") || item.schoolName].filter(Boolean).join(" - ");
   if (type === "users") return `${item.role || ""} ${(item.assignedCircuits || []).join(", ")}`.trim();
   if (type === "parents") return `${item.phone || ""} ${(item.linkedChildrenIds || []).join(", ")}`.trim();
   return item.phone || item.schoolCircuit || "";
 }
 
 function fieldsFor(type) {
+  if (type === "drivers" && isTransportManagerUser()) {
+    return [["firstName", "Prénom"], ["lastName", "Nom"], ["phone", "Téléphone"], ["email", "Adresse e-mail"], ["vehicleId", "Véhicule associé"]];
+  }
   return {
-    drivers: [["lastName", "Nom"], ["firstName", "Prénom"], ["phone", "Téléphone"], ["busNumber", "Numéro bus"], ["licensePlate", "Plaque"], ["schoolCircuit", "Circuit"], ["schoolName", "École"], ["replacementDriverName", "Chauffeur de remplacement"]],
-    assistants: [["lastName", "Nom"], ["firstName", "Prénom"], ["phone", "Téléphone"], ["schoolCircuit", "Circuit"]],
-    vehicles: [["busNumber", "Numéro bus"], ["licensePlate", "Plaque"], ["driverId", "Chauffeur"], ["assistantId", "Convoyeuse"], ["circuitId", "Circuit"], ["schoolName", "École"]],
+    drivers: [["lastName", "Nom"], ["firstName", "Prénom"], ["phone", "Téléphone"], ["email", "Adresse e-mail"], ["vehicleId", "Véhicule associé"], ["busNumber", "Numéro bus"], ["licensePlate", "Plaque"], ["schoolCircuit", "Circuit"], ["schoolName", "École"], ["replacementDriverName", "Chauffeur de remplacement"]],
+    assistants: [["lastName", "Nom"], ["firstName", "Prénom"], ["phone", "Téléphone"], ["vehicleId", "Véhicule associé"], ["schoolCircuit", "Circuit"]],
+    vehicles: [["busNumber", "Numéro bus"], ["licensePlate", "Plaque"], ["assistantId", "Convoyeuse"], ["circuitId", "Circuit"], ["schoolName", "École"]],
     schools: [["name", "Nom"], ["managerName", "Nom du responsable"], ["address", "Adresse"], ["phone", "Téléphone"], ["email", "Adresse e-mail"], ["notes", "Notes"]],
-    circuits: [["name", "Numéro de circuit"], ["schoolName", "École"], ["driverId", "Chauffeur"], ["assistantId", "Convoyeuse"], ["vehicleId", "Véhicule"], ["notes", "Notes"]]
+    circuits: [["name", "Numéro de circuit"], ["transferName", "Nom du transfert"]]
   }[type] || [];
+}
+
+function circuitsForSchool(school = {}) {
+  return scopeRecordsForCurrentTransportManager("circuits", data.circuits || []).filter((circuit) =>
+    circuitSelectedSchoolIds(circuit).includes(school.id) ||
+    circuitSchoolNames(circuit).includes(school.name)
+  );
 }
 
 function canEditGeneric(type, item) {
   if (isSupportAssistanceSession()) return false;
   if (!item || !state.user) return false;
   if (isPrimaryAdmin()) return false;
+  if (isSpwAccount() && ["drivers", "vehicles", "circuits"].includes(type)) return false;
   if (type === "assistants") return canManageAssistantAccounts();
   if (type === "schools" && isAdmin()) return true;
   if (isAdmin()) return true;
   const visible = visibleCollection(type).some((entry) => entry.id === item.id);
   if (!visible) return false;
-  if (state.user.role === "driver") return ["drivers", "vehicles", "schools", "circuits"].includes(type);
-  if (state.user.role === "assistant") return ["assistants", "circuits"].includes(type);
+  if (state.user.role === "driver") {
+    if (type === "drivers") return item.id === state.user.id;
+    return ["vehicles", "schools", "circuits"].includes(type);
+  }
+  if (state.user.role === "assistant") return type === "assistants";
   return false;
 }
 
@@ -10235,12 +16312,13 @@ function canCreateGeneric(type) {
   if (type === "schools") return isAdmin();
   if (type === "drivers") return isTransportManagerUser();
   if (isAdmin()) return true;
-  return state.user?.role === "assistant" && type === "circuits";
+  return false;
 }
 
 function canDeleteGeneric(type, item) {
   if (isSupportAssistanceSession()) return false;
   if (isPrimaryAdmin()) return false;
+  if (isSpwAccount() && ["drivers", "vehicles", "circuits"].includes(type)) return false;
   if (type === "assistants") return canManageAssistantAccounts() && !!item;
   if (isAdmin() && !!item) return true;
   return false;
@@ -10248,12 +16326,13 @@ function canDeleteGeneric(type, item) {
 
 function blankFor(type) {
   const id = `${type}-${Date.now()}`;
+  const transportManagerId = transportManagerIdForUser(state.user);
   return {
-    drivers: { id, firstName: "", lastName: "", phone: "", busNumber: "", licensePlate: "", schoolCircuit: "", schoolName: "", replacementDriverName: "" },
-    assistants: { id, firstName: "", lastName: "", phone: "", schoolCircuit: "" },
-    vehicles: { id, busNumber: "", licensePlate: "", driverId: "", assistantId: "", circuitId: "", schoolName: "", isOutOfService: false, outOfServiceReason: "", outOfServiceMessage: "", outOfServiceStartDate: "", outOfServiceEndDate: "", outOfServiceUpdatedBy: "", outOfServiceUpdatedAt: "", outOfServiceReadBy: [] },
-    schools: { id, name: "", managerName: "", address: "", phone: "", email: "", notes: "" },
-    circuits: { id, name: "", type: "", schoolName: "", driverId: "", assistantId: "", vehicleId: "", notes: "" }
+    drivers: { id, transportManagerId, firstName: "", lastName: "", phone: "", email: "", vehicleId: "", busNumber: "", licensePlate: "", schoolCircuit: "", schoolName: "", replacementDriverName: "" },
+    assistants: { id, transportManagerId, firstName: "", lastName: "", phone: "", vehicleId: "", schoolCircuit: "" },
+    vehicles: { id, transportManagerId, busNumber: "", licensePlate: "", driverId: "", driverIds: [], assistantId: "", circuitId: "", schoolIds: [], schoolName: "", isOutOfService: false, outOfServiceReason: "", outOfServiceMessage: "", outOfServiceStartDate: "", outOfServiceEndDate: "", outOfServiceUpdatedBy: "", outOfServiceUpdatedAt: "", outOfServiceReadBy: [] },
+    schools: { id, transportManagerId, name: "", managerName: "", address: "", phone: "", email: "", notes: "" },
+    circuits: { id, transportManagerId, name: "", transferName: "", type: "", schoolName: "", schoolIds: [], schoolNames: [], driverId: "", driverIds: [], assistantId: "", vehicleId: "", notes: "" }
   }[type];
 }
 
@@ -10412,14 +16491,11 @@ function acknowledgeVehicleOutOfService(vehicleId) {
 
 function bindEvents() {
   bindSupportAssistanceReadOnlyGuard();
+  document.querySelectorAll("[data-back-view]").forEach((button) => button.addEventListener("click", goBackView));
   document.querySelectorAll("[data-screen]").forEach((button) => button.addEventListener("click", () => {
     const nextScreen = button.dataset.screen;
+    if (nextScreen && nextScreen !== state.screen) rememberCurrentView();
     state.mobileMoreOpen = false;
-    if (nextScreen === "sncbApp" && canAccessSncbApp()) {
-      state.activeApp = "sncb";
-      saveSession(state.user);
-      return render();
-    }
     state.screen = nextScreen;
     if (nextScreen === "dashboard") {
       resetDashboardContext();
@@ -10435,6 +16511,9 @@ function bindEvents() {
       state.editingAccessId = "";
       state.search = "";
     }
+    if (nextScreen === "messages" && ["driver", "assistant"].includes(state.user?.role)) {
+      state.messagesTab = defaultTransportMessagesTab(transportMessageTabs());
+    }
     render();
   }));
 
@@ -10448,19 +16527,8 @@ function bindEvents() {
     render();
   }));
 
-  document.querySelectorAll("[data-choose-app]").forEach((button) => button.addEventListener("click", () => chooseApplication(button.dataset.chooseApp)));
-  document.querySelectorAll("[data-change-app]").forEach((button) => button.addEventListener("click", () => {
-    state.activeApp = "";
-    saveSession(state.user);
-    render();
-  }));
-  document.querySelectorAll("[data-open-gts-app]").forEach((button) => button.addEventListener("click", () => {
-    state.activeApp = "gts";
-    state.screen = "dashboard";
-    saveSession(state.user);
-    render();
-  }));
   document.querySelectorAll("[data-open-replacement-rules-dashboard]").forEach((button) => button.addEventListener("click", () => {
+    rememberCurrentView();
     state.screen = "transportGroup";
     state.transportGroupTab = "replacementRules";
     state.selectedChildId = "";
@@ -10477,6 +16545,7 @@ function bindEvents() {
 
   document.querySelector(".notification-toast")?.addEventListener("click", (event) => {
     const nextScreen = event.currentTarget.dataset.notificationLink || "dashboard";
+    rememberCurrentView();
     markCurrentNotificationsSeen();
     state.screen = nextScreen;
     state.selectedChildId = "";
@@ -10491,6 +16560,7 @@ function bindEvents() {
   document.querySelectorAll("[data-parent-child]").forEach((button) => button.addEventListener("click", () => {
     state.parentChildId = button.dataset.parentChild;
     state.parentRequestChildId = "";
+    state.parentMedicalChildId = "";
     state.search = "";
     markStudentIssuesRead(state.parentChildId);
     render();
@@ -10498,10 +16568,20 @@ function bindEvents() {
 
   document.querySelectorAll("[data-parent-request]").forEach((button) => button.addEventListener("click", () => {
     state.parentRequestChildId = button.dataset.parentRequest;
+    state.parentMedicalChildId = "";
+    state.parentChildId = button.dataset.parentRequest;
+    render();
+  }));
+
+  document.querySelectorAll("[data-parent-medical-request]").forEach((button) => button.addEventListener("click", () => {
+    state.parentMedicalChildId = button.dataset.parentMedicalRequest;
+    state.parentRequestChildId = "";
+    state.parentChildId = button.dataset.parentMedicalRequest;
     render();
   }));
 
   document.querySelectorAll("[data-open-message-child]").forEach((button) => button.addEventListener("click", () => {
+    rememberCurrentView();
     state.messageChildId = button.dataset.openMessageChild;
     markPrivateConversationRead(state.messageChildId);
     state.screen = "messages";
@@ -10513,9 +16593,32 @@ function bindEvents() {
   }));
   document.querySelectorAll("[data-open-direct-conversation]").forEach((button) => button.addEventListener("click", () => {
     state.selectedDirectConversationId = button.dataset.openDirectConversation;
+    state.composingDirectRole = "";
     render();
   }));
+  document.querySelectorAll("[data-compose-direct]").forEach((button) => button.addEventListener("click", () => {
+    state.composingDirectRole = button.dataset.composeDirect;
+    render();
+  }));
+  document.querySelectorAll("[data-cancel-direct-compose]").forEach((button) => button.addEventListener("click", () => {
+    state.composingDirectRole = "";
+    render();
+  }));
+  document.querySelectorAll("[data-transfer-location-form]").forEach((form) => form.addEventListener("submit", saveTransferLocation));
+  document.getElementById("create-transfer-location-form")?.addEventListener("submit", createTransferLocation);
+  document.querySelectorAll("[data-delete-transport-transfer]").forEach((button) => button.addEventListener("click", () => deleteTransportTransfer(button.dataset.deleteTransportTransfer)));
+  document.querySelectorAll("[data-spw-contact-form]").forEach((form) => form.addEventListener("submit", saveSpwContact));
+  document.querySelectorAll("[data-edit-spw-contact]").forEach((button) => button.addEventListener("click", () => {
+    state.editingSpwContactId = button.dataset.editSpwContact;
+    render();
+  }));
+  document.querySelectorAll("[data-cancel-spw-contact-edit]").forEach((button) => button.addEventListener("click", () => {
+    state.editingSpwContactId = "";
+    render();
+  }));
+  document.querySelectorAll("[data-delete-spw-contact]").forEach((button) => button.addEventListener("click", () => deleteSpwContact(button.dataset.deleteSpwContact)));
   document.querySelectorAll("[data-transfer-delay-form]").forEach((form) => form.addEventListener("submit", saveTransferDelay));
+  document.querySelectorAll("[data-quick-delay-form]").forEach((form) => form.addEventListener("submit", saveQuickTransferDelay));
   document.querySelectorAll("[data-resolve-transfer-delay]").forEach((button) => button.addEventListener("click", () => resolveTransferDelay(button.dataset.resolveTransferDelay)));
   document.querySelectorAll("[data-message-tab]").forEach((button) => button.addEventListener("click", () => {
     state.messagesTab = button.dataset.messageTab;
@@ -10528,11 +16631,19 @@ function bindEvents() {
     render();
   }));
 
+  document.querySelectorAll("[data-cancel-parent-medical-request]").forEach((button) => button.addEventListener("click", () => {
+    state.parentMedicalChildId = "";
+    render();
+  }));
+
   document.querySelectorAll("[data-open-child]").forEach((button) => button.addEventListener("click", () => {
+    rememberCurrentView();
     state.selectedChildId = button.dataset.openChild;
     if (isParent()) state.parentChildId = button.dataset.openChild;
     markStudentIssuesRead(state.selectedChildId);
     state.editingChildId = "";
+    state.parentRequestChildId = "";
+    state.parentMedicalChildId = "";
     state.selectedType = "";
     state.selectedId = "";
     state.editingType = "";
@@ -10545,6 +16656,7 @@ function bindEvents() {
   document.querySelectorAll("[data-open-type]").forEach((button) => button.addEventListener("click", () => {
     const type = button.dataset.openType;
     const id = button.dataset.openId;
+    rememberCurrentView();
     if (isAdmin() && button.dataset.filterResult === "1" && !["users", "parents"].includes(type)) state.activeFilter = { type, id };
     if (isAdmin() && ["users", "parents"].includes(type)) {
       state.selectedChildId = "";
@@ -10573,6 +16685,18 @@ function bindEvents() {
       render();
       return;
     }
+    if (type === "spwContacts") {
+      state.selectedChildId = "";
+      state.selectedType = "";
+      state.selectedId = "";
+      state.editingChildId = "";
+      state.editingType = "";
+      state.editingId = "";
+      state.screen = "spwContacts";
+      state.search = "";
+      render();
+      return;
+    }
     if (type === "children") {
       state.selectedChildId = id;
       state.screen = "children";
@@ -10588,14 +16712,24 @@ function bindEvents() {
   }));
 
   document.querySelectorAll("[data-back]").forEach((button) => button.addEventListener("click", () => {
+    goBackView();
+  }));
+
+  document.querySelectorAll("[data-assistance-back-dashboard]").forEach((button) => button.addEventListener("click", () => {
+    rememberCurrentView();
+    state.screen = "dashboard";
     state.selectedChildId = "";
     state.editingChildId = "";
     state.selectedType = "";
     state.selectedId = "";
+    state.editingType = "";
+    state.editingId = "";
+    state.search = "";
     render();
   }));
 
   document.querySelectorAll("[data-edit-child]").forEach((button) => button.addEventListener("click", () => {
+    rememberCurrentView();
     state.editingChildId = button.dataset.editChild;
     state.selectedType = "";
     state.selectedId = "";
@@ -10644,18 +16778,21 @@ function bindEvents() {
   }));
 
   document.querySelectorAll("[data-new-child]").forEach((button) => button.addEventListener("click", () => {
+    rememberCurrentView();
     state.editingChildId = "new";
     state.selectedChildId = "";
     render();
   }));
 
   document.querySelectorAll("[data-edit-type]").forEach((button) => button.addEventListener("click", () => {
+    rememberCurrentView();
     state.editingType = button.dataset.editType;
     state.editingId = button.dataset.editId;
     render();
   }));
 
   document.querySelectorAll("[data-new-type]").forEach((button) => button.addEventListener("click", () => {
+    rememberCurrentView();
     state.editingType = button.dataset.newType;
     state.editingId = "new";
     state.selectedType = "";
@@ -10721,6 +16858,20 @@ function bindEvents() {
 
   const form = document.getElementById("child-form");
   if (form) form.addEventListener("submit", saveChild);
+  document.querySelectorAll("[data-add-person-row]").forEach((button) => button.addEventListener("click", () => addPersonEditRow(button.dataset.addPersonRow)));
+  document.querySelectorAll("[data-remove-person-row]").forEach((button) => button.addEventListener("click", () => {
+    const row = button.closest("[data-person-row]");
+    if (row) row.remove();
+  }));
+  const childSchoolInput = document.querySelector("#child-form [name='schoolName']");
+  if (childSchoolInput) {
+    childSchoolInput.addEventListener("input", () => updateChildSchoolLinkedDisplays(form));
+    childSchoolInput.addEventListener("change", () => updateChildSchoolLinkedDisplays(form));
+  }
+  document.querySelectorAll("#child-form [name='pickupCircuitId'], #child-form [name='schoolCircuitId']").forEach((input) => {
+    input.addEventListener("input", () => updateChildTransportLinkedDisplays(form));
+    input.addEventListener("change", () => updateChildTransportLinkedDisplays(form));
+  });
   document.querySelectorAll("#parent-absence-form").forEach((absenceForm) => absenceForm.addEventListener("submit", saveParentAbsence));
   document.querySelectorAll("[data-student-issue-form]").forEach((form) => form.addEventListener("submit", saveStudentIssue));
   document.querySelectorAll("[data-student-issue-reply]").forEach((form) => form.addEventListener("submit", replyStudentIssue));
@@ -10736,6 +16887,7 @@ function bindEvents() {
   bindAddressAutocomplete();
   const genericForm = document.getElementById("generic-form");
   if (genericForm) genericForm.addEventListener("submit", saveGeneric);
+  document.querySelectorAll("[data-circuit-assignment-form]").forEach((form) => form.addEventListener("submit", saveCircuitAssignment));
   const outOfServiceForm = document.getElementById("vehicle-out-service-form");
   if (outOfServiceForm) outOfServiceForm.addEventListener("submit", saveVehicleOutOfService);
   document.querySelectorAll("[data-select-out-service]").forEach((button) => button.addEventListener("click", () => {
@@ -10762,6 +16914,12 @@ function bindEvents() {
     state.historyFilterDate = "";
     render();
   });
+  document.querySelectorAll("[data-delete-history-log]").forEach((button) => button.addEventListener("click", () => {
+    deleteHistoryLog(button.dataset.deleteHistoryLog);
+  }));
+  document.querySelectorAll("[data-clear-visible-history]").forEach((button) => button.addEventListener("click", () => {
+    clearVisibleHistoryLogs(button.dataset.clearVisibleHistory);
+  }));
   document.getElementById("leave-request-form")?.addEventListener("submit", saveLeaveRequest);
   document.querySelectorAll("[data-transport-request-form]").forEach((form) => form.addEventListener("submit", saveTransportRequest));
   document.getElementById("vehicle-repair-form")?.addEventListener("submit", saveVehicleRepair);
@@ -10789,9 +16947,25 @@ function bindEvents() {
   });
   document.querySelectorAll("[data-ack-vehicle-oos]").forEach((button) => button.addEventListener("click", () => acknowledgeVehicleOutOfService(button.dataset.ackVehicleOos)));
   document.querySelectorAll("[data-ack-replacement-rule]").forEach((button) => button.addEventListener("click", () => acknowledgeReplacementRule(button.dataset.ackReplacementRule)));
+  document.querySelectorAll("[data-ack-maintenance-notice]").forEach((button) => button.addEventListener("click", acknowledgeMaintenanceNotice));
   const createUser = document.getElementById("create-user-form");
   if (createUser) createUser.addEventListener("submit", createUserFromForm);
+  const createSupport = document.getElementById("create-support-form");
+  if (createSupport) createSupport.addEventListener("submit", createSupportFromForm);
+  document.querySelectorAll("[data-school-multi-search]").forEach((input) => input.addEventListener("input", () => filterSchoolMultiSelect(input)));
+  document.querySelectorAll("[data-circuit-school-select]").forEach((select) => select.addEventListener("change", () => updateSchoolMultiBadges(select)));
+  document.querySelectorAll("[data-circuit-school-checkboxes] input").forEach((input) => input.addEventListener("change", () => updateSchoolMultiBadges(input)));
+  document.querySelectorAll("[data-circuit-multi-search]").forEach((input) => input.addEventListener("input", () => filterCircuitMultiSelect(input)));
+  document.querySelectorAll("[data-linked-circuit-select]").forEach((select) => select.addEventListener("change", () => updateCircuitMultiBadges(select)));
+  document.querySelectorAll("[data-driver-multi-search]").forEach((input) => input.addEventListener("input", () => filterDriverMultiSelect(input)));
+  document.querySelectorAll("[data-driver-multi-select]").forEach((select) => select.addEventListener("change", () => updateDriverMultiBadges(select)));
   document.getElementById("service-status-form")?.addEventListener("submit", saveServiceStatus);
+  document.getElementById("maintenance-form")?.addEventListener("submit", saveMaintenanceSchedule);
+  document.getElementById("disable-maintenance")?.addEventListener("click", disableMaintenanceSchedule);
+  document.getElementById("check-service-now")?.addEventListener("click", async () => {
+    await runServiceHealthCheck();
+    alert(`Vérification terminée : ${serviceStatusMeta(currentServiceStatus().status).label}`);
+  });
   document.getElementById("print-support-access-codes")?.addEventListener("click", printSupportAccessCodesPdf);
   document.querySelectorAll("[data-print-support-access-type]").forEach((button) => button.addEventListener("click", () => {
     printSingleSupportAccessPdf(button.dataset.printSupportAccessType, button.dataset.printSupportAccessId);
@@ -10801,8 +16975,14 @@ function bindEvents() {
   }));
   const createAdmin = document.getElementById("create-admin-form");
   if (createAdmin) createAdmin.addEventListener("submit", createAdminFromForm);
+  const createSpw = document.getElementById("create-spw-form");
+  if (createSpw) createSpw.addEventListener("submit", createSpwFromForm);
+  const createInitialManager = document.getElementById("create-initial-manager-form");
+  if (createInitialManager) createInitialManager.addEventListener("submit", createInitialTransportManagerFromForm);
   const parentChangeForm = document.getElementById("parent-change-form");
   if (parentChangeForm) parentChangeForm.addEventListener("submit", saveParentChangeRequest);
+  const parentMedicalHelpForm = document.getElementById("parent-medical-help-form");
+  if (parentMedicalHelpForm) parentMedicalHelpForm.addEventListener("submit", saveParentMedicalHelp);
   const createParent = document.getElementById("create-parent-form");
   if (createParent) {
     createParent.addEventListener("submit", createParentFromForm);
@@ -10878,10 +17058,20 @@ function bindEvents() {
     saveThemePreference(button.dataset.themeChoice);
   }));
   document.querySelectorAll("[data-notification-choice]").forEach((button) => button.addEventListener("click", () => {
-    saveNotificationPreference("notificationsEnabled", button.dataset.notificationChoice === "enabled");
-  }));
-  document.querySelectorAll("[data-notification-sound]").forEach((button) => button.addEventListener("click", () => {
-    saveNotificationPreference("notificationSoundEnabled", button.dataset.notificationSound === "enabled");
+    const enabled = button.dataset.notificationChoice === "enabled";
+    (async () => {
+      if (enabled) {
+        const ready = await ensureFirebasePushNotificationsFromUserAction();
+        if (!ready) {
+          alert(currentPushPlatform() === "ios-browser"
+            ? "Sur iPhone, les notifications fonctionnent uniquement depuis l’app ajoutée à l’écran d’accueil avec Safari."
+            : "Les notifications ne sont pas autorisées sur cet appareil ou ce navigateur.");
+          return;
+        }
+      }
+      await saveNotificationPreference("notificationsEnabled", enabled);
+      render();
+    })();
   }));
   const supportRequestForm = document.getElementById("support-request-form");
   if (supportRequestForm) supportRequestForm.addEventListener("submit", createSupportRequest);
@@ -10909,8 +17099,48 @@ function bindEvents() {
   document.querySelectorAll("[data-delete-message-id]").forEach((button) => button.addEventListener("click", () => {
     deleteMessage(button.dataset.deleteMessageType, button.dataset.deleteMessageOwner, button.dataset.deleteMessageId);
   }));
+  document.querySelectorAll("[data-delete-direct-conversation]").forEach((button) => button.addEventListener("click", () => {
+    deleteDirectConversation(button.dataset.deleteDirectConversation);
+  }));
+  document.querySelectorAll("[data-delete-team-conversation]").forEach((button) => button.addEventListener("click", () => {
+    deleteTeamConversation(button.dataset.deleteTeamConversation);
+  }));
   document.querySelectorAll("[data-support-filter]").forEach((button) => button.addEventListener("click", () => {
     state.supportFilter = button.dataset.supportFilter;
+    state.selectedSupportRequestId = "";
+    state.supportPage = 1;
+    render();
+  }));
+  const supportSearchInput = document.getElementById("support-search-input");
+  if (supportSearchInput) supportSearchInput.addEventListener("input", () => {
+    state.supportSearch = supportSearchInput.value;
+    state.selectedSupportRequestId = "";
+    state.supportPage = 1;
+    render();
+    const next = document.getElementById("support-search-input");
+    if (next) {
+      next.focus();
+      next.setSelectionRange(next.value.length, next.value.length);
+    }
+  });
+  const supportCategoryFilter = document.getElementById("support-category-filter");
+  if (supportCategoryFilter) supportCategoryFilter.addEventListener("change", () => {
+    state.supportCategoryFilter = supportCategoryFilter.value;
+    state.selectedSupportRequestId = "";
+    state.supportPage = 1;
+    render();
+  });
+  const supportPriorityFilter = document.getElementById("support-priority-filter");
+  if (supportPriorityFilter) supportPriorityFilter.addEventListener("change", () => {
+    state.supportPriorityFilter = supportPriorityFilter.value;
+    state.selectedSupportRequestId = "";
+    state.supportPage = 1;
+    render();
+  });
+  document.querySelectorAll("[data-support-page]").forEach((button) => button.addEventListener("click", () => {
+    const page = Number(button.dataset.supportPage);
+    if (!Number.isFinite(page) || page < 1) return;
+    state.supportPage = page;
     state.selectedSupportRequestId = "";
     render();
   }));
@@ -10925,21 +17155,41 @@ function bindEvents() {
   document.querySelectorAll("[data-delete-support-request]").forEach((button) => button.addEventListener("click", () => {
     deleteSupportRequest(button.dataset.deleteSupportRequest);
   }));
+  document.querySelectorAll("[data-resend-support-email]").forEach((button) => button.addEventListener("click", () => {
+    resendSupportEmail(button.dataset.resendSupportEmail, button.dataset.resendSupportEmailKind, button.dataset.resendSupportMessage || "");
+  }));
+  document.getElementById("export-support-tickets")?.addEventListener("click", exportSupportTicketsCsv);
+  document.getElementById("run-support-overdue-digest")?.addEventListener("click", runSupportOverdueDigestNow);
+  document.getElementById("send-support-weekly-report")?.addEventListener("click", sendSupportWeeklyReportNow);
+  document.getElementById("run-support-anonymization")?.addEventListener("click", runSupportAnonymizationNow);
+  document.querySelectorAll(".support-reply-template").forEach((select) => select.addEventListener("change", () => {
+    const form = select.closest("[data-support-message-form]");
+    const textarea = form?.elements.supportMessageText;
+    if (textarea && select.value) {
+      textarea.value = select.value;
+      textarea.focus();
+    }
+  }));
+  document.querySelectorAll("[data-support-metadata-form]").forEach((form) => form.addEventListener("submit", updateSupportMetadata));
+  document.querySelectorAll("[data-support-internal-note-form]").forEach((form) => form.addEventListener("submit", updateSupportInternalNote));
+  document.querySelectorAll("[data-support-rating]").forEach((button) => button.addEventListener("click", () => {
+    rateSupportRequest(button.dataset.supportRating, button.dataset.ratingValue);
+  }));
   document.querySelectorAll("[data-support-message-form]").forEach((form) => form.addEventListener("submit", sendSupportMessage));
   const createUserRole = document.getElementById("create-user-role");
   if (createUserRole) {
     const syncAdminFields = () => {
-      document.querySelector(".admin-hidden-fields")?.classList.toggle("is-hidden", ["admin", "support"].includes(createUserRole.value));
-      document.querySelector(".driver-sncb-access-field")?.classList.toggle("is-hidden", createUserRole.value !== "driver");
-      document.querySelector(".driver-association-field")?.classList.toggle("is-hidden", createUserRole.value !== "assistant");
+      document.querySelectorAll(".spw-convoyeur-field").forEach((field) => field.classList.toggle("is-hidden", createUserRole.value !== "assistant"));
     };
     createUserRole.addEventListener("change", syncAdminFields);
     syncAdminFields();
   }
   document.querySelectorAll("[data-reset-code]").forEach((button) => button.addEventListener("click", resetUserCode));
   document.querySelectorAll("[data-delete-user]").forEach((button) => button.addEventListener("click", deleteUser));
+  document.querySelectorAll("[data-toggle-support]").forEach((button) => button.addEventListener("click", toggleSupportAccess));
   document.querySelectorAll("[data-toggle-admin]").forEach((button) => button.addEventListener("click", toggleAdminAccess));
   document.querySelectorAll("[data-delete-admin]").forEach((button) => button.addEventListener("click", deleteAdmin));
+  document.querySelectorAll("[data-delete-manager-account]").forEach((button) => button.addEventListener("click", deleteTransportManagerAccount));
   const driverPickerSearch = document.getElementById("driver-picker-search");
   if (driverPickerSearch) driverPickerSearch.addEventListener("input", () => {
     state.driverPickerSearch = driverPickerSearch.value;
@@ -10952,6 +17202,7 @@ function bindEvents() {
   });
   const driverSelect = document.getElementById("dashboard-driver-select");
   if (driverSelect) driverSelect.addEventListener("change", () => {
+    rememberCurrentView();
     if (driverSelect.value) {
       state.activeFilter = { type: "drivers", id: driverSelect.value };
     } else {
@@ -10969,6 +17220,7 @@ function bindEvents() {
   });
   const assistantSelect = document.getElementById("dashboard-assistant-select");
   if (assistantSelect) assistantSelect.addEventListener("change", () => {
+    rememberCurrentView();
     if (assistantSelect.value) {
       state.activeFilter = { type: "assistants", id: assistantSelect.value };
     } else {
@@ -10985,6 +17237,7 @@ function bindEvents() {
     render();
   });
   document.querySelectorAll("[data-pick-driver]").forEach((button) => button.addEventListener("click", () => {
+    rememberCurrentView();
     state.activeFilter = { type: "drivers", id: button.dataset.pickDriver };
     state.selectedChildId = "";
     state.selectedType = "";
@@ -10997,6 +17250,7 @@ function bindEvents() {
     render();
   }));
   document.querySelectorAll("[data-pick-assistant]").forEach((button) => button.addEventListener("click", () => {
+    rememberCurrentView();
     state.activeFilter = { type: "assistants", id: button.dataset.pickAssistant };
     state.selectedChildId = "";
     state.selectedType = "";
@@ -11009,6 +17263,7 @@ function bindEvents() {
     render();
   }));
   document.querySelectorAll("[data-pick-circuit]").forEach((button) => button.addEventListener("click", () => {
+    rememberCurrentView();
     state.activeFilter = { type: "circuits", id: button.dataset.pickCircuit };
     state.selectedChildId = "";
     state.selectedType = "";
@@ -11025,21 +17280,73 @@ function bindEvents() {
     render();
   });
 
-  const search = document.getElementById("global-search");
-  if (search) search.addEventListener("input", () => {
+  document.querySelectorAll("[data-global-search]").forEach((search) => search.addEventListener("input", () => {
+    const sourceClass = search.closest(".search-box")?.classList.contains("topbar-search") ? "topbar-search" : "content-search";
     state.search = search.value;
     render();
-    const next = document.getElementById("global-search");
+    const next = document.querySelector(`.${sourceClass} [data-global-search]`) || document.querySelector("[data-global-search]");
     if (next) {
       next.focus();
       next.setSelectionRange(next.value.length, next.value.length);
     }
-  });
+  }));
 
-  document.getElementById("logout-button")?.addEventListener("click", logout);
-  document.querySelectorAll("[data-dashboard-action]").forEach((button) => button.addEventListener("click", () => {
-    if (button.dataset.dashboardAction === "associated-children") {
-      state.screen = "children";
+	document.getElementById("logout-button")?.addEventListener("click", logout);
+	document.querySelectorAll("[data-dashboard-action]").forEach((button) => button.addEventListener("click", () => {
+	  rememberCurrentView();
+	  if (button.dataset.dashboardAction === "circuit-students") {
+	    state.screen = canOpenCircuitStudentsDashboard() ? "circuitStudents" : "dashboard";
+	    state.selectedChildId = "";
+	    state.editingChildId = "";
+	    state.selectedType = "";
+	    state.selectedId = "";
+	    state.search = "";
+	    render();
+	  }
+	  if (button.dataset.dashboardAction === "associated-children") {
+	    state.screen = "children";
+	    state.selectedChildId = "";
+      state.editingChildId = "";
+      state.selectedType = "";
+      state.selectedId = "";
+      state.search = "";
+	    render();
+	  }
+	  if (button.dataset.dashboardAction === "driver-assistant-detail") {
+	    state.selectedChildId = "";
+	    state.editingChildId = "";
+	    openDashboardDriverAssistant();
+	    state.search = "";
+	    render();
+	  }
+	    if (button.dataset.dashboardAction === "associated-assistants") {
+	      state.screen = "assistants";
+	      state.selectedChildId = "";
+      state.editingChildId = "";
+      state.selectedType = "";
+      state.selectedId = "";
+      state.search = "";
+      render();
+    }
+	    if (button.dataset.dashboardAction === "associated-schools") {
+	      state.screen = "schools";
+	      state.selectedChildId = "";
+      state.editingChildId = "";
+      state.selectedType = "";
+      state.selectedId = "";
+      state.search = "";
+	      render();
+	    }
+	    if (button.dataset.dashboardAction === "driver-school-detail") {
+	      state.selectedChildId = "";
+	      state.editingChildId = "";
+	      openDashboardDriverSchool();
+	      state.search = "";
+	      render();
+	    }
+	    if (button.dataset.dashboardAction === "drivers") {
+      state.screen = "transportGroup";
+      state.transportGroupTab = "drivers";
       state.selectedChildId = "";
       state.editingChildId = "";
       state.selectedType = "";
@@ -11047,8 +17354,9 @@ function bindEvents() {
       state.search = "";
       render();
     }
-    if (button.dataset.dashboardAction === "associated-assistants") {
-      state.screen = "assistants";
+    if (button.dataset.dashboardAction === "children") {
+      state.screen = "transportGroup";
+      state.transportGroupTab = "children";
       state.selectedChildId = "";
       state.editingChildId = "";
       state.selectedType = "";
@@ -11056,15 +17364,24 @@ function bindEvents() {
       state.search = "";
       render();
     }
-    if (button.dataset.dashboardAction === "associated-schools") {
-      state.screen = "schools";
-      state.selectedChildId = "";
-      state.editingChildId = "";
-      state.selectedType = "";
+	    if (button.dataset.dashboardAction === "transfer-delays") {
+	      state.screen = "delayCenter";
+	      state.selectedChildId = "";
+	      state.editingChildId = "";
+	      state.selectedType = "";
       state.selectedId = "";
       state.search = "";
-      render();
-    }
+	      render();
+	    }
+	    if (button.dataset.dashboardAction === "delay-center") {
+	      state.screen = "delayCenter";
+	      state.selectedChildId = "";
+	      state.editingChildId = "";
+	      state.selectedType = "";
+	      state.selectedId = "";
+	      state.search = "";
+	      render();
+	    }
     if (button.dataset.dashboardAction === "out-of-service-vehicles") {
       state.screen = "vehicles";
       state.outOfServiceVehicleId = activeOutOfServiceVehicles()[0]?.id || state.outOfServiceVehicleId || "";
@@ -11075,12 +17392,76 @@ function bindEvents() {
       state.search = "";
       render();
     }
+	  if (button.dataset.dashboardAction === "quick-delay-dialog") {
+	    state.screen = "delayCenter";
+	    state.quickTransferDelayOpen = true;
+	    render();
+	  }
+  if (["technical-errors", "failed-logins", "security-alerts", "support-email-audit"].includes(button.dataset.dashboardAction)) {
+      state.screen = button.dataset.dashboardAction;
+      state.selectedChildId = "";
+      state.selectedType = "";
+      state.selectedId = "";
+      state.editingChildId = "";
+      state.editingType = "";
+      state.editingId = "";
+      state.search = "";
+      render();
+    }
   }));
+	  document.querySelectorAll("[data-close-quick-delay]").forEach((element) => element.addEventListener("click", closeQuickTransferDelay));
+	  document.querySelectorAll(".modal-backdrop[data-close-quick-delay]").forEach((backdrop) => backdrop.addEventListener("click", closeQuickTransferDelay));
+	  document.querySelector("[data-open-delay-create]")?.addEventListener("click", () => {
+	    state.quickTransferDelayOpen = true;
+	    render();
+	  });
+	  document.querySelectorAll("[data-mark-delay-read]").forEach((button) => button.addEventListener("click", () => markDelayNotificationRead(button.dataset.markDelayRead)));
+	  document.querySelectorAll("[data-cancel-transfer-delay]").forEach((button) => button.addEventListener("click", () => cancelTransferDelay(button.dataset.cancelTransferDelay)));
+	  document.querySelectorAll("[data-delete-transfer-delay]").forEach((button) => button.addEventListener("click", () => deleteTransferDelay(button.dataset.deleteTransferDelay)));
+  document.getElementById("clear-failed-logins")?.addEventListener("click", clearFailedLoginLogs);
   document.querySelectorAll("#reset-filter-button, #show-all-data-button").forEach((button) => button.addEventListener("click", () => {
+    const previousFilter = state.activeFilter ? { ...state.activeFilter } : null;
     resetDashboardContext();
-    state.screen = "dashboard";
+    if (previousFilter?.type === "drivers") {
+      state.screen = "drivers";
+      state.selectedType = "drivers";
+      state.selectedId = previousFilter.id;
+    }
     render();
   }));
+}
+
+function closeQuickTransferDelay() {
+  if (state.quickTransferDelayOpen) {
+    state.quickTransferDelayOpen = false;
+    render();
+  }
+}
+
+function saveQuickTransferDelay(event) {
+  event.preventDefault();
+  if (!canCreateTransferDelay()) return alert("Vous ne pouvez pas signaler un retard.");
+  const form = event.currentTarget;
+  const transferId = form.elements.transferId?.value || "";
+  const manualCircuitId = String(form.elements.manualCircuitId?.value || "").trim();
+  const transfer = transferId ? transferById(transferId) : manualDelayTransfer(manualCircuitId);
+  if (!transfer || !canManageTransferDelay(transfer)) return alert("Vous ne pouvez pas signaler un retard sur ce transfert.");
+  if (saveDelayForTransfer(transfer, form)) closeQuickTransferDelay();
+}
+
+function markDelayNotificationRead(delayId) {
+  if (!state.user || !delayId) return;
+  const delay = (data.transferDelays || []).find((item) => item.id === delayId);
+  const notification = delayNotificationForId(delayId) || (delay ? createDelayNotification(delay) : null);
+  if (!notification) return;
+  notification.readBy = [...new Set([...(notification.readBy || []), state.user.id])];
+  data.notifications = data.notifications || [];
+  const index = data.notifications.findIndex((item) => item.id === notification.id);
+  if (index >= 0) data.notifications[index] = notification;
+  else data.notifications.unshift(notification);
+  saveData();
+  markFirestoreDocumentRead(["notifications", notification.id], notification, "update_data");
+  render();
 }
 
 function bindSupportAssistanceReadOnlyGuard() {
@@ -11096,7 +17477,9 @@ function bindSupportAssistanceReadOnlyGuard() {
     "[data-reset-code]",
     "[data-delete-user]",
     "[data-toggle-admin]",
+    "[data-toggle-support]",
     "[data-delete-admin]",
+    "[data-delete-manager-account]",
     "[data-print-access-card-type]",
     "[data-print-support-access-type]",
     "[data-support-status]",
@@ -11127,7 +17510,173 @@ function bindSupportAssistanceReadOnlyGuard() {
   });
 }
 
-function saveGeneric(event) {
+function saveChangedRecord(collectionName, before, record) {
+  if (!record?.id) return;
+  if (JSON.stringify(before) === JSON.stringify(record)) return;
+  recordHistoryChanges(collectionName, before, record);
+  saveCollectionItemToFirestore(collectionName, record);
+}
+
+function saveCircuitAssignment(event) {
+  event.preventDefault();
+  if (!isTransportManagerUser()) return alert("Modification réservée au transporteur.");
+  const form = event.currentTarget;
+  const circuit = scopeRecordsForCurrentTransportManager("circuits", data.circuits || []).find((item) => item.id === form.dataset.circuitId);
+  if (!circuit) return alert("Circuit introuvable.");
+  const previousVehicleId = circuit.vehicleId || "";
+  const previousDriverIds = driverIdsFromRecord(circuit);
+  const previousAssistantId = circuit.assistantId || "";
+  const schoolIds = new FormData(form).getAll("schoolIds").map((value) => String(value || "").trim()).filter(Boolean);
+  const selectedSchools = schoolIds.map((schoolId) => scopeRecordsForCurrentTransportManager("schools", data.schools || []).find((school) => school.id === schoolId)).filter(Boolean);
+  const driverIds = selectedIdsFromMultiSelect(form.elements.driverIds);
+  const vehicle = scopeRecordsForCurrentTransportManager("vehicles", data.vehicles || []).find((item) => item.id === form.elements.vehicleId?.value);
+  const assistant = scopeRecordsForCurrentTransportManager("assistants", data.assistants || []).find((item) => item.id === form.elements.assistantId?.value);
+  const now = new Date().toISOString();
+  const circuitRef = circuit.name || circuit.id || "";
+  const schoolNames = selectedSchools.map((school) => school.name).filter(Boolean);
+  const schoolName = schoolNames[0] || "";
+  const beforeCircuit = cloneHistorySnapshot(circuit);
+  circuit.schoolIds = schoolIds;
+  circuit.schoolNames = schoolNames;
+  circuit.schoolName = schoolName;
+  circuit.driverIds = driverIds;
+  circuit.driverId = driverIds[0] || "";
+  circuit.vehicleId = vehicle?.id || "";
+  circuit.assistantId = assistant?.id || "";
+  circuit.updatedAt = now;
+  circuit.updatedBy = state.user.id;
+  saveChangedRecord("circuits", beforeCircuit, circuit);
+
+  scopeRecordsForCurrentTransportManager("vehicles", data.vehicles || []).forEach((item) => {
+    const before = cloneHistorySnapshot(item);
+    const isSelected = vehicle?.id && item.id === vehicle.id;
+    const wasLinked = item.id === previousVehicleId || item.circuitId === circuitRef || item.circuitId === circuit.id;
+    if (isSelected) {
+      item.circuitId = circuitRef;
+      item.driverIds = [...driverIds];
+      item.driverId = driverIds[0] || "";
+      item.assistantId = assistant?.id || "";
+      item.schoolIds = schoolIds;
+      item.schoolName = schoolName;
+      item.schoolNames = schoolNames;
+    } else if (wasLinked) {
+      item.circuitId = "";
+      item.driverIds = [];
+      item.driverId = "";
+      item.assistantId = "";
+      item.schoolIds = [];
+      item.schoolNames = [];
+    } else {
+      return;
+    }
+    item.updatedAt = now;
+    item.updatedBy = state.user.id;
+    saveChangedRecord("vehicles", before, item);
+  });
+
+  scopeRecordsForCurrentTransportManager("drivers", data.drivers || []).forEach((driver) => {
+    const before = cloneHistorySnapshot(driver);
+    const selected = driverIds.includes(driver.id);
+    const wasLinked = previousDriverIds.includes(driver.id) || driver.schoolCircuit === circuitRef;
+    if (selected) {
+      driver.vehicleId = vehicle?.id || "";
+      driver.busNumber = vehicle?.busNumber || "";
+      driver.licensePlate = vehicle?.licensePlate || "";
+      driver.schoolCircuit = circuitRef;
+      driver.schoolName = schoolName;
+      driver.schoolNames = schoolNames;
+      driver.assignedCircuits = uniqueText([...(driver.assignedCircuits || []), circuitRef].filter(Boolean));
+    } else if (wasLinked) {
+      driver.assignedCircuits = (driver.assignedCircuits || []).filter((entry) => entry !== circuitRef && entry !== circuit.id);
+      if (driver.schoolCircuit === circuitRef || driver.schoolCircuit === circuit.id) driver.schoolCircuit = "";
+      if (!driver.schoolCircuit) {
+        driver.schoolName = "";
+        driver.schoolNames = [];
+      }
+      if (driver.vehicleId === previousVehicleId || driver.vehicleId === vehicle?.id) driver.vehicleId = "";
+      if (!driver.vehicleId) {
+        driver.busNumber = "";
+        driver.licensePlate = "";
+      }
+    } else {
+      return;
+    }
+    driver.updatedAt = now;
+    driver.updatedBy = state.user.id;
+    saveChangedRecord("drivers", before, driver);
+    syncAssignedUserFromTransportPerson("driver", driver, circuitRef, selected, vehicle?.id || "", schoolNames, now);
+  });
+
+  scopeRecordsForCurrentTransportManager("assistants", data.assistants || []).forEach((assistantRecord) => {
+    const before = cloneHistorySnapshot(assistantRecord);
+    const selected = assistant?.id && assistantRecord.id === assistant.id;
+    const wasLinked = assistantRecord.id === previousAssistantId || assistantRecord.schoolCircuit === circuitRef;
+    if (selected) {
+      assistantRecord.vehicleId = vehicle?.id || "";
+      assistantRecord.schoolCircuit = circuitRef;
+      assistantRecord.schoolName = schoolName;
+      assistantRecord.schoolNames = schoolNames;
+      assistantRecord.assignedCircuits = uniqueText([...(assistantRecord.assignedCircuits || []), circuitRef].filter(Boolean));
+    } else if (wasLinked) {
+      assistantRecord.assignedCircuits = (assistantRecord.assignedCircuits || []).filter((entry) => entry !== circuitRef && entry !== circuit.id);
+      if (assistantRecord.schoolCircuit === circuitRef || assistantRecord.schoolCircuit === circuit.id) assistantRecord.schoolCircuit = "";
+      if (!assistantRecord.schoolCircuit) {
+        assistantRecord.schoolName = "";
+        assistantRecord.schoolNames = [];
+      }
+      if (assistantRecord.vehicleId === previousVehicleId || assistantRecord.vehicleId === vehicle?.id) assistantRecord.vehicleId = "";
+    } else {
+      return;
+    }
+    assistantRecord.updatedAt = now;
+    assistantRecord.updatedBy = state.user.id;
+    saveChangedRecord("assistants", before, assistantRecord);
+    syncAssignedUserFromTransportPerson("assistant", assistantRecord, circuitRef, selected, vehicle?.id || "", schoolNames, now);
+  });
+
+  data.children.forEach((child) => {
+    const linked = child.circuitNumber === circuitRef ||
+      child.pickupCircuitId === circuit.id ||
+      child.pickupCircuitId === circuitRef ||
+      child.schoolCircuitId === circuit.id ||
+      child.schoolCircuitId === circuitRef;
+    if (!linked) return;
+    child.driverIds = [...driverIds];
+    child.driverId = driverIds[0] || "";
+    child.assistantId = assistant?.id || "";
+    child.vehicleId = vehicle?.id || "";
+    child.schoolName = schoolName || child.schoolName || "";
+    child.transferName = circuit.transferName || child.transferName || "";
+    child.updatedAt = now;
+    child.updatedBy = state.user.id;
+    saveChildToFirestore(child);
+  });
+
+  saveData();
+  alert("Affectation du circuit enregistrée.");
+  render();
+}
+
+function syncAssignedUserFromTransportPerson(role, person, circuitRef, selected, vehicleId, schoolNames, now) {
+  const user = (data.users || []).find((item) => item.id === person.id && item.role === role);
+  if (!user) return;
+  const before = cloneHistorySnapshot(user);
+  const names = Array.isArray(schoolNames) ? uniqueText(schoolNames) : assignedSchoolNamesFromRecord({ schoolName: schoolNames });
+  if (selected) {
+    user.assignedVehicleId = vehicleId || "";
+    user.assignedCircuits = uniqueText([...(user.assignedCircuits || []), circuitRef].filter(Boolean));
+    user.assignedSchools = uniqueText([...(user.assignedSchools || []), ...names]);
+    user.assignedSchool = names[0] || user.assignedSchool || "";
+  } else {
+    user.assignedCircuits = (user.assignedCircuits || []).filter((entry) => entry !== circuitRef);
+    if (user.assignedVehicleId === vehicleId) user.assignedVehicleId = "";
+  }
+  user.updatedAt = now;
+  user.updatedBy = state.user.id;
+  saveChangedRecord("users", before, user);
+}
+
+async function saveGeneric(event) {
   event.preventDefault();
   const form = event.currentTarget;
   const type = form.dataset.type;
@@ -11137,29 +17686,158 @@ function saveGeneric(event) {
   if (id === "new" && !canCreateGeneric(type)) return alert("Création non autorisée.");
   const before = cloneHistorySnapshot(current);
   const item = id === "new" ? blankFor(type) : { ...current };
+  applyTransportManagerScopeToRecord(type, item);
   fieldsFor(type).forEach(([key]) => {
     if (type === "drivers" && key === "replacementDriverName" && !isAdmin()) return;
     if (id !== "new" && isGenericFieldReadonly(type, key)) return;
     item[key] = form.elements[key]?.value || "";
   });
+  if (type === "drivers") {
+    const vehicle = vehicleByRef(form.elements.vehicleId?.value || "");
+    item.vehicleId = vehicle?.id || "";
+    if (vehicle) {
+      item.busNumber = vehicle.busNumber || item.busNumber || "";
+      item.licensePlate = vehicle.licensePlate || item.licensePlate || "";
+      item.schoolCircuit = vehicle.circuitId || item.schoolCircuit || "";
+      item.schoolName = vehicle.schoolName || item.schoolName || "";
+    }
+  }
+  if (type === "assistants") {
+    const vehicle = vehicleByRef(form.elements.vehicleId?.value || "");
+    item.vehicleId = vehicle?.id || "";
+    if (vehicle) item.schoolCircuit = vehicle.circuitId || item.schoolCircuit || "";
+  }
+  if (type === "vehicles") {
+    const assistant = assistantByRef(form.elements.assistantId?.value || "");
+    const circuit = circuitByRef(form.elements.circuitId?.value || "");
+    if (form.elements.driverIds) {
+      item.driverIds = selectedIdsFromMultiSelect(form.elements.driverIds);
+      item.driverId = item.driverIds[0] || "";
+    } else {
+      item.driverIds = driverIdsFromRecord(item);
+      item.driverId = item.driverId || item.driverIds[0] || "";
+    }
+    item.assistantId = assistant?.id || "";
+    item.circuitId = circuit?.name || circuit?.id || "";
+    item.schoolIds = circuit ? circuitSelectedSchoolIds(circuit) : item.schoolIds || [];
+    item.schoolName = circuit ? (circuit.schoolName || circuitSchoolNames(circuit)[0] || item.schoolName || "") : item.schoolName || "";
+  }
+  if (type === "schools") {
+    const selectedCircuitIds = selectedIdsFromMultiSelect(form.elements.linkedCircuitIds);
+    syncSchoolCircuitLinks(item, selectedCircuitIds);
+  }
+  if (type === "circuits") {
+    const schoolIds = new FormData(form).getAll("schoolIds").map((value) => String(value || "").trim()).filter(Boolean);
+    const selectedSchools = schoolIds.map((schoolId) => (data.schools || []).find((school) => school.id === schoolId)).filter(Boolean);
+    const vehicle = vehicleByRef(form.elements.vehicleId?.value || "");
+    const assistant = assistantByRef(form.elements.assistantId?.value || "");
+    item.schoolIds = schoolIds;
+    item.schoolNames = selectedSchools.map((school) => school.name).filter(Boolean);
+    item.schoolName = item.schoolNames[0] || "";
+    item.vehicleId = vehicle?.id || "";
+    if (form.elements.driverIds) {
+      item.driverIds = selectedIdsFromMultiSelect(form.elements.driverIds);
+      item.driverId = item.driverIds[0] || "";
+    } else {
+      item.driverIds = driverIdsFromRecord(item);
+      item.driverId = item.driverId || item.driverIds[0] || "";
+    }
+    item.assistantId = assistant?.id || "";
+    if (vehicle) {
+      item.driverIds = uniqueText([...item.driverIds, ...driverIdsFromRecord(vehicle)]);
+      item.driverId = item.driverId || item.driverIds[0] || vehicle.driverId || "";
+      item.assistantId = item.assistantId || vehicle.assistantId || "";
+    }
+  }
+  item.updatedAt = new Date().toISOString();
+  item.updatedBy = state.user.id;
   if (type === "circuits" && state.user?.role === "assistant") syncAssistantCircuitEdit(item);
   if (type === "circuits") syncCircuitRelationsEdit(item);
   if (type === "assistants" && state.user?.role === "assistant") syncAssistantProfileEdit(item);
-  item.updatedAt = new Date().toISOString();
-  item.updatedBy = state.user.id;
   const index = data[type].findIndex((entry) => entry.id === item.id);
   if (index >= 0) data[type][index] = item;
   else data[type].push(item);
-  if (type === "vehicles") syncVehicleCircuitEdit(item);
+  if (["vehicles", "drivers", "assistants"].includes(type)) syncVehicleRelationsFromRecord(type, item);
   recordHistoryChanges(type, before, item);
+  let accessInfo = null;
+  if (type === "drivers" && isTransportManagerUser() && form.elements.createSiteAccess?.checked === true) {
+    accessInfo = await createDriverSiteAccessFromDriver(item);
+  }
   saveData();
   saveCollectionItemToFirestore(type, item);
+  if (accessInfo?.user) saveCollectionItemToFirestore("users", accessInfo.user);
   state.editingType = "";
   state.editingId = "";
   if (state.activeFilter?.type === type) state.activeFilter = { type, id: item.id };
   state.selectedType = type;
   state.selectedId = item.id;
+  if (accessInfo) {
+    alert(`Fiche chauffeur enregistrée.\nAccès site créé.\nIdentifiant : ${accessInfo.identifier}\nCode temporaire : ${accessInfo.temporaryCode}`);
+  }
   render();
+}
+
+async function createDriverSiteAccessFromDriver(driver) {
+  if (!driver?.id) return null;
+  const existing = (data.users || []).find((user) => user.id === driver.id && user.role === "driver");
+  if (existing) return null;
+  const temporaryCode = generateUniqueAccessCode();
+  const identifierNumber = generateUniqueIdentifier("driver");
+  const now = new Date().toISOString();
+  const user = {
+    id: driver.id,
+    firstName: driver.firstName || "",
+    lastName: driver.lastName || "",
+    phone: driver.phone || "",
+    email: driver.email || "",
+    role: "driver",
+    identifier: identifierNumber,
+    identifierNumber,
+    username: identifierNumber,
+    ...generatedTemporaryAccessData(temporaryCode, now),
+    temporaryAccessHash: await hashSecret(temporaryCode),
+    accessCodeHash: "",
+    passwordHash: "",
+    firstLoginCompleted: false,
+    resetRequired: true,
+    assignedCircuits: driver.schoolCircuit ? [driver.schoolCircuit] : [],
+    assignedVehicleId: "",
+    assignedSchool: driver.schoolName || "",
+    transportManagerId: driver.transportManagerId || transportManagerIdForUser(state.user),
+    isActive: true,
+    createdBy: state.user.id,
+    createdAt: now,
+    updatedAt: now,
+    updatedBy: state.user.id
+  };
+  data.users.push(user);
+  return { user, identifier: identifierNumber, temporaryCode };
+}
+
+function syncSchoolCircuitLinks(school, selectedCircuitIds = []) {
+  if (!school?.id) return;
+  const selected = new Set(selectedCircuitIds || []);
+  scopeRecordsForCurrentTransportManager("circuits", data.circuits || []).forEach((circuit) => {
+    const before = cloneHistorySnapshot(circuit);
+    const currentIds = new Set(circuitSelectedSchoolIds(circuit));
+    const currentNames = new Set(circuitSchoolNames(circuit));
+    if (selected.has(circuit.id)) {
+      currentIds.add(school.id);
+      if (school.name) currentNames.add(school.name);
+    } else {
+      currentIds.delete(school.id);
+      if (school.name) currentNames.delete(school.name);
+    }
+    circuit.schoolIds = [...currentIds];
+    circuit.schoolNames = [...currentNames];
+    circuit.schoolName = circuit.schoolNames[0] || "";
+    circuit.updatedAt = new Date().toISOString();
+    circuit.updatedBy = state.user?.id || "";
+    if (JSON.stringify(before) !== JSON.stringify(circuit)) {
+      recordHistoryChanges("circuits", before, circuit);
+      saveCollectionItemToFirestore("circuits", circuit);
+    }
+  });
 }
 
 function syncAssistantCircuitEdit(circuit) {
@@ -11183,28 +17861,76 @@ function syncAssistantCircuitEdit(circuit) {
 }
 
 function syncCircuitRelationsEdit(circuit) {
-  const driver = driverByRef(circuit.driverId);
-  if (driver) circuit.driverId = driver.id;
-  const vehicle = data.vehicles.find((item) => item.id === circuit.vehicleId || item.circuitId === circuit.name);
+  const vehicle = vehicleByRef(circuit.vehicleId) || data.vehicles.find((item) => item.id === circuit.vehicleId || item.circuitId === circuit.name);
+  if (vehicle) circuit.vehicleId = vehicle.id;
+  circuit.driverIds = uniqueText([...driverIdsFromRecord(circuit), ...(vehicle ? driverIdsFromRecord(vehicle) : [])]);
+  circuit.driverId = circuit.driverId || circuit.driverIds[0] || "";
+  const drivers = circuit.driverIds.map(driverByRef).filter(Boolean);
+  const assistant = assistantByRef(circuit.assistantId);
+  if (assistant) circuit.assistantId = assistant.id;
+  else if (vehicle?.assistantId) circuit.assistantId = vehicle.assistantId;
   if (vehicle) {
     vehicle.circuitId = circuit.name || vehicle.circuitId || "";
-    vehicle.driverId = circuit.driverId || vehicle.driverId || "";
+    vehicle.driverIds = uniqueText([...driverIdsFromRecord(vehicle), ...circuit.driverIds]);
+    vehicle.driverId = vehicle.driverId || vehicle.driverIds[0] || "";
     vehicle.assistantId = circuit.assistantId || vehicle.assistantId || "";
+    vehicle.schoolIds = circuitSelectedSchoolIds(circuit);
     vehicle.schoolName = circuit.schoolName || vehicle.schoolName || "";
     vehicle.updatedAt = new Date().toISOString();
     vehicle.updatedBy = state.user.id;
     saveCollectionItemToFirestore("vehicles", vehicle);
   }
+  drivers.forEach((driver) => {
+    driver.schoolCircuit = circuit.name || driver.schoolCircuit || "";
+    driver.schoolName = circuit.schoolName || driver.schoolName || "";
+    driver.assignedCircuits = uniqueText([...(driver.assignedCircuits || []), circuit.name]);
+    driver.updatedAt = new Date().toISOString();
+    driver.updatedBy = state.user.id;
+    const driverUser = (data.users || []).find((user) => user.id === driver.id && user.role === "driver");
+    if (driverUser) {
+      driverUser.assignedCircuits = uniqueText([...(driverUser.assignedCircuits || []), circuit.name]);
+      driverUser.assignedSchool = circuit.schoolName || driverUser.assignedSchool || "";
+      driverUser.updatedAt = driver.updatedAt;
+      driverUser.updatedBy = state.user.id;
+      saveCollectionItemToFirestore("users", driverUser);
+    }
+    saveCollectionItemToFirestore("drivers", driver);
+  });
+  if (assistant) {
+    assistant.schoolCircuit = circuit.name || assistant.schoolCircuit || "";
+    assistant.schoolName = circuit.schoolName || assistant.schoolName || "";
+    assistant.assignedCircuits = uniqueText([...(assistant.assignedCircuits || []), circuit.name]);
+    assistant.updatedAt = new Date().toISOString();
+    assistant.updatedBy = state.user.id;
+    const assistantUser = (data.users || []).find((user) => user.id === assistant.id && user.role === "assistant");
+    if (assistantUser) {
+      assistantUser.assignedCircuits = uniqueText([...(assistantUser.assignedCircuits || []), circuit.name]);
+      assistantUser.assignedSchool = circuit.schoolName || assistantUser.assignedSchool || "";
+      assistantUser.updatedAt = assistant.updatedAt;
+      assistantUser.updatedBy = state.user.id;
+      saveCollectionItemToFirestore("users", assistantUser);
+    }
+    saveCollectionItemToFirestore("assistants", assistant);
+  }
+  const linkedToCircuit = (child) =>
+    child.circuitNumber === circuit.name ||
+    child.pickupCircuitId === circuit.id ||
+    child.pickupCircuitId === circuit.name ||
+    child.schoolCircuitId === circuit.id ||
+    child.schoolCircuitId === circuit.name;
   data.children.forEach((child) => {
-    if (child.circuitNumber !== circuit.name) return;
-    child.driverId = circuit.driverId || child.driverId || "";
-    child.assistantId = circuit.assistantId || child.assistantId || "";
+    if (!linkedToCircuit(child)) return;
+    child.driverIds = [...circuit.driverIds];
+    child.driverId = child.driverIds[0] || "";
+    child.assistantId = circuit.assistantId || "";
     child.vehicleId = circuit.vehicleId || vehicle?.id || child.vehicleId || "";
     child.schoolName = circuit.schoolName || child.schoolName || "";
+    child.transferName = circuit.transferName || "";
     child.updatedAt = new Date().toISOString();
     child.updatedBy = state.user.id;
     saveChildToFirestore(child);
   });
+  if (vehicle) syncVehicleRelationsFromRecord("vehicles", vehicle);
 }
 
 function syncAssistantProfileEdit(assistant) {
@@ -11226,7 +17952,93 @@ function syncAssistantProfileEdit(assistant) {
   }
 }
 
+function syncVehicleRelationsFromRecord(type, record) {
+  const vehicle = type === "vehicles" ? record : vehicleByRef(record.vehicleId);
+  if (!vehicle) return;
+  const now = record.updatedAt || new Date().toISOString();
+  if (type === "drivers") {
+    vehicle.driverIds = uniqueText([...driverIdsFromRecord(vehicle), record.id]);
+    vehicle.driverId = vehicle.driverId || record.id;
+  }
+  if (type === "assistants") vehicle.assistantId = record.id;
+  const circuit = circuitByRef(vehicle.circuitId) || data.circuits.find((item) => item.vehicleId === vehicle.id);
+  if (circuit) {
+    vehicle.circuitId = circuit.name || circuit.id || vehicle.circuitId || "";
+    vehicle.schoolIds = circuitSelectedSchoolIds(circuit);
+    vehicle.schoolName = circuit.schoolName || circuitSchoolNames(circuit)[0] || vehicle.schoolName || "";
+    circuit.vehicleId = vehicle.id;
+    circuit.driverIds = uniqueText([...driverIdsFromRecord(circuit), ...driverIdsFromRecord(vehicle)]);
+    circuit.driverId = circuit.driverId || circuit.driverIds[0] || "";
+    if (vehicle.assistantId) circuit.assistantId = vehicle.assistantId;
+    circuit.updatedAt = now;
+    circuit.updatedBy = state.user.id;
+    saveCollectionItemToFirestore("circuits", circuit);
+  }
+  driverIdsFromRecord(vehicle).map(driverByRef).filter(Boolean).forEach((driver) => {
+    driver.vehicleId = vehicle.id;
+    driver.busNumber = vehicle.busNumber || driver.busNumber || "";
+    driver.licensePlate = vehicle.licensePlate || driver.licensePlate || "";
+    driver.schoolCircuit = vehicle.circuitId || driver.schoolCircuit || "";
+    driver.schoolName = vehicle.schoolName || driver.schoolName || "";
+    driver.updatedAt = now;
+    driver.updatedBy = state.user.id;
+    saveCollectionItemToFirestore("drivers", driver);
+    const user = data.users.find((item) => item.id === driver.id && item.role === "driver");
+    if (user) {
+      user.assignedVehicleId = vehicle.id;
+      user.assignedCircuits = uniqueText([...(user.assignedCircuits || []), vehicle.circuitId].filter(Boolean));
+      user.assignedSchool = vehicle.schoolName || user.assignedSchool || "";
+      user.updatedAt = now;
+      user.updatedBy = state.user.id;
+      saveCollectionItemToFirestore("users", user);
+    }
+  });
+  const assistant = assistantByRef(vehicle.assistantId);
+  if (assistant) {
+    assistant.vehicleId = vehicle.id;
+    assistant.schoolCircuit = vehicle.circuitId || assistant.schoolCircuit || "";
+    assistant.schoolName = vehicle.schoolName || assistant.schoolName || "";
+    assistant.updatedAt = now;
+    assistant.updatedBy = state.user.id;
+    saveCollectionItemToFirestore("assistants", assistant);
+    const user = data.users.find((item) => item.id === assistant.id && item.role === "assistant");
+    if (user) {
+      user.assignedVehicleId = vehicle.id;
+      user.assignedCircuits = uniqueText([...(user.assignedCircuits || []), vehicle.circuitId].filter(Boolean));
+      user.assignedSchool = vehicle.schoolName || user.assignedSchool || "";
+      user.updatedAt = now;
+      user.updatedBy = state.user.id;
+      saveCollectionItemToFirestore("users", user);
+    }
+  }
+  data.children.forEach((child) => {
+    const linked = child.vehicleId === vehicle.id ||
+      child.circuitNumber === vehicle.circuitId ||
+      child.pickupCircuitId === circuit?.id ||
+      child.pickupCircuitId === circuit?.name ||
+      child.schoolCircuitId === circuit?.id ||
+      child.schoolCircuitId === circuit?.name;
+    if (!linked) return;
+    child.vehicleId = vehicle.id;
+    child.driverIds = uniqueText([...driverIdsFromRecord(child), ...driverIdsFromRecord(vehicle)]);
+    child.driverId = child.driverId || child.driverIds[0] || "";
+    child.assistantId = vehicle.assistantId || child.assistantId || "";
+    if (circuit) {
+      child.pickupCircuitId = child.pickupCircuitId || circuit.id || circuit.name || "";
+      child.schoolCircuitId = child.schoolCircuitId || child.pickupCircuitId;
+      child.schoolName = circuit.schoolName || child.schoolName || "";
+    }
+    child.updatedAt = now;
+    child.updatedBy = state.user.id;
+    saveChildToFirestore(child);
+  });
+  vehicle.updatedAt = now;
+  vehicle.updatedBy = state.user.id;
+  saveCollectionItemToFirestore("vehicles", vehicle);
+}
+
 function syncVehicleCircuitEdit(vehicle) {
+  syncVehicleRelationsFromRecord("vehicles", vehicle);
   const requestedCircuit = String(vehicle.circuitId || "").trim();
   data.circuits.forEach((circuit) => {
     const isRequested = requestedCircuit && (circuit.name === requestedCircuit || circuit.id === requestedCircuit);
@@ -11243,7 +18055,8 @@ function syncVehicleCircuitEdit(vehicle) {
     return;
   }
   vehicle.circuitId = circuit.name || requestedCircuit;
-  vehicle.driverId = vehicle.driverId || circuit.driverId || "";
+  vehicle.driverIds = uniqueText([...driverIdsFromRecord(vehicle), ...driverIdsFromRecord(circuit)]);
+  vehicle.driverId = vehicle.driverId || vehicle.driverIds[0] || "";
   vehicle.assistantId = vehicle.assistantId || circuit.assistantId || "";
   vehicle.schoolName = vehicle.schoolName || circuit.schoolName || "";
   circuit.vehicleId = vehicle.id;
@@ -11267,6 +18080,7 @@ function saveRoleAnnouncement(event) {
     targetRole,
     recipientType: "role_group",
     recipientIds: [targetRole],
+    transportManagerId: transportManagerIdForUser(state.user),
     createdBy: state.user.id,
     createdByName: fullName(state.user),
     createdAt: now,
@@ -11300,9 +18114,33 @@ function deleteRoleAnnouncement(id) {
 
 function validateCode(newCode, confirmCode) {
   if (!newCode) return "Code vide interdit.";
-  if (!/^\d{4,}$/.test(newCode)) return "Le code doit contenir au minimum 4 chiffres.";
+  if (!/^\d{4}$/.test(newCode)) return "Le code doit contenir exactement 4 chiffres.";
   if (newCode !== confirmCode) return "La confirmation est differente.";
   return "";
+}
+
+async function accessCodeAlreadyUsed(code, currentAccount = null) {
+  const normalized = String(code || "").trim();
+  if (!normalized) return false;
+  const hashed = await hashSecret(normalized);
+  const fallback = legacyFallbackHash(normalized);
+  const currentIsParent = currentAccount?.role === "parent";
+  const currentLinkedChildren = new Set(currentAccount?.linkedChildrenIds || []);
+  const peopleToCheck = currentIsParent
+    ? (data.parents || []).filter((parent) =>
+      (parent.linkedChildrenIds || []).some((childId) => currentLinkedChildren.has(childId))
+    )
+    : [...(data.users || []), ...(data.parents || [])];
+  return peopleToCheck.some((person) => {
+    if (currentAccount && person.id === currentAccount.id && person.role === currentAccount.role) return false;
+    return [
+      person.accessCode,
+      person.temporaryAccessCode,
+      person.accessCodeHash,
+      person.passwordHash,
+      person.temporaryAccessHash
+    ].some((value) => value && [normalized, hashed, fallback].includes(String(value)));
+  });
 }
 
 async function saveOwnAccessCode(event) {
@@ -11346,6 +18184,7 @@ function baseRequestRecord(idPrefix, status = "pending") {
     createdBy: state.user.id,
     createdByName: fullName(state.user),
     role: state.user.role,
+    transportManagerId: transportManagerIdForUser(state.user),
     status,
     readBy: []
   };
@@ -11486,7 +18325,7 @@ function openRequestPrintPreview(collection, id) {
 
 function saveAssistantCircuitSettings(event) {
   event.preventDefault();
-  if (state.user?.role !== "assistant") return alert("Modification non autorisée.");
+  if (!isSpwAccount() && !isTransportManagerUser()) return alert("Modification non autorisée.");
   const form = event.currentTarget;
   const assignedCircuits = form.elements.assignedCircuits.value.split(",").map((value) => value.trim()).filter(Boolean);
   if (!assignedCircuits.length) return alert("Indiquez au moins un circuit.");
@@ -11557,22 +18396,72 @@ function saveThemePreference(value) {
 
 function saveServiceStatus(event) {
   event.preventDefault();
-  if (!isAdmin()) return alert("Modification réservée au gestionnaire de transport.");
+  if (!isPrimaryAdmin() && !isSupport()) return alert("Modification réservée au support ou à l’administrateur système.");
   const form = event.currentTarget;
   const status = form.elements.status.value;
   const meta = serviceStatusMeta(status);
+  const autoMode = form.elements.autoMode?.checked !== false;
   data.serviceStatus = {
+    ...seed.serviceStatus,
+    ...(data.serviceStatus || {}),
     id: "current",
     status,
     message: form.elements.message.value.trim() || meta.short,
-    autoMode: false,
+    autoMode,
     lastCheckedAt: data.serviceStatus?.lastCheckedAt || "",
     updatedAt: new Date().toISOString(),
     updatedBy: state.user?.id || ""
   };
   saveData();
   saveServiceStatusToFirestore(data.serviceStatus);
-  alert("État des services mis à jour.");
+  if (autoMode) runServiceHealthCheck({ silent: true }).catch((error) => console.warn("Vérification automatique indisponible.", error));
+  alert(autoMode ? "Vérification automatique réactivée." : "État des services mis à jour en mode manuel.");
+  render();
+}
+
+function saveMaintenanceSchedule(event) {
+  event.preventDefault();
+  if (!isPrimaryAdmin() && !isSupport()) return alert("Modification réservée au support ou à l’administrateur système.");
+  const form = event.currentTarget;
+  const maintenanceEnabled = form.elements.maintenanceEnabled?.checked === true;
+  const maintenanceStartAt = dateTimeLocalToIso(form.elements.maintenanceStartAt?.value || "");
+  const maintenanceEndAt = dateTimeLocalToIso(form.elements.maintenanceEndAt?.value || "");
+  if (maintenanceEnabled) {
+    if (!maintenanceStartAt || !maintenanceEndAt) return alert("Indiquez une date/heure de début et de fin pour la maintenance.");
+    if (new Date(maintenanceEndAt).getTime() <= new Date(maintenanceStartAt).getTime()) return alert("La fin de maintenance doit être après le début.");
+  }
+  data.serviceStatus = {
+    ...seed.serviceStatus,
+    ...(data.serviceStatus || {}),
+    id: "current",
+    maintenanceEnabled,
+    maintenanceTitle: form.elements.maintenanceTitle?.value.trim() || "Maintenance planifiée",
+    maintenanceMessage: form.elements.maintenanceMessage?.value.trim() || "Une mise à jour est planifiée. L’application sera temporairement indisponible pendant cette période.",
+    maintenanceStartAt,
+    maintenanceEndAt,
+    autoMode: false,
+    updatedAt: new Date().toISOString(),
+    updatedBy: state.user?.id || ""
+  };
+  saveData();
+  saveServiceStatusToFirestore(data.serviceStatus);
+  alert(maintenanceEnabled ? "Maintenance planifiée." : "Maintenance désactivée.");
+  render();
+}
+
+function disableMaintenanceSchedule() {
+  if (!isPrimaryAdmin() && !isSupport()) return alert("Modification réservée au support ou à l’administrateur système.");
+  data.serviceStatus = {
+    ...seed.serviceStatus,
+    ...(data.serviceStatus || {}),
+    id: "current",
+    maintenanceEnabled: false,
+    updatedAt: new Date().toISOString(),
+    updatedBy: state.user?.id || ""
+  };
+  saveData();
+  saveServiceStatusToFirestore(data.serviceStatus);
+  alert("Maintenance désactivée.");
   render();
 }
 
@@ -11598,7 +18487,7 @@ function saveParentContactSettings(event) {
 
 function saveAccessPerson(event) {
   event.preventDefault();
-  if (!isAdmin() || isPrimaryAdmin()) return;
+  if (!isAdmin()) return;
   const form = event.currentTarget;
   const type = form.dataset.accessType;
   const id = form.dataset.accessId;
@@ -11607,6 +18496,7 @@ function saveAccessPerson(event) {
     : data.users.find((item) => item.id === id);
   if (!person) return alert("Personne introuvable.");
   if (type !== "parents" && !canManageUserAccess(person)) return alert("Action non autorisée pour ce compte.");
+  const wasSpw = type !== "parents" && isSpwLikeAccount(person);
   const linkedBefore = type !== "parents" ? cloneHistorySnapshot(linkedAccessRecord(person)) : null;
   const identifierNumber = form.elements.identifierNumber?.value.trim() || defaultIdentifierForUser(person);
   if (type !== "parents") {
@@ -11629,19 +18519,28 @@ function saveAccessPerson(event) {
     if (person.id === "admin" && !form.elements.isActive.checked) {
       return alert("Le gestionnaire de transport principal doit rester actif.");
     }
+    if (isPrimaryTransportManagerProfile(person) && !form.elements.isActive.checked) {
+      return alert("Le profil principal Keolis Satracom doit rester actif.");
+    }
     if (!form.elements.isActive.checked && activeAdminCount() <= 1 && person.isActive !== false) {
       return alert("Impossible de désactiver le seul gestionnaire de transport actif.");
     }
-    person.companyName = form.elements.companyName?.value.trim() || "";
+    if (!wasSpw) {
+      person.companyName = form.elements.companyName?.value.trim() || "";
+    }
     delete person.accessLastName;
     delete person.accessFirstName;
     person.assignedCircuits = [];
     person.assignedVehicleId = "";
     person.assignedSchool = "";
     person.isActive = form.elements.isActive.checked;
-    person.visualTheme = form.elements.visualThemeSpw?.checked ? "spw" : "";
+    person.visualTheme = wasSpw ? "spw" : (form.elements.visualThemeSpw?.checked ? "spw" : "");
     person.createdBy = form.elements.createdBy?.value.trim() || person.createdBy || "";
     person.createdAt = form.elements.createdAt?.value || person.createdAt || new Date().toISOString();
+  }
+  if (person.role === "support" && form.elements.isActive) {
+    person.isActive = form.elements.isActive.checked;
+    person.supportPermissions = { ...defaultSupportPermissions(), ...(person.supportPermissions || {}) };
   }
   person.updatedAt = new Date().toISOString();
   person.updatedBy = state.user.id;
@@ -11660,6 +18559,9 @@ function saveAccessPerson(event) {
   } else {
     syncUserLinkedRecord(person, form);
     saveCollectionItemToFirestore("users", person);
+    if (isSpwLikeAccount(person)) person.visualTheme = "spw";
+    if (isTransportManagerUser(person) && (person.transportManagerId || person.id) === person.id) saveCollectionItemToFirestore("transportManagers", transportManagerRecordFromUser(person));
+    if (person.role === "support") saveSupportPermissionsForUser(person);
     const linked = linkedAccessRecord(person);
     if (linked) {
       const linkedType = person.role === "driver" ? "drivers" : "assistants";
@@ -11679,32 +18581,36 @@ function saveAccessPerson(event) {
 }
 
 function syncUserLinkedRecord(user, form) {
+  if (["driver", "assistant"].includes(user.role) || isSpwAccount(user) || isTransportManagerUser(user)) {
+    user.transportManagerId = user.transportManagerId || (isTransportManagerUser(user) ? user.id : transportManagerIdForUser(state.user));
+  }
   if (user.role === "driver") {
     user.assignedVehicleId = form.elements.assignedVehicleId?.value.trim() || "";
-    user.assignedCircuits = form.elements.assignedCircuits.value.split(",").map((value) => value.trim()).filter(Boolean);
-    user.assignedSchool = form.elements.assignedSchool.value.trim();
-    user.hasSncbReplacementAccess = form.elements.hasSncbReplacementAccess?.checked === true;
+    user.assignedCircuits = form.elements.assignedCircuits?.value.split(",").map((value) => value.trim()).filter(Boolean) || user.assignedCircuits || [];
+    user.assignedSchool = form.elements.assignedSchool?.value.trim() || user.assignedSchool || "";
     let driver = data.drivers.find((item) => item.id === user.id);
     if (!driver) {
-      driver = { id: user.id, firstName: "", lastName: "", phone: "", busNumber: "", licensePlate: "", schoolCircuit: "", schoolName: "" };
+      driver = { id: user.id, transportManagerId: user.transportManagerId, firstName: "", lastName: "", phone: "", busNumber: "", licensePlate: "", schoolCircuit: "", schoolName: "" };
       data.drivers.push(driver);
     }
+    driver.transportManagerId = driver.transportManagerId || user.transportManagerId;
     driver.firstName = user.firstName;
     driver.lastName = user.lastName;
     driver.phone = user.phone;
-    driver.hasSncbReplacementAccess = user.hasSncbReplacementAccess;
     driver.schoolCircuit = user.assignedCircuits[0] || driver.schoolCircuit || "";
     driver.schoolName = user.assignedSchool || driver.schoolName || "";
     if (user.assignedVehicleId) {
       const vehicle = data.vehicles.find((item) => item.id === user.assignedVehicleId);
       if (vehicle) {
-        vehicle.driverId = user.id;
+        vehicle.driverIds = uniqueText([...driverIdsFromRecord(vehicle), user.id]);
+        vehicle.driverId = vehicle.driverId || user.id;
         saveCollectionItemToFirestore("vehicles", vehicle);
       }
     }
     data.circuits.forEach((circuit) => {
       if (user.assignedCircuits.includes(circuit.name) || user.assignedCircuits.includes(circuit.id)) {
-        circuit.driverId = user.id;
+        circuit.driverIds = uniqueText([...driverIdsFromRecord(circuit), user.id]);
+        circuit.driverId = circuit.driverId || user.id;
         if (user.assignedVehicleId) circuit.vehicleId = user.assignedVehicleId;
         if (user.assignedSchool) circuit.schoolName = user.assignedSchool;
         saveCollectionItemToFirestore("circuits", circuit);
@@ -11712,15 +18618,16 @@ function syncUserLinkedRecord(user, form) {
     });
   }
   if (user.role === "assistant") {
-    user.assignedCircuits = form.elements.assignedCircuits.value.split(",").map((value) => value.trim()).filter(Boolean);
-    user.assignedSchool = form.elements.assignedSchool.value.trim();
+    user.assignedCircuits = form.elements.assignedCircuits?.value.split(",").map((value) => value.trim()).filter(Boolean) || user.assignedCircuits || [];
+    user.assignedSchool = form.elements.assignedSchool?.value.trim() || user.assignedSchool || "";
     const rawDriverRef = form.elements.driverId?.value.trim() || "";
     const driverId = driverByRef(rawDriverRef)?.id || rawDriverRef;
     let assistant = data.assistants.find((item) => item.id === user.id);
     if (!assistant) {
-      assistant = { id: user.id, firstName: "", lastName: "", phone: "", schoolCircuit: "" };
+      assistant = { id: user.id, transportManagerId: user.transportManagerId, firstName: "", lastName: "", phone: "", schoolCircuit: "" };
       data.assistants.push(assistant);
     }
+    assistant.transportManagerId = assistant.transportManagerId || user.transportManagerId;
     assistant.firstName = user.firstName;
     assistant.lastName = user.lastName;
     assistant.phone = user.phone;
@@ -11728,7 +18635,7 @@ function syncUserLinkedRecord(user, form) {
     assistant.schoolName = user.assignedSchool || assistant.schoolName || "";
     assistant.driverId = driverId;
     data.vehicles.forEach((vehicle) => {
-      if (vehicle.driverId === driverId || user.assignedCircuits.includes(vehicle.circuitId)) {
+      if (driverIdsFromRecord(vehicle).includes(driverId) || user.assignedCircuits.includes(vehicle.circuitId)) {
         vehicle.assistantId = user.id;
         saveCollectionItemToFirestore("vehicles", vehicle);
       }
@@ -11736,7 +18643,10 @@ function syncUserLinkedRecord(user, form) {
     data.circuits.forEach((circuit) => {
       if (user.assignedCircuits.includes(circuit.name) || user.assignedCircuits.includes(circuit.id)) {
         circuit.assistantId = user.id;
-        if (driverId) circuit.driverId = driverId;
+        if (driverId) {
+          circuit.driverIds = uniqueText([...driverIdsFromRecord(circuit), driverId]);
+          circuit.driverId = circuit.driverId || driverId;
+        }
         if (user.assignedSchool) circuit.schoolName = user.assignedSchool;
         saveCollectionItemToFirestore("circuits", circuit);
       }
@@ -11746,18 +18656,23 @@ function syncUserLinkedRecord(user, form) {
 
 async function createAdminFromForm(event) {
   event.preventDefault();
-  if (!isAdmin() || isPrimaryAdmin()) return;
+  if (!isPrimaryAdmin() && !isTransportManagerUser()) return;
   const form = event.currentTarget;
   const temporaryCode = generateUniqueAccessCode();
-  const visualTheme = form.elements.visualThemeSpw.checked ? "spw" : "";
+  const visualTheme = "";
   const identifierNumber = generateUniqueIdentifier("admin", { visualTheme });
   const now = new Date().toISOString();
+  const parentManagerId = transportManagerIdForUser(state.user);
+  const createsNewTransportOrganization = isPrimaryAdmin();
+  const id = createsNewTransportOrganization ? `transport-manager-${Date.now()}` : `transport-manager-user-${Date.now()}`;
+  const transportManagerId = createsNewTransportOrganization ? id : parentManagerId;
   const admin = {
-    id: `admin-${Date.now()}`,
+    id,
     role: "admin",
+    transportManagerId,
     username: identifierNumber,
     identifier: identifierNumber,
-    companyName: form.elements.companyName.value.trim(),
+    companyName: form.elements.companyName?.value.trim() || state.user?.companyName || "",
     identifierNumber,
     firstName: form.elements.firstName.value.trim(),
     lastName: form.elements.lastName.value.trim(),
@@ -11778,11 +18693,111 @@ async function createAdminFromForm(event) {
     isActive: form.elements.isActive.checked,
     createdBy: state.user.id,
     createdAt: now,
-    updatedAt: now
+    updatedAt: now,
+    updatedBy: state.user.id
   };
   data.users.push(admin);
+  if (createsNewTransportOrganization) {
+    const managerRecord = transportManagerRecordFromUser(admin, now);
+    data.transportManagers = data.transportManagers || [];
+    data.transportManagers.push(managerRecord);
+    saveCollectionItemToFirestore("transportManagers", managerRecord);
+  }
   saveData();
   saveCollectionItemToFirestore("users", admin);
+  alert(`Gestionnaire de transport créé.\nIdentifiant : ${identifierNumber}\nCode temporaire : ${temporaryCode}`);
+  render();
+}
+
+async function createSpwFromForm(event) {
+  event.preventDefault();
+  if (!isPrimaryAdmin()) return;
+  const form = event.currentTarget;
+  const temporaryCode = generateUniqueAccessCode();
+  const identifierNumber = generateUniqueIdentifier("admin", { visualTheme: "spw" });
+  const now = new Date().toISOString();
+  const spw = {
+    id: `spw-${Date.now()}`,
+    role: "admin",
+    username: identifierNumber,
+    identifier: identifierNumber,
+    identifierNumber,
+    firstName: form.elements.firstName.value.trim(),
+    lastName: form.elements.lastName.value.trim(),
+    phone: form.elements.phone.value.trim(),
+    email: form.elements.email.value.trim(),
+    ...generatedTemporaryAccessData(temporaryCode, now),
+    temporaryAccessHash: await hashSecret(temporaryCode),
+    accessCodeHash: "",
+    passwordHash: "",
+    recoveryCodeHash: "",
+    recoveryAnswerHash: "",
+    firstLoginCompleted: false,
+    resetRequired: true,
+    assignedCircuits: [],
+    assignedVehicleId: "",
+    assignedSchool: "",
+    visualTheme: "spw",
+    transportManagerId: transportManagerIdForUser(state.user),
+    isActive: form.elements.isActive.checked,
+    createdBy: state.user.id,
+    createdAt: now,
+    updatedAt: now,
+    updatedBy: state.user.id
+  };
+  data.users.push(spw);
+  saveData();
+  saveCollectionItemToFirestore("users", spw);
+  alert(`Utilisateur SPW créé.\nIdentifiant : ${identifierNumber}\nCode temporaire : ${temporaryCode}`);
+  render();
+}
+
+async function createInitialTransportManagerFromForm(event) {
+  event.preventDefault();
+  if (!isPrimaryAdmin()) return;
+  const form = event.currentTarget;
+  const temporaryCode = generateUniqueAccessCode();
+  const identifierNumber = generateUniqueIdentifier("admin", { visualTheme: "" });
+  const now = new Date().toISOString();
+  const id = `transport-manager-${Date.now()}`;
+  const manager = {
+    id,
+    role: "admin",
+    transportManagerId: id,
+    username: identifierNumber,
+    identifier: identifierNumber,
+    companyName: form.elements.companyName.value.trim(),
+    identifierNumber,
+    firstName: form.elements.firstName.value.trim(),
+    lastName: form.elements.lastName.value.trim(),
+    phone: form.elements.phone.value.trim(),
+    email: form.elements.email.value.trim(),
+    ...generatedTemporaryAccessData(temporaryCode, now),
+    temporaryAccessHash: await hashSecret(temporaryCode),
+    accessCodeHash: "",
+    passwordHash: "",
+    recoveryCodeHash: "",
+    recoveryAnswerHash: "",
+    firstLoginCompleted: false,
+    resetRequired: true,
+    assignedCircuits: [],
+    assignedVehicleId: "",
+    assignedSchool: "",
+    visualTheme: "",
+    isPrimaryTransportManager: true,
+    isActive: form.elements.isActive.checked,
+    createdBy: state.user.id,
+    createdAt: now,
+    updatedAt: now,
+    updatedBy: state.user.id
+  };
+  const managerRecord = transportManagerRecordFromUser(manager, now);
+  data.users.push(manager);
+  data.transportManagers = data.transportManagers || [];
+  data.transportManagers.push(managerRecord);
+  saveData();
+  saveCollectionItemToFirestore("users", manager);
+  saveCollectionItemToFirestore("transportManagers", managerRecord);
   alert(`Gestionnaire de transport créé.\nIdentifiant : ${identifierNumber}\nCode temporaire : ${temporaryCode}`);
   render();
 }
@@ -11791,10 +18806,23 @@ function activeAdminCount() {
   return data.users.filter((user) => user.role === "admin" && user.isActive !== false).length;
 }
 
+function confirmSystemAdminCode(actionLabel = "valider cette action") {
+  if (!isPrimaryAdmin()) return false;
+  const code = prompt(`Code administrateur système requis pour ${actionLabel} :`);
+  if (code === null) return false;
+  if (String(code).trim() !== "1901") {
+    alert("Code administrateur système incorrect. Action annulée.");
+    return false;
+  }
+  return true;
+}
+
 function toggleAdminAccess(event) {
-  if (!isAdmin() || isPrimaryAdmin()) return;
+  if (!isPrimaryAdmin() && !isTransportManagerUser()) return;
   const admin = data.users.find((user) => user.id === event.currentTarget.dataset.toggleAdmin && user.role === "admin");
   if (!admin) return alert("Gestionnaire de transport introuvable.");
+  if (!canManageUserAccess(admin)) return alert("Action non autorisée pour ce compte.");
+  if (!canToggleAdminAccess(admin)) return alert("Le profil principal Keolis Satracom doit rester actif.");
   const nextActive = admin.isActive === false;
   if (admin.id === "admin" && !nextActive) return alert("Le gestionnaire de transport principal doit rester actif.");
   if (!nextActive && activeAdminCount() <= 1) return alert("Impossible de désactiver le seul gestionnaire de transport actif.");
@@ -11803,20 +18831,59 @@ function toggleAdminAccess(event) {
   admin.updatedBy = state.user.id;
   saveData();
   saveCollectionItemToFirestore("users", admin);
+  if ((admin.transportManagerId || admin.id) === admin.id) saveCollectionItemToFirestore("transportManagers", transportManagerRecordFromUser(admin));
   render();
 }
 
 function deleteAdmin(event) {
-  if (!isAdmin() || isPrimaryAdmin()) return;
+  if (!isPrimaryAdmin() && !isTransportManagerUser()) return;
   const id = event.currentTarget.dataset.deleteAdmin;
   const admin = data.users.find((user) => user.id === id && user.role === "admin");
   if (!admin) return alert("Gestionnaire de transport introuvable.");
   if (!canRemoveAdmin(admin)) return alert("Impossible de supprimer ce gestionnaire de transport.");
   if (!confirm("Supprimer ce gestionnaire de transport ?")) return;
+  if (isPrimaryAdmin() && !confirmSystemAdminCode("supprimer ce gestionnaire de transport")) return;
   rememberDeletedRecord("users", id);
   data.users = data.users.filter((user) => user.id !== id);
+  if ((admin.transportManagerId || admin.id) === admin.id) {
+    data.transportManagers = (data.transportManagers || []).filter((manager) => manager.id !== (admin.transportManagerId || admin.id));
+    deleteCollectionItemFromFirestore("transportManagers", admin.transportManagerId || admin.id);
+  }
   saveData();
   deleteCollectionItemFromFirestore("users", id);
+  render();
+}
+
+function deleteTransportManagerAccount(event) {
+  if (!isPrimaryAdmin()) return;
+  const id = event.currentTarget.dataset.deleteManagerAccount;
+  const user = data.users.find((item) => item.id === id || item.transportManagerId === id);
+  const manager = (data.transportManagers || []).find((item) => item.id === id || item.transportManagerId === id);
+  const account = user || (manager ? {
+    id: manager.id || id,
+    role: "admin",
+    transportManagerId: manager.id || id,
+    companyName: manager.companyName || manager.name || "",
+    firstName: manager.firstName || "",
+    lastName: manager.lastName || "",
+    identifier: manager.identifier || manager.identifierNumber || "",
+    identifierNumber: manager.identifierNumber || manager.identifier || "",
+    isActive: manager.isActive !== false
+  } : null);
+  if (!account) return alert("Gestionnaire de transport introuvable.");
+  if (!canRemoveAdmin(account)) return alert("Impossible de supprimer ce gestionnaire de transport.");
+  if (!confirm("Supprimer ce gestionnaire de transport ?")) return;
+  if (!confirmSystemAdminCode("supprimer ce gestionnaire de transport")) return;
+  const managerId = account.transportManagerId || account.id;
+  if (user) {
+    rememberDeletedRecord("users", user.id);
+    data.users = data.users.filter((item) => item.id !== user.id);
+    deleteCollectionItemFromFirestore("users", user.id);
+  }
+  rememberDeletedRecord("transportManagers", managerId);
+  data.transportManagers = (data.transportManagers || []).filter((item) => item.id !== managerId && item.transportManagerId !== managerId);
+  saveData();
+  deleteCollectionItemFromFirestore("transportManagers", managerId);
   render();
 }
 
@@ -11825,17 +18892,26 @@ async function createUserFromForm(event) {
   if (!isAdmin() || isPrimaryAdmin()) return;
   const form = event.currentTarget;
   const temporaryCode = generateUniqueAccessCode();
-  const role = form.elements.role.value;
-  if (isSpwAccount() && role !== "assistant") return alert("Le SPW peut créer uniquement des accès convoyeuse.");
+  const selectedRole = form.elements.role.value;
+  if (isSpwAccount() && !["assistant", "spw"].includes(selectedRole)) return alert("Le SPW peut créer uniquement des accès SPW ou convoyeuse.");
+  const role = selectedRole === "spw" ? "admin" : selectedRole;
+  const visualTheme = selectedRole === "spw" ? "spw" : "";
   if (role === "driver" && !isTransportManagerUser()) return alert("Seul le gestionnaire de transport peut créer un chauffeur.");
   if (role === "assistant" && !canManageAssistantAccounts()) return alert("Seul le SPW peut créer une convoyeuse.");
-  const identifierNumber = generateUniqueIdentifier(role);
+  const firstName = form.elements.firstName.value.trim();
+  const lastName = form.elements.lastName.value.trim();
+  const phone = form.elements.phone?.value.trim() || "";
+  const email = form.elements.email?.value.trim() || "";
+  if (!firstName || !lastName) return alert("Le prénom et le nom sont obligatoires.");
+  const identifierNumber = generateUniqueIdentifier(role, { visualTheme });
   const now = new Date().toISOString();
-  const id = `${role}-${Date.now()}`;
+  const id = `${selectedRole}-${Date.now()}`;
   const user = {
     id,
-    firstName: form.elements.firstName.value.trim(),
-    lastName: form.elements.lastName.value.trim(),
+    firstName,
+    lastName,
+    phone,
+    email,
     role,
     identifier: identifierNumber,
     identifierNumber,
@@ -11846,10 +18922,11 @@ async function createUserFromForm(event) {
     passwordHash: "",
     firstLoginCompleted: false,
     resetRequired: true,
-    assignedCircuits: ["admin", "support"].includes(role) ? [] : form.elements.assignedCircuits.value.split(",").map((value) => value.trim()).filter(Boolean),
-    assignedVehicleId: ["admin", "support"].includes(role) ? "" : form.elements.assignedVehicleId.value.trim(),
-    assignedSchool: ["admin", "support"].includes(role) ? "" : form.elements.assignedSchool.value.trim(),
-    hasSncbReplacementAccess: role === "driver" && form.elements.hasSncbReplacementAccess?.checked === true,
+    assignedCircuits: [],
+    assignedVehicleId: "",
+    assignedSchool: "",
+    visualTheme,
+    transportManagerId: transportManagerIdForUser(state.user),
     isActive: true,
     createdBy: state.user.id,
     createdAt: now,
@@ -11867,43 +18944,154 @@ async function createUserFromForm(event) {
     recordHistoryChanges(linkedType, null, linked);
     saveCollectionItemToFirestore(linkedType, linked);
   }
-  alert(`Utilisateur créé.\nIdentifiant : ${identifierNumber}\nCode temporaire : ${temporaryCode}`);
+  alert(`${selectedRole === "spw" ? "Utilisateur SPW" : "Utilisateur"} créé.\nIdentifiant : ${identifierNumber}\nCode temporaire : ${temporaryCode}`);
+  render();
+}
+
+async function createSupportFromForm(event) {
+  event.preventDefault();
+  if (!canManageSupportAccounts()) return;
+  const form = event.currentTarget;
+  const temporaryCode = generateUniqueAccessCode();
+  const identifierNumber = generateUniqueIdentifier("support");
+  const now = new Date().toISOString();
+  const support = {
+    id: `support-${Date.now()}`,
+    firstName: form.elements.firstName.value.trim(),
+    lastName: form.elements.lastName.value.trim(),
+    phone: form.elements.phone.value.trim(),
+    email: form.elements.email.value.trim(),
+    role: "support",
+    identifier: identifierNumber,
+    identifierNumber,
+    username: identifierNumber,
+    ...generatedTemporaryAccessData(temporaryCode, now),
+    temporaryAccessHash: await hashSecret(temporaryCode),
+    accessCodeHash: "",
+    passwordHash: "",
+    recoveryCodeHash: "",
+    recoveryAnswerHash: "",
+    firstLoginCompleted: false,
+    resetRequired: true,
+    assignedCircuits: [],
+    assignedVehicleId: "",
+    assignedSchool: "",
+    supportPermissions: defaultSupportPermissions(),
+    isActive: form.elements.isActive.checked,
+    createdBy: state.user.id,
+    createdAt: now,
+    updatedAt: now,
+    updatedBy: state.user.id
+  };
+  data.users.push(support);
+  saveSupportPermissionsForUser(support);
+  saveData();
+  saveCollectionItemToFirestore("users", support);
+  alert(`Compte support créé.\nIdentifiant : ${identifierNumber}\nCode temporaire : ${temporaryCode}`);
+  render();
+}
+
+function saveSupportPermissionsForUser(user) {
+  if (!user || user.role !== "support") return;
+  data.supportPermissions = Array.isArray(data.supportPermissions) ? data.supportPermissions : [];
+  const doc = {
+    id: user.id,
+    userId: user.id,
+    ...defaultSupportPermissions(),
+    ...(user.supportPermissions || {}),
+    updatedAt: new Date().toISOString(),
+    updatedBy: state.user?.id || "system"
+  };
+  const index = data.supportPermissions.findIndex((permissions) => permissions.id === user.id || permissions.userId === user.id);
+  if (index >= 0) data.supportPermissions[index] = doc;
+  else data.supportPermissions.push(doc);
+  saveCollectionItemToFirestore("supportPermissions", doc);
+}
+
+function toggleSupportAccess(event) {
+  if (!canManageSupportAccounts()) return;
+  const support = data.users.find((user) => user.id === event.currentTarget.dataset.toggleSupport && user.role === "support");
+  if (!support) return alert("Compte support introuvable.");
+  support.isActive = support.isActive === false;
+  support.updatedAt = new Date().toISOString();
+  support.updatedBy = state.user.id;
+  support.supportPermissions = { ...defaultSupportPermissions(), ...(support.supportPermissions || {}) };
+  saveSupportPermissionsForUser(support);
+  saveData();
+  saveCollectionItemToFirestore("users", support);
   render();
 }
 
 async function resetUserCode(event) {
-  if (!isAdmin() || isPrimaryAdmin()) return;
-  const user = data.users.find((item) => item.id === event.currentTarget.dataset.resetCode);
+  if (!isAdmin()) return;
+  const id = event.currentTarget.dataset.resetCode;
+  let user = data.users.find((item) => item.id === id);
+  if (!user) {
+    const manager = (data.transportManagers || []).find((item) => item.id === id || item.transportManagerId === id);
+    if (manager) {
+      user = {
+        id: manager.id || id,
+        role: "admin",
+        transportManagerId: manager.id || id,
+        companyName: manager.companyName || manager.name || "",
+        firstName: manager.firstName || "",
+        lastName: manager.lastName || "",
+        phone: manager.phone || "",
+        email: manager.email || "",
+        identifier: manager.identifier || manager.identifierNumber || generateUniqueIdentifier("admin", { visualTheme: "" }),
+        identifierNumber: manager.identifierNumber || manager.identifier || "",
+        username: manager.identifierNumber || manager.identifier || "",
+        assignedCircuits: [],
+        assignedVehicleId: "",
+        assignedSchool: "",
+        visualTheme: "",
+        isActive: manager.isActive !== false,
+        createdBy: manager.createdBy || state.user.id,
+        createdAt: manager.createdAt || new Date().toISOString(),
+        updatedAt: manager.updatedAt || "",
+        updatedBy: manager.updatedBy || ""
+      };
+      user.identifierNumber = user.identifierNumber || user.identifier;
+      user.username = user.username || user.identifier;
+      data.users.push(user);
+    }
+  }
   if (!user) return alert("Utilisateur introuvable.");
-  if (!canManageUserAccess(user)) return alert("Action non autorisée pour ce compte.");
+  if (!canResetUserAccess(user)) return alert("Action non autorisée pour ce compte.");
   const temporaryCode = generateUniqueAccessCode();
-  Object.assign(user, generatedTemporaryAccessData(temporaryCode));
-  user.temporaryAccessHash = await hashSecret(temporaryCode);
-  user.accessCodeHash = "";
-  user.passwordHash = "";
-  user.recoveryCodeHash = "";
-  user.recoveryAnswerHash = "";
-  user.firstLoginCompleted = false;
-  user.resetRequired = true;
-  user.updatedAt = new Date().toISOString();
-  user.updatedBy = state.user.id;
+  const now = new Date().toISOString();
+  await applyTemporaryAccessReset(user, temporaryCode, now);
   recordSecurityLog(user, "temporary_code_generated", "success");
   saveData();
-  saveCollectionItemToFirestore("users", user);
+  await saveCollectionItemToFirestore("users", user);
+  if (isTransportManagerUser(user) && (user.transportManagerId || user.id) === user.id) await saveCollectionItemToFirestore("transportManagers", transportManagerRecordFromUser(user, now));
   alert(`Accès réinitialisé.\nIdentifiant : ${user.identifierNumber || defaultIdentifierForUser(user)}\nCode temporaire : ${temporaryCode}`);
   render();
 }
 
 function deleteUser(event) {
-  if (!isAdmin() || isPrimaryAdmin()) return;
+  if (!isAdmin()) return;
   const id = event.currentTarget.dataset.deleteUser;
   if (id === state.user.id) return alert("Impossible de supprimer l’utilisateur connecté.");
   const user = data.users.find((item) => item.id === id);
+  if (user?.role === "support") return alert("Le Centre Support ne peut pas être supprimé depuis les codes d’accès utilisateur.");
   if (!canManageUserAccess(user)) return alert("Action non autorisée pour ce compte.");
   if (user?.role === "admin" && !canRemoveAdmin(user)) return alert("Impossible de supprimer ce gestionnaire de transport.");
   if (!confirm("Supprimer cet utilisateur ?")) return;
+  if (user?.role === "admin" && isPrimaryAdmin() && !confirmSystemAdminCode("supprimer ce gestionnaire de transport")) return;
   rememberDeletedRecord("users", id);
   data.users = data.users.filter((user) => user.id !== id);
+  if (user?.role === "admin" && (user.transportManagerId || user.id) === user.id) {
+    const managerId = user.transportManagerId || user.id;
+    rememberDeletedRecord("transportManagers", managerId);
+    data.transportManagers = (data.transportManagers || []).filter((manager) => manager.id !== managerId);
+    deleteCollectionItemFromFirestore("transportManagers", managerId);
+  }
+  if (user?.role === "support") {
+    rememberDeletedRecord("supportPermissions", id);
+    data.supportPermissions = (data.supportPermissions || []).filter((permissions) => permissions.id !== id && permissions.userId !== id);
+    deleteCollectionItemFromFirestore("supportPermissions", id);
+  }
   saveData();
   deleteCollectionItemFromFirestore("users", id);
   render();
@@ -11942,13 +19130,32 @@ function saveChild(event) {
   [
     "lastName", "firstName", "birthDate", "schoolName", "circuitNumber",
     "streetName", "streetNumber", "postalCode", "city", "phone",
-    "pickupStop", "transferVehicleId",
+    "pickupStop", "morningPickupTime", "transferVehicleId",
     "transferLocation", "transferDriverId", "transferAssistantId", "transferCircuitId", "transferSchoolCircuitId",
-    "transportStatus", "exclusionType", "exclusionReason", "exclusionStartDate", "exclusionEndDate",
-    "schoolPhone", "schoolEmail", "schoolAddress", "schoolNotes"
+    "transportStatus", "exclusionType", "exclusionReason", "exclusionStartDate", "exclusionEndDate"
   ].forEach((key) => {
     if (form.has(key)) child[key] = String(form.get(key) || "").trim();
   });
+  const selectedSchool = schoolByRef(child.schoolName);
+  if (child.schoolName && !selectedSchool) {
+    return alert("L’école sélectionnée est introuvable. Choisissez une école déjà enregistrée.");
+  }
+  if (selectedSchool) {
+    child.schoolId = selectedSchool.id || "";
+    child.schoolName = selectedSchool.name || "";
+    child.schoolPhone = selectedSchool.phone || "";
+    child.schoolEmail = selectedSchool.email || "";
+    child.schoolAddress = selectedSchool.address || "";
+    child.schoolNotes = selectedSchool.notes || "";
+    child.schoolManagerName = selectedSchool.managerName || "";
+  } else {
+    child.schoolId = "";
+    child.schoolPhone = "";
+    child.schoolEmail = "";
+    child.schoolAddress = "";
+    child.schoolNotes = "";
+    child.schoolManagerName = "";
+  }
   if (form.has("autonomyStatus")) child.autonomyStatus = String(form.get("autonomyStatus") || "").trim();
   child.homeAddress = [child.streetName, child.streetNumber].filter(Boolean).join(" ");
   child.street = child.streetName || "";
@@ -11965,6 +19172,7 @@ function saveChild(event) {
   child.morningCircuit = circuitLabelByRef(child.pickupCircuitId) || child.morningCircuit || "";
   child.returnCircuit = circuitLabelByRef(child.schoolCircuitId) || child.returnCircuit || "";
   child.circuitNumber = child.morningCircuit || child.circuitNumber;
+  child.transferName = pickupCircuit?.transferName || schoolCircuit?.transferName || child.transferName || "";
   if (form.has("hasTransfer")) {
     child.hasTransfer = String(form.get("hasTransfer")) === "true";
     child.changesBusAtTransfer = child.hasTransfer && event.currentTarget.elements.changesBusAtTransfer?.checked === true;
@@ -11985,16 +19193,25 @@ function saveChild(event) {
     const assistant = assistantByRef(rawAssistant);
     if (rawDriver && !driver) return alert("Le chauffeur sélectionné est introuvable.");
     if (rawAssistant && !assistant) return alert("La convoyeuse sélectionnée est introuvable.");
-    child.driverId = driver?.id || child.driverId || "";
-    child.assistantId = assistant?.id || child.assistantId || "";
-    const vehicle = data.vehicles.find((item) => item.driverId === child.driverId || item.assistantId === child.assistantId);
+    child.driverIds = uniqueText([
+      ...(driver ? [driver.id] : []),
+      ...driverIdsFromRecord(pickupCircuit || {}),
+      ...driverIdsFromRecord(schoolCircuit || {}),
+      ...driverIdsFromRecord(child)
+    ]);
+    child.driverId = child.driverIds[0] || "";
+    child.assistantId = assistant?.id || pickupCircuit?.assistantId || schoolCircuit?.assistantId || child.assistantId || "";
+    const vehicle = data.vehicles.find((item) =>
+      driverIdsFromRecord(item).some((driverId) => child.driverIds.includes(driverId)) ||
+      item.assistantId === child.assistantId
+    );
     child.vehicleId = vehicle?.id || child.vehicleId || "";
     child.transferVehicleId = vehicle?.busNumber || child.transferVehicleId || "";
   }
   if (formHasAnyPrefix(form, "medicalHelpSheet.")) {
     const sheet = normalizeMedicalHelpSheet(child);
     Object.keys(sheet).forEach((key) => {
-      sheet[key] = form.get(`medicalHelpSheet.${key}`) || "";
+      if (form.has(`medicalHelpSheet.${key}`)) sheet[key] = form.get(`medicalHelpSheet.${key}`) || "";
     });
     child.medicalHelpSheet = sheet;
     syncMedicalHelpSheet(child);
@@ -12011,8 +19228,8 @@ function saveChild(event) {
       enabled: residence.enabled,
       evenWeekAddress: residence.motherAddress,
       oddWeekAddress: residence.fatherAddress,
-      evenWeekParent: "Maman",
-      oddWeekParent: "Papa",
+      evenWeekParent: residence.evenWeekParent || "Maman",
+      oddWeekParent: residence.oddWeekParent || "Papa",
       notes: residence.notes
     };
   }
@@ -12060,6 +19277,7 @@ function saveChild(event) {
     return alert("Vous pouvez ajouter uniquement un élève lié à votre circuit.");
   }
   applyLinkedChildData(child);
+  child.transportManagerId = child.transportManagerId || transportManagerIdForUser(state.user);
   const now = new Date().toISOString();
   if (!child.createdAt) child.createdAt = now;
   if (!child.createdBy) child.createdBy = state.user?.id || "system";
@@ -12103,9 +19321,11 @@ function saveParentAbsence(event) {
     id: existing?.id || `absence-${child.id}-${dateAbsence}-${Date.now()}`,
     studentId: child.id,
     studentName: fullName(child),
+    transportManagerId: child.transportManagerId || transportManagerIdForUser(state.user),
     parentId: state.user.id,
     circuitId: absenceCircuitIdForChild(child),
     driverId: child.driverId || childDriver(child)?.id || "",
+    driverIds: driverIdsFromRecord(child),
     assistantId: child.assistantId || childAssistant(child)?.id || "",
     dateAbsence,
     motif: String(form.elements.motif.value || "").trim(),
@@ -12125,32 +19345,151 @@ function saveParentAbsence(event) {
   render();
 }
 
+async function saveParentMedicalHelp(event) {
+  event.preventDefault();
+  if (!isParent()) return;
+  const formElement = event.currentTarget;
+  const child = visibleChildren().find((item) => item.id === formElement.dataset.childId);
+  if (!child || !isChildParent(child)) return alert("Élève introuvable.");
+  const form = new FormData(formElement);
+  const sheet = normalizeMedicalHelpSheet(child);
+  Object.keys(sheet).forEach((key) => {
+    if (form.has(`medicalHelpSheet.${key}`)) sheet[key] = String(form.get(`medicalHelpSheet.${key}`) || "").trim();
+  });
+  child.medicalHelpSheet = sheet;
+  syncMedicalHelpSheet(child);
+  const now = new Date().toISOString();
+  child.parentMedicalHelpCompletedAt = now;
+  child.parentMedicalHelpCompletedBy = state.user.id;
+  child.updatedAt = now;
+  child.updatedBy = state.user.id;
+  child.updatedByRole = state.user.role;
+  syncCollectionAliases(data);
+  saveData();
+  await saveChildToFirestore(child);
+  state.parentMedicalChildId = "";
+  alert("Fiche médicale enregistrée.");
+  render();
+}
+
+function saveTransferLocation(event) {
+  event.preventDefault();
+  if (!isTransportManagerUser()) return;
+  const form = event.currentTarget;
+  const transfer = transferById(form.dataset.transferLocationForm);
+  if (!transfer || !canManageTransferLocation(transfer)) return alert("Modification du transfert non autorisée.");
+  const transferLocation = String(form.elements.transferLocation.value || "").trim();
+  if (!transferLocation) return alert("L’endroit de transfert est obligatoire.");
+  const now = new Date().toISOString();
+  data.transportTransfers = Array.isArray(data.transportTransfers) ? data.transportTransfers : [];
+  const stored = data.transportTransfers.find((item) => (item.transferId || item.id) === transfer.transferId);
+  const payload = {
+    ...transfer,
+    ...(stored || {}),
+    id: transfer.transferId,
+    transferId: transfer.transferId,
+    transferLocation,
+    transferName: transfer.transferName || transferLocation,
+    transportManagerId: transfer.transportManagerId || transportManagerIdForUser(state.user),
+    updatedAt: now,
+    updatedBy: state.user.id,
+    updatedByRole: state.user.role
+  };
+  if (stored) Object.assign(stored, payload);
+  else data.transportTransfers.push(payload);
+  saveData();
+  saveCollectionItemToFirestore("transportTransfers", payload);
+  render();
+}
+
+function createTransferLocation(event) {
+  event.preventDefault();
+  if (!isTransportManagerUser()) return;
+  const form = event.currentTarget;
+  const transferName = String(form.elements.transferName.value || "").trim();
+  const transferLocation = String(form.elements.transferLocation.value || "").trim();
+  const circuitId = String(form.elements.circuitId.value || "").trim();
+  if (!transferName || !transferLocation) return alert("Nom et lieu de transfert obligatoires.");
+  const circuit = circuitId ? circuitByRef(circuitId) : null;
+  const now = new Date().toISOString();
+  const transferId = `transfer-location-${slugify(circuitId || transferName)}-${Date.now()}`;
+  const children = circuitId
+    ? scopeRecordsForCurrentTransportManager("children", data.children || []).filter((child) => childCircuitReferences(child).includes(circuitId) || childCircuitReferences(child).includes(circuit?.id) || childCircuitReferences(child).includes(circuit?.name))
+    : [];
+  const payload = {
+    id: transferId,
+    transferId,
+    transportManagerId: transportManagerIdForUser(state.user),
+    transferName,
+    transferLocation,
+    circuitId,
+    driverId: driverIdsFromRecord(circuit || {})[0] || "",
+    driverIds: driverIdsFromRecord(circuit || {}),
+    convoyeurId: circuit?.assistantId || "",
+    assistantId: circuit?.assistantId || "",
+    studentsIds: children.map((child) => child.id).filter(Boolean),
+    parentIds: uniqueText(children.flatMap((child) => child.parentIds || [])),
+    createdAt: now,
+    updatedAt: now,
+    createdBy: state.user.id,
+    updatedBy: state.user.id,
+    updatedByRole: state.user.role
+  };
+  data.transportTransfers = Array.isArray(data.transportTransfers) ? data.transportTransfers : [];
+  data.transportTransfers.push(payload);
+  saveData();
+  saveCollectionItemToFirestore("transportTransfers", payload);
+  render();
+}
+
+function deleteTransportTransfer(transferId) {
+  if (!isTransportManagerUser()) return;
+  const transfer = transferById(transferId);
+  if (!transfer || !canManageTransferLocation(transfer)) return alert("Suppression du lieu non autorisée.");
+  if (!confirm("Supprimer ce lieu de transfert ?")) return;
+  data.transportTransfers = (data.transportTransfers || []).filter((item) => (item.transferId || item.id) !== (transfer.transferId || transfer.id));
+  recordHistoryDeletion("transportTransfers", transfer);
+  saveData();
+  deleteCollectionItemFromFirestore("transportTransfers", transfer.transferId || transfer.id);
+  render();
+}
+
 function saveTransferDelay(event) {
   event.preventDefault();
-  if (!["driver", "assistant"].includes(state.user?.role)) return;
+  if (!canCreateTransferDelay()) return;
   const form = event.currentTarget;
   const transfer = transferById(form.dataset.transferDelayForm);
   if (!transfer || !canManageTransferDelay(transfer)) return alert("Vous ne pouvez pas signaler un retard sur ce transfert.");
+  if (saveDelayForTransfer(transfer, form)) render();
+}
+
+function saveDelayForTransfer(transfer, form) {
   const selectedMinutes = form.elements.delayMinutes.value;
   const delayMinutes = selectedMinutes === "custom" ? Number(form.elements.customDelayMinutes.value) : Number(selectedMinutes);
-  if (!Number.isFinite(delayMinutes) || delayMinutes <= 0) return alert("La durée du retard est obligatoire.");
+  if (!Number.isFinite(delayMinutes) || delayMinutes <= 0) {
+    alert("La durée du retard est obligatoire.");
+    return false;
+  }
   const now = new Date().toISOString();
   const previousActive = (data.transferDelays || []).filter((delay) => delay.status === "active" && delay.transferId === transfer.transferId);
-  previousActive.forEach((delay) => {
-    const before = cloneHistorySnapshot(delay);
-    delay.status = "resolved";
-    delay.resolvedAt = now;
-    delay.resolvedById = state.user.id;
-    delay.resolvedByRole = state.user.role;
-    recordHistoryChanges("transferDelays", before, delay);
-    saveCollectionItemToFirestore("transferDelays", delay);
-  });
+	  previousActive.forEach((delay) => {
+	    const before = cloneHistorySnapshot(delay);
+	    delay.status = "resolved";
+	    delay.resolvedAt = now;
+	    delay.resolvedById = state.user.id;
+	    delay.resolvedByRole = state.user.role;
+	    recordHistoryChanges("transferDelays", before, delay);
+	    saveDelayNotificationStatus(delay);
+	    saveCollectionItemToFirestore("transferDelays", delay);
+	  });
   const delay = {
     id: `delay-${transfer.transferId}-${Date.now()}`,
     transferId: transfer.transferId,
     transferName: transfer.transferName,
+    transportManagerId: transfer.transportManagerId || transportManagerIdForUser(state.user),
     circuitId: transfer.circuitId,
     driverId: transfer.driverId || "",
+    driverIds: driverIdsFromRecord(transfer),
     convoyeurId: transfer.convoyeurId || transfer.assistantId || "",
     studentsIds: transfer.studentsIds || [],
     parentIds: transfer.parentIds || [],
@@ -12161,9 +19500,10 @@ function saveTransferDelay(event) {
     createdAt: now,
     status: "active"
   };
-  data.transferDelays = data.transferDelays || [];
-  data.transferDelays.push(delay);
-  recordHistoryChanges("transferDelays", null, delay);
+	  data.transferDelays = data.transferDelays || [];
+	  data.transferDelays.push(delay);
+	  createDelayNotification(delay);
+	  recordHistoryChanges("transferDelays", null, delay);
   if (form.elements.notifyParentsSms?.checked === true) {
     queueSmsAlerts("delay", childrenForTransfer(transfer), {
       circuitId: transfer.circuitId,
@@ -12173,7 +19513,7 @@ function saveTransferDelay(event) {
   }
   saveData();
   saveCollectionItemToFirestore("transferDelays", delay);
-  render();
+  return true;
 }
 
 function resolveTransferDelay(delayId) {
@@ -12188,7 +19528,40 @@ function resolveTransferDelay(delayId) {
   delay.resolvedByRole = state.user.role;
   recordHistoryChanges("transferDelays", before, delay);
   saveData();
+  saveDelayNotificationStatus(delay);
   saveCollectionItemToFirestore("transferDelays", delay);
+  render();
+}
+
+function cancelTransferDelay(delayId) {
+  const delay = (data.transferDelays || []).find((item) => item.id === delayId);
+  if (!canCancelTransferDelay(delay)) return;
+  if (delay.status !== "active") return;
+  const before = cloneHistorySnapshot(delay);
+  delay.status = "cancelled";
+  delay.cancelledAt = new Date().toISOString();
+  delay.cancelledById = state.user.id;
+  delay.cancelledByRole = state.user.role;
+  recordHistoryChanges("transferDelays", before, delay);
+  saveData();
+  saveDelayNotificationStatus(delay);
+  saveCollectionItemToFirestore("transferDelays", delay);
+  render();
+}
+
+function deleteTransferDelay(delayId) {
+  const delay = (data.transferDelays || []).find((item) => item.id === delayId);
+  if (!canDeleteTransferDelay(delay)) return;
+  if (!confirm("Supprimer définitivement ce retard ?")) return;
+  const notificationIds = (data.notifications || [])
+    .filter((notification) => notification.type === "delay" && (notification.entityId === delayId || notification.key === delayId || notification.id === `notification-delay-${delayId}`))
+    .map((notification) => notification.id);
+  data.transferDelays = (data.transferDelays || []).filter((item) => item.id !== delayId);
+  data.notifications = (data.notifications || []).filter((notification) => !notificationIds.includes(notification.id));
+  recordHistoryDeletion("transferDelays", delay);
+  saveData();
+  deleteCollectionItemFromFirestore("transferDelays", delayId);
+  notificationIds.forEach((id) => deleteCollectionItemFromFirestore("notifications", id));
   render();
 }
 
@@ -12215,30 +19588,14 @@ function saveParentChangeRequest(event) {
   const child = selectedParentChild();
   if (!child) return;
   const form = new FormData(event.currentTarget);
-  const isRequiredMedicalCompletion = event.currentTarget.dataset.medicalCompletionRequired === "1";
   const guardian = parentGuardianForChild(child);
   const syncedAddress = child.homeAddress || guardian.address || "";
   const driver = childDriver(child);
+  const driverIds = uniqueText([...driverIdsFromRecord(child), ...(driver ? [driver.id] : [])]);
   const assistant = childAssistant(child);
-  const sheet = normalizeMedicalHelpSheet(child);
   const fields = [
     ["homeAddress", "adresse", syncedAddress],
     ["guardianPhone", "téléphone parent", guardian.phone],
-    ["medicalHelpSheet.hasAllergies", "allergies oui/non", sheet.hasAllergies],
-    ["medicalHelpSheet.allergiesDetails", "précisions allergies", sheet.allergiesDetails],
-    ["medicalHelpSheet.hasMedicalConditions", "affections médicales oui/non", sheet.hasMedicalConditions],
-    ["medicalHelpSheet.medicalConditionsDetails", "précisions affections médicales", sheet.medicalConditionsDetails],
-    ["medicalHelpSheet.medicalSymptoms", "symptômes particuliers", sheet.medicalSymptoms],
-    ["medicalHelpSheet.symptomInstructions", "consignes en cas de symptôme", sheet.symptomInstructions],
-    ["medicalHelpSheet.transitionObject", "objet de transition", sheet.transitionObject],
-    ["medicalHelpSheet.mobilityHelp", "aide déplacement", sheet.mobilityHelp],
-    ["medicalHelpSheet.tripOccupation", "occupation trajet", sheet.tripOccupation],
-    ["medicalHelpSheet.transportSickness", "mal des transports", sheet.transportSickness],
-    ["medicalHelpSheet.communicationHelp", "aide communication", sheet.communicationHelp],
-    ["medicalHelpSheet.nonVerbalCommunication", "communication non verbale", sheet.nonVerbalCommunication],
-    ["medicalHelpSheet.pictograms", "pictogrammes", sheet.pictograms],
-    ["medicalHelpSheet.signs", "signes", sheet.signs],
-    ["medicalHelpSheet.careAdviceNotes", "remarques santé", sheet.careAdviceNotes],
     ["parentNotes", "notes parents", child.parentNotes]
   ];
   const created = [];
@@ -12252,6 +19609,7 @@ function saveParentChangeRequest(event) {
         parentId: state.user.id,
         parentName: fullName(state.user),
         driverId: driver?.id || child.driverId || "",
+        driverIds,
         assistantId: assistant?.id || child.assistantId || "",
         fieldChanged: key,
         fieldLabel: label,
@@ -12267,24 +19625,19 @@ function saveParentChangeRequest(event) {
       });
     }
   });
-  if (!created.length && !isRequiredMedicalCompletion) return alert("Aucune modification détectée.");
+  if (!created.length) return alert("Aucune modification détectée.");
   if (created.length) data.parentChangeRequests.push(...created);
-  if (isRequiredMedicalCompletion) {
-    child.parentMedicalHelpCompletedAt = new Date().toISOString();
-    child.parentMedicalHelpCompletedBy = state.user.id;
-    saveChildToFirestore(child);
-  }
   saveData();
   created.forEach(saveParentRequestToFirestore);
   state.parentRequestChildId = "";
-  alert(created.length ? "Demande envoyée au chauffeur et à la convoyeuse." : "Fiche médicale confirmée.");
+  alert("Demande envoyée au chauffeur et à la convoyeuse.");
   render();
 }
 
 function reviewParentRequest(event) {
   const request = data.parentChangeRequests.find((item) => item.id === event.currentTarget.dataset.reviewRequest);
   if (!request || !["driver", "assistant"].includes(state.user?.role)) return;
-  if (request.driverId !== state.user.id && request.assistantId !== state.user.id) return;
+  if (!driverIdsFromRecord(request).includes(state.user.id) && request.driverId !== state.user.id && request.assistantId !== state.user.id) return;
   const child = visibleChildren().find((item) => item.id === request.childId);
   if (!child) return;
   const action = event.currentTarget.dataset.reviewAction;
@@ -12342,8 +19695,10 @@ function addSystemMessage(childId, text) {
     authorId: state.user.id,
     authorName: fullName(state.user),
     authorRole: state.user.role,
+    transportManagerId: child.transportManagerId || transportManagerIdForUser(state.user),
+    childId,
     recipientType: "role_group",
-    recipientIds: privateRecipientIdsForChild(child),
+    recipientIds: uniqueText([...privateRecipientIdsForChild(child), ...currentUserIdentityIds()]),
     createdAt: new Date().toISOString(),
     readBy: [state.user.id]
   };
@@ -12363,6 +19718,7 @@ function saveStudentIssue(event) {
     id: `issue-${Date.now()}`,
     childId: child.id,
     childName: fullName(child),
+    transportManagerId: child.transportManagerId || transportManagerIdForUser(state.user),
     type: form.elements.type.value,
     description,
     importance: form.elements.importance.value,
@@ -12373,6 +19729,7 @@ function saveStudentIssue(event) {
     createdAt: now,
     updatedAt: now,
     driverId: child.driverId || childDriver(child)?.id || "",
+    driverIds: driverIdsFromRecord(child),
     assistantId: child.assistantId || childAssistant(child)?.id || "",
     parentIds: parentListForChild(child).map((parent) => parent.id),
     spwIds: (data.users || []).filter((user) => user.role === "admin" && user.visualTheme === "spw").map((user) => user.id),
@@ -12429,7 +19786,7 @@ function updateStudentIssueStatus(issueId, status) {
   render();
 }
 
-function sendMessage(event) {
+async function sendMessage(event) {
   event.preventDefault();
   const childId = event.currentTarget.dataset.messageForm;
   const child = visibleChildren().find((item) => item.id === childId);
@@ -12437,29 +19794,38 @@ function sendMessage(event) {
   const text = event.currentTarget.elements.messageText.value.trim();
   if (!text) return;
   data.messages[childId] = data.messages[childId] || [];
+  const nowDate = new Date();
+  const createdAt = nowDate.toISOString();
+  const deliveryDate = state.user.role === "parent" ? nextParentMessageDeliveryDate(nowDate) : nowDate;
+  const isScheduledDelivery = deliveryDate.getTime() > nowDate.getTime() + 1000;
   const message = {
     id: `msg-${Date.now()}`,
     text,
     authorId: state.user.id,
     authorName: fullName(state.user),
     authorRole: state.user.role,
+    transportManagerId: child.transportManagerId || transportManagerIdForUser(state.user),
+    childId,
     recipientType: "role_group",
-    recipientIds: privateRecipientIdsForChild(child),
-    createdAt: new Date().toISOString(),
+    recipientIds: uniqueText([...privateRecipientIdsForChild(child), ...currentUserIdentityIds()]),
+    createdAt,
+    deliverAt: deliveryDate.toISOString(),
+    deliveryStatus: isScheduledDelivery ? "scheduled" : "delivered",
+    deliveredAt: isScheduledDelivery ? "" : createdAt,
     readBy: [state.user.id]
   };
   data.messages[childId].push(message);
   saveData();
-  saveChildMessageToFirestore(childId, message);
   render();
+  await saveChildMessageToFirestore(childId, message);
 }
 
-function sendTeamMessage(event) {
+async function sendTeamMessage(event) {
   event.preventDefault();
   if (!["driver", "assistant"].includes(state.user?.role)) return;
   const conversationId = event.currentTarget.dataset.teamMessageForm;
-  const conversation = teamConversationsForUser(state.messagesTab).find((item) => item.conversationId === conversationId);
-  if (!conversation || !conversation.participants.includes(state.user.id)) return;
+  const conversation = teamConversationsForUser("team").find((item) => item.conversationId === conversationId);
+  if (!conversation || !currentUserInList(conversation.participants || [])) return;
   const text = event.currentTarget.elements.teamMessageText.value.trim();
   if (!text) return;
   const now = new Date().toISOString();
@@ -12469,6 +19835,7 @@ function sendTeamMessage(event) {
     authorId: state.user.id,
     authorName: fullName(state.user),
     authorRole: state.user.role,
+    transportManagerId: conversation.transportManagerId || transportManagerIdForUser(state.user),
     recipientIds: conversation.participants,
     recipientRoles: conversation.participantRoles,
     createdAt: now,
@@ -12476,20 +19843,23 @@ function sendTeamMessage(event) {
   };
   data.teamMessageItems[conversationId] = data.teamMessageItems[conversationId] || [];
   data.teamMessageItems[conversationId].push(message);
-  const stored = { ...conversation, lastMessage: text, lastMessageAt: now, createdAt: conversation.createdAt || now };
+  const stored = { ...conversation, transportManagerId: conversation.transportManagerId || transportManagerIdForUser(state.user), lastMessage: text, lastMessageAt: now, createdAt: conversation.createdAt || now };
   const index = data.teamMessages.findIndex((item) => item.conversationId === conversationId);
   if (index >= 0) data.teamMessages[index] = stored;
   else data.teamMessages.push(stored);
   saveData();
-  saveTeamMessageToFirestore(stored, message);
   render();
+  await saveTeamMessageToFirestore(stored, message);
 }
 
-function sendDirectMessage(event) {
+async function sendDirectMessage(event) {
   event.preventDefault();
   if (!isAdmin() && !["driver", "assistant"].includes(state.user?.role)) return;
   const form = event.currentTarget;
   const targetRole = form.dataset.directMessageForm;
+  if (targetRole === "driver" && isSpwAccount()) return alert("Le SPW ne peut pas envoyer de message aux chauffeurs.");
+  if (targetRole === "transport_manager" && !isSpwAccount()) return alert("Message réservé au SPW.");
+  if (targetRole === "spw" && !isTransportManagerUser()) return alert("Message réservé au gestionnaire de transport.");
   const recipientId = form.elements.recipientId.value;
   const subject = form.elements.subject.value.trim();
   const text = form.elements.messageText.value.trim();
@@ -12499,18 +19869,23 @@ function sendDirectMessage(event) {
   const conversationId = directConversationId(state.user.id, recipientId, subject);
   const now = new Date().toISOString();
   const existing = data.directMessages.find((item) => item.conversationId === conversationId);
+  const participants = [...new Set([...personIdentityIds(state.user), ...personIdentityIds(recipient)])];
   const conversation = {
+    id: conversationId,
     conversationId,
     senderId: existing?.senderId || state.user.id,
     senderName: existing?.senderName || fullName(state.user),
-    senderRole: existing?.senderRole || state.user.role,
+    senderRole: existing?.senderRole || directRoleForUser(state.user),
     recipientId: existing?.recipientId || recipientId,
     recipientName: existing?.recipientName || fullName(recipient),
     recipientRole: existing?.recipientRole || targetRole,
+    targetRole,
+    counterpartRole: targetRole,
+    transportManagerId: existing?.transportManagerId || transportManagerIdForUser(state.user) || recipient.transportManagerId || "",
     subject,
     lastMessage: text,
     lastMessageAt: now,
-    participants: [...new Set([state.user.id, recipientId])],
+    participants,
     createdAt: existing?.createdAt || now,
     updatedAt: now
   };
@@ -12518,13 +19893,17 @@ function sendDirectMessage(event) {
   data.directMessageItems[conversationId] = data.directMessageItems[conversationId] || [];
   data.directMessageItems[conversationId].push(message);
   upsertDirectConversation(conversation);
+  if (["driver", "assistant"].includes(state.user?.role) && ["driver", "assistant"].includes(targetRole)) {
+    state.messagesTab = targetRole === "driver" ? "drivers" : "assistants";
+  }
   state.selectedDirectConversationId = conversationId;
+  state.composingDirectRole = "";
   saveData();
-  saveDirectMessageToFirestore(conversation, message);
   render();
+  await saveDirectMessageToFirestore(conversation, message);
 }
 
-function sendDirectReply(event) {
+async function sendDirectReply(event) {
   event.preventDefault();
   const conversation = data.directMessages.find((item) => item.conversationId === event.currentTarget.dataset.directReplyForm);
   if (!conversation || !canReadDirectConversation(conversation)) return;
@@ -12539,8 +19918,8 @@ function sendDirectReply(event) {
   conversation.updatedAt = now;
   upsertDirectConversation(conversation);
   saveData();
-  saveDirectMessageToFirestore(conversation, message);
   render();
+  await saveDirectMessageToFirestore(conversation, message);
 }
 
 function directMessagePayload(conversation, text, createdAt) {
@@ -12549,16 +19928,19 @@ function directMessagePayload(conversation, text, createdAt) {
     text,
     authorId: state.user.id,
     authorName: fullName(state.user),
-    authorRole: state.user.role,
+    authorRole: directRoleForUser(state.user),
+    transportManagerId: conversation.transportManagerId || transportManagerIdForUser(state.user),
+    recipientIds: conversation.participants || [],
     createdAt,
     readBy: [state.user.id]
   };
 }
 
 function upsertDirectConversation(conversation) {
+  const storedConversation = { ...conversation, id: conversation.id || conversation.conversationId };
   const index = data.directMessages.findIndex((item) => item.conversationId === conversation.conversationId);
-  if (index >= 0) data.directMessages[index] = conversation;
-  else data.directMessages.push(conversation);
+  if (index >= 0) data.directMessages[index] = storedConversation;
+  else data.directMessages.push(storedConversation);
 }
 
 function refreshDirectConversationPreview(conversationId) {
@@ -12591,29 +19973,51 @@ function directConversationId(senderId, recipientId, subject) {
   return `direct-${people}-${key}`;
 }
 
+function supportTicketNumberForDate(date = new Date()) {
+  const stamp = date.getTime();
+  const day = date.toISOString().slice(0, 10).replace(/-/g, "");
+  return `GTS-${day}-${String(stamp).slice(-6)}`;
+}
+
+function supportTicketNumber(request = {}) {
+  if (request.ticketNumber) return String(request.ticketNumber);
+  const source = request.createdAt ? new Date(request.createdAt) : new Date(Number(String(request.id || "").replace(/\D/g, "")) || Date.now());
+  if (Number.isFinite(source.getTime())) return supportTicketNumberForDate(source);
+  return request.id || "Ticket support";
+}
+
 function createSupportRequest(event) {
   event.preventDefault();
   if (!canAccessSupportCenter() || isParent()) return alert("Centre support technique non accessible depuis le compte parent.");
   const form = event.currentTarget;
   const subject = form.elements.subject.value.trim();
   const messageText = form.elements.message.value.trim();
+  const category = form.elements.category?.value || "technical";
+  const priority = form.elements.priority?.value || "normal";
   if (!subject || !messageText) return alert("Sujet et message obligatoires.");
-  const now = new Date().toISOString();
+  const nowDate = new Date();
+  const now = nowDate.toISOString();
   const context = supportContextForUser();
+  const dueAt = supportDueAt({ createdAt: now, priority });
   const request = {
-    id: `support-${Date.now()}`,
+    id: `support-${nowDate.getTime()}`,
+    ticketNumber: supportTicketNumberForDate(nowDate),
     userId: state.user.id,
     userName: form.elements.userName.value.trim() || fullName(state.user),
     userRole: state.user.role,
     subject,
+    category,
+    priority,
     message: messageText,
     status: "pending",
     createdAt: now,
     updatedAt: now,
+    dueAt,
     assignedSupport: "",
     lastReplyAt: "",
     context,
-    readBy: [state.user.id]
+    readBy: [state.user.id],
+    history: []
   };
   const message = {
     id: `support-msg-${Date.now()}`,
@@ -12629,7 +20033,7 @@ function createSupportRequest(event) {
   saveData();
   saveSupportRequestToFirestore(request);
   saveSupportMessageToFirestore(request.id, message);
-  alert("Demande envoyée au support");
+  alert(`Demande envoyée au support.\nTicket : ${supportTicketNumber(request)}`);
   state.selectedSupportRequestId = request.id;
   render();
 }
@@ -12682,31 +20086,35 @@ function createSupportRequestFromLogin(event) {
   const requesterRole = form.elements.requesterRole.value;
   const subject = form.elements.subject.value.trim();
   const messageText = form.elements.message.value.trim();
+  const category = form.elements.category?.value || "account";
+  const priority = form.elements.priority?.value || "normal";
   if (!firstName || !lastName || !phone || !email || !subject || !messageText) {
     return alert("Nom, prénom, téléphone, e-mail, sujet et message sont obligatoires.");
   }
-  const now = new Date().toISOString();
-  const guestId = `guest-${Date.now()}`;
+  const nowDate = new Date();
+  const now = nowDate.toISOString();
+  const guestId = `guest-${nowDate.getTime()}`;
   const userName = `${firstName} ${lastName}`.trim();
+  const dueAt = supportDueAt({ createdAt: now, priority });
   const request = {
-    id: `support-${Date.now()}`,
+    id: `support-${nowDate.getTime()}`,
+    ticketNumber: supportTicketNumberForDate(nowDate),
     userId: guestId,
     userName,
     userRole: requesterRole,
     subject,
+    category,
+    priority,
     message: messageText,
     status: "pending",
     createdAt: now,
     updatedAt: now,
+    dueAt,
     assignedSupport: "",
     lastReplyAt: "",
-    context: {
-      source: "page connexion",
-      requesterRole: roleLabel(requesterRole),
-      userPhone: phone,
-      userEmail: email
-    },
-    readBy: []
+    context: supportIdentityContext({ firstName, lastName, phone, email }),
+    readBy: [],
+    history: []
   };
   const message = {
     id: `support-msg-${Date.now()}`,
@@ -12725,7 +20133,7 @@ function createSupportRequestFromLogin(event) {
   saveSupportRequestToFirestore(request);
   saveSupportMessageToFirestore(request.id, message);
   state.loginAccessRequestOpen = false;
-  state.loginNotice = "Demande envoyée au support.";
+  state.loginNotice = `Demande envoyée au support. Ticket : ${supportTicketNumber(request)}.`;
   renderLogin();
 }
 
@@ -12851,6 +20259,7 @@ async function createAccessCodeFromRequest(request) {
     const parent = {
       id: `parent-${Date.now()}`,
       role: "parent",
+      transportManagerId: request.transportManagerId || transportManagerIdForUser(state.user),
       firstName: request.firstName,
       lastName: request.lastName,
       phone: request.phone,
@@ -12882,6 +20291,7 @@ async function createAccessCodeFromRequest(request) {
       phone: request.phone,
       email: request.email,
       role: request.requestedRole,
+      transportManagerId: request.transportManagerId || transportManagerIdForUser(state.user),
       identifier: createdIdentifier,
       identifierNumber: createdIdentifier,
       username: createdIdentifier,
@@ -12900,7 +20310,7 @@ async function createAccessCodeFromRequest(request) {
       updatedAt: now
     };
     data.users.push(user);
-    const profile = { id, firstName: request.firstName, lastName: request.lastName, phone: request.phone, schoolCircuit: request.circuitNumber || "", schoolName: request.schoolName || "" };
+    const profile = { id, transportManagerId: user.transportManagerId, firstName: request.firstName, lastName: request.lastName, phone: request.phone, schoolCircuit: request.circuitNumber || "", schoolName: request.schoolName || "" };
     if (request.requestedRole === "driver") {
       profile.busNumber = "";
       profile.licensePlate = "";
@@ -12935,12 +20345,12 @@ function accessCodeAlreadyVisibleOrTemporary(code) {
   );
 }
 
-function sendSupportMessage(event) {
+async function sendSupportMessage(event) {
   event.preventDefault();
   const requestId = event.currentTarget.dataset.supportMessageForm;
   const request = data.supportRequests.find((item) => item.id === requestId);
   if (!request) return;
-  if (!isSupport() && request.userId !== state.user.id) return;
+  if (!canManageSupportCenter() && request.userId !== state.user.id) return;
   const text = event.currentTarget.elements.supportMessageText.value.trim();
   if (!text) return;
   const now = new Date().toISOString();
@@ -12957,14 +20367,96 @@ function sendSupportMessage(event) {
   data.supportMessages[requestId].push(message);
   request.updatedAt = now;
   request.lastReplyAt = now;
-  if (isSupport() && request.status === "pending") {
+  if (canManageSupportCenter() && request.status === "pending") {
     request.status = "in_progress";
-    request.assignedSupport = state.user.id;
+    if (isSupport()) request.assignedSupport = state.user.id;
+    addSupportHistoryEntry(request, "Première réponse support, ticket passé en cours");
+  }
+  if (!canManageSupportCenter() && request.status === "waiting_requester") {
+    request.status = "in_progress";
+    addSupportHistoryEntry(request, "Réponse demandeur reçue, ticket repassé en cours");
   }
   request.readBy = [state.user.id];
   saveData();
   saveSupportRequestToFirestore(request);
   saveSupportMessageToFirestore(requestId, message);
+  render();
+}
+
+async function resendSupportEmail(requestId, kind = "request", messageId = "") {
+  if (!canManageSupportCenter()) return alert("Action non autorisée.");
+  if (!requestId) return alert("Ticket support introuvable.");
+  try {
+    const { functions } = await import("./src/firebaseConfig.js");
+    if (!functions) throw new Error("Firebase Functions indisponible.");
+    const { httpsCallable } = await import("firebase/functions");
+    const response = await httpsCallable(functions, "resendSupportEmail")({ requestId, kind, messageId });
+    alert(response.data?.message || "E-mail support renvoyé.");
+  } catch (error) {
+    console.error("Renvoi e-mail support impossible", error);
+    alert(`Renvoi e-mail impossible : ${error?.message || "erreur inconnue"}`);
+  }
+}
+
+function updateSupportMetadata(event) {
+  event.preventDefault();
+  if (!canManageSupportCenter()) return;
+  const requestId = event.currentTarget.dataset.supportMetadataForm;
+  const request = data.supportRequests.find((item) => item.id === requestId);
+  if (!request) return;
+  const form = event.currentTarget;
+  const before = {
+    assignedSupport: request.assignedSupport || "",
+    category: request.category || "technical",
+    priority: request.priority || "normal",
+    dueAt: supportDueAt(request)
+  };
+  request.assignedSupport = form.elements.assignedSupport.value;
+  request.category = form.elements.category.value;
+  request.priority = form.elements.priority.value;
+  request.dueAt = fromDateTimeLocalValue(form.elements.dueAt.value) || supportDueAt(request);
+  request.updatedAt = new Date().toISOString();
+  request.metadataUpdatedAt = request.updatedAt;
+  request.metadataUpdatedBy = state.user.id;
+  const changes = [];
+  if (before.assignedSupport !== request.assignedSupport) changes.push(`assignation : ${supportAssignedLabel(request)}`);
+  if (before.category !== request.category) changes.push(`catégorie : ${supportCategoryLabel(request.category)}`);
+  if (before.priority !== request.priority) changes.push(`priorité : ${supportPriorityLabel(request.priority)}`);
+  if (before.dueAt !== request.dueAt) changes.push(`échéance : ${formatDateTime(request.dueAt)}`);
+  if (changes.length) addSupportHistoryEntry(request, `Suivi mis à jour (${changes.join(", ")})`);
+  request.readBy = [...new Set([...(request.readBy || []), state.user.id])];
+  saveData();
+  saveSupportRequestToFirestore(request);
+  render();
+}
+
+function updateSupportInternalNote(event) {
+  event.preventDefault();
+  if (!canManageSupportCenter()) return;
+  const requestId = event.currentTarget.dataset.supportInternalNoteForm;
+  const request = data.supportRequests.find((item) => item.id === requestId);
+  if (!request) return;
+  request.internalNote = event.currentTarget.elements.internalNote.value.trim();
+  request.internalNoteUpdatedAt = new Date().toISOString();
+  request.internalNoteUpdatedBy = state.user.id;
+  request.updatedAt = request.internalNoteUpdatedAt;
+  addSupportHistoryEntry(request, request.internalNote ? "Note interne mise à jour" : "Note interne vidée");
+  saveData();
+  saveSupportRequestToFirestore(request);
+  render();
+}
+
+function rateSupportRequest(requestId, value) {
+  const request = data.supportRequests.find((item) => item.id === requestId);
+  const rating = Number(value);
+  if (!request || request.userId !== state.user.id || !Number.isFinite(rating)) return;
+  if (!["resolved", "closed"].includes(request.status)) return;
+  request.satisfactionRating = Math.max(1, Math.min(5, rating));
+  request.satisfactionAt = new Date().toISOString();
+  request.updatedAt = request.satisfactionAt;
+  addSupportHistoryEntry(request, `Satisfaction demandeur enregistrée : ${request.satisfactionRating}/5`);
+  saveData();
+  saveSupportRequestToFirestore(request);
   render();
 }
 
@@ -13008,6 +20500,36 @@ function deleteTeamMessage(conversationId, messageId) {
   render();
 }
 
+function deleteDirectConversation(conversationId) {
+  const conversation = data.directMessages.find((item) => item.conversationId === conversationId);
+  if (!canDeleteTransportConversation(conversation)) return;
+  if (!confirm("Supprimer toute cette conversation ?")) return;
+  const deletedConversation = { ...conversation, lastMessage: "", lastMessageAt: "", deletedAt: new Date().toISOString(), deletedById: state.user.id };
+  rememberDeletedDirectConversation(conversationId);
+  upsertDirectConversation(deletedConversation);
+  data.directMessages = (data.directMessages || []).filter((item) => item.conversationId !== conversationId);
+  if (data.directMessageItems) data.directMessageItems[conversationId] = [];
+  if (state.selectedDirectConversationId === conversationId) state.selectedDirectConversationId = "";
+  saveData();
+  deleteDirectConversationFromFirestore(deletedConversation);
+  render();
+}
+
+function deleteTeamConversation(conversationId) {
+  const conversation = teamConversationsForUser("team").find((item) => item.conversationId === conversationId);
+  if (!canDeleteTransportConversation(conversation)) return;
+  if (!confirm("Supprimer toute cette conversation ?")) return;
+  const deletedConversation = { ...conversation, lastMessage: "", lastMessageAt: "", deletedAt: new Date().toISOString(), deletedById: state.user.id };
+  const index = data.teamMessages.findIndex((item) => item.conversationId === conversationId);
+  if (index >= 0) data.teamMessages[index] = deletedConversation;
+  else data.teamMessages.push(deletedConversation);
+  if (data.teamMessageItems) data.teamMessageItems[conversationId] = [];
+  if (state.selectedTeamConversationId === conversationId) state.selectedTeamConversationId = "";
+  saveData();
+  deleteTeamConversationFromFirestore(deletedConversation);
+  render();
+}
+
 function deleteSupportMessage(requestId, messageId) {
   const messages = data.supportMessages?.[requestId] || [];
   const message = messages.find((item) => item.id === messageId);
@@ -13027,12 +20549,15 @@ function deleteSupportMessage(requestId, messageId) {
 }
 
 function updateSupportStatus(requestId, status) {
-  if (!isSupport()) return;
+  if (!canManageSupportCenter()) return;
   const request = data.supportRequests.find((item) => item.id === requestId);
   if (!request) return;
   request.status = status;
   request.updatedAt = new Date().toISOString();
-  request.assignedSupport = state.user.id;
+  if (status === "resolved") request.resolvedAt = request.updatedAt;
+  if (status === "closed") request.closedAt = request.updatedAt;
+  if (isSupport()) request.assignedSupport = state.user.id;
+  addSupportHistoryEntry(request, `Statut modifié : ${supportStatusLabel(status)}`);
   request.readBy = [...new Set([...(request.readBy || []), state.user.id])];
   saveData();
   saveSupportRequestToFirestore(request);
@@ -13040,7 +20565,7 @@ function updateSupportStatus(requestId, status) {
 }
 
 function deleteSupportRequest(requestId) {
-  if (!isSupport()) return;
+  if (!canManageSupportCenter()) return;
   if (!confirm("Supprimer cette demande support ?")) return;
   data.supportRequests = data.supportRequests.filter((request) => request.id !== requestId);
   delete data.supportMessages[requestId];
@@ -13053,9 +20578,15 @@ function deleteSupportRequest(requestId) {
 function markSupportRequestRead(requestId) {
   const request = data.supportRequests.find((item) => item.id === requestId);
   if (!request) return;
-  request.readBy = [...new Set([...(request.readBy || []), state.user.id])];
+  if (!request.readBy?.includes(state.user.id)) {
+    request.readBy = [...new Set([...(request.readBy || []), state.user.id])];
+    markFirestoreDocumentRead(["supportRequests", request.id], request, "support_request");
+  }
   (data.supportMessages[requestId] || []).forEach((message) => {
-    message.readBy = [...new Set([...(message.readBy || []), state.user.id])];
+    if (!message.readBy?.includes(state.user.id)) {
+      message.readBy = [...new Set([...(message.readBy || []), state.user.id])];
+      markFirestoreDocumentRead(["supportRequests", requestId, "messages", message.id], message, "message");
+    }
   });
   saveData();
 }
@@ -13082,6 +20613,7 @@ async function createParentFromForm(event) {
   const parent = {
     id,
     role: "parent",
+    transportManagerId: transportManagerIdForUser(state.user),
     firstName: parentIdentity.firstName,
     lastName: parentIdentity.lastName,
     phone: parentIdentity.phone,
@@ -13112,8 +20644,14 @@ async function createParentFromForm(event) {
 
 function syncParentLinks() {
   data.children.forEach((child) => {
-    const linkedParents = (data.parents || []).filter((parent) => (parent.linkedChildrenIds || []).includes(child.id));
-    child.parentIds = linkedParents.map((parent) => parent.id);
+    const linkedParents = (data.parents || []).filter((parent) =>
+      (parent.linkedChildrenIds || []).includes(child.id)
+      || (child.parentIds || []).includes(parent.id)
+    );
+    child.parentIds = uniqueText([...(child.parentIds || []), ...linkedParents.map((parent) => parent.id)]);
+    linkedParents.forEach((parent) => {
+      parent.linkedChildrenIds = uniqueText([...(parent.linkedChildrenIds || []), child.id]);
+    });
     child.parentAccessCode = "";
   });
 }
@@ -13122,19 +20660,12 @@ async function resetParentCode(event) {
   const parent = data.parents.find((item) => item.id === event.currentTarget.dataset.resetParentCode);
   if (!parent || !isAdmin() || isPrimaryAdmin()) return;
   const temporaryCode = generateUniqueAccessCode();
-  Object.assign(parent, generatedTemporaryAccessData(temporaryCode));
-  parent.temporaryAccessHash = await hashSecret(temporaryCode);
-  parent.accessCodeHash = "";
-  parent.passwordHash = "";
-  parent.recoveryCodeHash = "";
-  parent.recoveryAnswerHash = "";
-  parent.firstLoginCompleted = false;
-  parent.resetRequired = true;
-  parent.updatedAt = new Date().toISOString();
+  const now = new Date().toISOString();
+  await applyTemporaryAccessReset(parent, temporaryCode, now);
   recordSecurityLog(parent, "temporary_code_generated", "success");
   syncParentLinks(parent);
   saveData();
-  saveCollectionItemToFirestore("parents", parent);
+  await saveCollectionItemToFirestore("parents", parent);
   alert(`Accès parent réinitialisé.\nIdentifiant : ${parentStudentIdentifier(parent) || parent.username || parent.lastName}\nCode temporaire : ${temporaryCode}`);
   render();
 }
@@ -13160,12 +20691,18 @@ function deleteParentAccess(event) {
 }
 
 function logout() {
+  const session = currentSession();
+  if (session?.supportAssistance === true) {
+    finishSupportAssistanceSession(session, "ended");
+  }
+  signOutFirebaseAuth();
   localStorage.removeItem(SESSION_KEY);
   localStorage.removeItem(VIEW_STATE_KEY);
   resetViewState();
   state.user = null;
   state.loginMode = "";
-  renderLogin();
+  if (legalPageForCurrentPath()) render();
+  else renderLogin();
 }
 
 function bindSessionActivityTracking() {
@@ -13186,6 +20723,17 @@ window.addEventListener("unhandledrejection", (event) => {
 });
 
 bindSessionActivityTracking();
+bindSwipeNavigation();
 initOfflineMode();
-startFirestoreRealtimeSync();
-render();
+startAppVersionMonitoring();
+startDashboardClock();
+startMaintenanceMonitoring();
+startServiceHealthMonitoring();
+bindFirebaseAuthRealtimeSync();
+
+(async () => {
+  await refreshPublicServiceStatus();
+  await hydrateSessionFromFirebaseAuth();
+  if (state.user) startFirestoreRealtimeSync();
+  render();
+})();

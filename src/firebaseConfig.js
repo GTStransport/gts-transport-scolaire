@@ -1,1 +1,1 @@
-export { app, auth, db, storage } from "./lib/firebase.js";
+export { app, auth, db, storage, functions } from "./lib/firebase.js";

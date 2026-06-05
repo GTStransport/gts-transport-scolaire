@@ -5,19 +5,27 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1",
     "serve": "python3 -m http.server 5173",
     "check": "node --check app.js",
+    "test:rules": "bash scripts/run-firestore-rules-tests.sh",
     "backup": "node scripts/backup-firestore.js",
+    "clean:firestore": "node scripts/clean-firestore-business-data.js",
     "convert:wallonia-addresses": "node scripts/convert-wallonia-addresses.js",
     "convert:tec-stops": "node scripts/convert-gtfs-stops.js",
+    "predeploy": "npm run build",
+    "predeploy:hosting": "npm run build",
     "deploy": "firebase deploy",
     "deploy:hosting": "firebase deploy --only hosting",
+    "deploy:functions": "firebase deploy --only functions",
     "deploy:rules": "firebase deploy --only firestore:rules"
   },
   "dependencies": {
     "firebase": "^12.13.0"
   },
   "devDependencies": {
+    "@firebase/rules-unit-testing": "^5.0.1",
     "vite": "^5.4.11"
   }
 }
