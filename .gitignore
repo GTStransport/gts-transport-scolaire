@@ -9,3 +9,5 @@ data/wallonia_postal_street.csv
 *.log
 firestore-debug.log
 data/Wallonia_postal_street.csv
+test-results/
+playwright-report/

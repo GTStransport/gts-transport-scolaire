@@ -7477,6 +7477,22 @@ body {
     font-size: 0.9rem !important;
   }
 
+  .legal-links-inline {
+    display: grid !important;
+    grid-template-columns: 1fr !important;
+    justify-items: center !important;
+    gap: 8px !important;
+    max-width: 100% !important;
+    font-size: 0.9rem !important;
+    line-height: 1.25 !important;
+    overflow-wrap: anywhere !important;
+    text-align: center !important;
+  }
+
+  .legal-links-inline a {
+    max-width: 100% !important;
+  }
+
   .login-profile-helper,
   .login-profile-helper-text,
   .premium-login-panel .premium-form-divider:first-of-type,
