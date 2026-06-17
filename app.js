@@ -15353,6 +15353,7 @@ function replacementRuleCard(rule, canManage = false) {
 
 function transportGroupView() {
   const tabs = [
+    ...(isTransportManagerUser() ? [["quickAssignments", "Affectation rapide"]] : []),
     ...(isTransportManagerUser() ? [["circuitAssignments", "Affectation circuits"]] : []),
     ["children", "Élèves"],
     ["drivers", "Chauffeurs"],
@@ -15362,9 +15363,9 @@ function transportGroupView() {
     ["circuits", "Circuits"],
     ...((isTransportManagerUser() || isSpwAccount()) ? [["transfers", "Lieux de transfert"]] : [])
   ];
-  const defaultTab = isTransportManagerUser() ? "circuitAssignments" : "children";
+  const defaultTab = isTransportManagerUser() ? "quickAssignments" : "children";
   const tab = tabs.some(([value]) => value === state.transportGroupTab) ? state.transportGroupTab : defaultTab;
-  const body = tab === "children" ? childrenList() : tab === "circuitAssignments" ? circuitAssignmentsView() : tab === "transfers" ? transfersView() : tab === "replacementRules" ? replacementRulesView() : genericListView(tab);
+  const body = tab === "children" ? childrenList() : tab === "quickAssignments" ? quickAssignmentClosedCircuitView() : tab === "circuitAssignments" ? circuitAssignmentsView() : tab === "transfers" ? transfersView() : tab === "replacementRules" ? replacementRulesView() : genericListView(tab);
   const ownerLabel = isSpwAccount() ? "SPW" : "Gestionnaire de transport";
   return `<section class="view-stack">
     <div class="section-title"><p class="eyebrow">${esc(ownerLabel)}</p><h2>Gestion transport</h2></div>
@@ -15373,6 +15374,970 @@ function transportGroupView() {
     </div>
     ${body}
   </section>`;
+}
+
+function quickAssignmentClosedCircuitView() {
+  if (!isTransportManagerUser()) return `<article class="info-card"><p class="muted">Accès réservé au transporteur.</p></article>`;
+  const rows = quickAssignmentClosedCircuitRows();
+  const assignedRows = rows.filter((row) => row.status === "assigned");
+  const unassignedRows = rows.filter((row) => row.status === "unassigned");
+  const excludedRows = rows.filter((row) => row.status === "transfer");
+  const criticalAlertCount = assignedRows.reduce((count, row) => count + row.alerts.filter((alert) => ["missing_driver", "missing_vehicle", "pmr_without_adapted_vehicle"].includes(alert.code)).length, 0);
+  return `<section class="view-stack compact-stack">
+    <div class="section-title action-title">
+      <div><p class="eyebrow">Lecture seule</p><h2>Affectation rapide - circuit fermé</h2></div>
+      <span class="badge ok">Aucune écriture Firestore</span>
+    </div>
+    <article class="info-card">
+      <h3>Résumé circuit fermé</h3>
+      ${quickAssignmentSummaryRows([
+        ["👨 Élèves affectés", assignedRows.length || 0],
+        ["⚠ Élèves non affectés", unassignedRows.length || 0],
+        ["🚨 Alertes à traiter", criticalAlertCount || 0],
+        ["🔄 Hors lot transfert", excludedRows.length || 0]
+      ])}
+      <p class="muted">Cette vue utilise les données transport déjà présentes. Les trajets avec transfert sont exclus de ce lot.</p>
+    </article>
+    ${quickAssignmentCategoryOverview()}
+    ${quickAssignmentCircuitSummary(assignedRows)}
+    <article class="info-card">
+      <h3>Élèves affectés</h3>
+      ${quickAssignmentRowsList(assignedRows, "Aucun élève affecté en circuit fermé.")}
+    </article>
+    <article class="info-card">
+      <h3>Élèves non affectés ou incomplets</h3>
+      ${quickAssignmentRowsList(unassignedRows, "Aucun élève non affecté pour ce périmètre.")}
+    </article>
+    ${excludedRows.length ? `<article class="info-card">
+      <h3>Hors lot transfert</h3>
+      <p class="muted">${esc(excludedRows.length)} élève${excludedRows.length > 1 ? "s" : ""} avec transfert détecté${excludedRows.length > 1 ? "s" : ""}. Non traité dans ce lot.</p>
+    </article>` : ""}
+    ${quickAssignmentDoorToDoorView()}
+    ${quickAssignmentTransferView()}
+  </section>`;
+}
+
+function quickAssignmentSummaryRows(rows) {
+  return rows.map(([label, value]) => {
+    const numberValue = Number(value);
+    const displayedValue = Number.isFinite(numberValue) ? numberValue : 0;
+    return `<div class="field-row"><span>${esc(label)}</span><strong>${esc(displayedValue)}</strong></div>`;
+  }).join("");
+}
+
+function quickAssignmentCategoryOverview() {
+  const rows = quickAssignmentCategoryRows();
+  const circuitRows = rows.filter((row) => row.transportType === "circuit_ferme");
+  const transferRows = rows.filter((row) => row.transportType === "avec_transfert");
+  const doorRows = rows.filter((row) => row.transportType === "porte_a_porte");
+  const pmrRows = rows.filter((row) => row.isPmr);
+  const nonPmrRows = rows.filter((row) => !row.isPmr);
+  const assignedRows = rows.filter((row) => row.isAssigned);
+  const unassignedRows = rows.filter((row) => !row.isAssigned);
+  const alertRows = rows.filter((row) => row.hasAlert);
+  const alternatingRows = rows.filter((row) => row.hasAlternatingResidence);
+  return `<article class="info-card">
+    <h3>Filtres rapides</h3>
+    <div class="quick-list-inner">
+      ${[
+        ["Tous", rows.length],
+        ["Circuit fermé", circuitRows.length],
+        ["Avec transfert", transferRows.length],
+        ["Porte-à-porte", doorRows.length],
+        ["PMR", pmrRows.length],
+        ["Non PMR", nonPmrRows.length],
+        ["Élèves affectés", assignedRows.length],
+        ["Élèves non affectés", unassignedRows.length],
+        ["Alertes", alertRows.length],
+        ["Garde alternée", alternatingRows.length]
+      ].map(([label, count]) => `<div class="child-row"><span>${esc(label)}</span><b class="badge">${esc(count || 0)}</b></div>`).join("")}
+    </div>
+    <p class="muted">PMR est un besoin spécifique. Porte-à-porte, circuit fermé et avec transfert restent les types de trajet.</p>
+  </article>
+  <article class="info-card">
+    <h3>Ciblage métier</h3>
+    ${quickAssignmentSummaryRows([
+      ["Porte-à-porte PMR", doorRows.filter((row) => row.isPmr).length || 0],
+      ["Porte-à-porte non PMR", doorRows.filter((row) => !row.isPmr).length || 0],
+      ["Avec transfert PMR", transferRows.filter((row) => row.isPmr).length || 0],
+      ["Avec transfert non PMR", transferRows.filter((row) => !row.isPmr).length || 0],
+      ["Circuit fermé PMR", circuitRows.filter((row) => row.isPmr).length || 0],
+      ["Circuit fermé non PMR", circuitRows.filter((row) => !row.isPmr).length || 0]
+    ])}
+  </article>`;
+}
+
+function quickAssignmentCategoryRows() {
+  const context = quickAssignmentTransportContext();
+  return scopeRecordsForCurrentTransportManager("children", data.children || []).map((child) => {
+    const view = transportViewForChild(child, context);
+    const isPmr = transportViewIsPmrChild(child);
+    const transportType = quickAssignmentTransportTypeForChild(child, view);
+    const hasAlternatingResidence = normalizeAlternatingResidence(child).enabled === true;
+    const isAssigned = view.source !== "unassigned" && (
+      (view.transport.circuitIds || []).length > 0 ||
+      (view.transport.vehicleIds || []).length > 0 ||
+      quickAssignmentReadableValue(activePickupStopForChild(child), "") ||
+      quickAssignmentDoorToDoorHomeLabel(child)
+    );
+    const hasAlert = view.alerts.some((alert) => alert.level !== "info")
+      || !isAssigned
+      || (isPmr && (view.transport.vehicleIds || []).length === 0);
+    return { child, view, transportType, isPmr, isAssigned, hasAlert, hasAlternatingResidence };
+  });
+}
+
+function quickAssignmentTransportContext() {
+  return {
+    direction: "morning",
+    transportManagerId: transportManagerIdForUser(state.user),
+    studentAssignments: data.studentAssignments || [],
+    stopPassages: data.stopPassages || [],
+    tripSegments: data.tripSegments || [],
+    vehicles: scopeRecordsForCurrentTransportManager("vehicles", data.vehicles || []),
+    drivers: scopeRecordsForCurrentTransportManager("drivers", data.drivers || []),
+    assistants: scopeRecordsForCurrentTransportManager("assistants", data.assistants || [])
+  };
+}
+
+function quickAssignmentTransportTypeForChild(child, view) {
+  const explicit = child.transportType || child.transportMode || child.routeType || view.summary.transportType;
+  if (explicit === "porte_a_porte") return "porte_a_porte";
+  if (explicit === "avec_transfert" || childHasTransfer(child) || view.route.hasTransfer) return "avec_transfert";
+  if (explicit === "circuit_ferme") return "circuit_ferme";
+  if (quickAssignmentDoorToDoorHomeLabel(child) && !quickAssignmentReadableValue(activePickupStopForChild(child), "")) return "porte_a_porte";
+  return "circuit_ferme";
+}
+
+function quickAssignmentDoorToDoorView() {
+  const rows = quickAssignmentDoorToDoorRows();
+  const assignedRows = rows.filter((row) => row.status === "assigned");
+  const unassignedRows = rows.filter((row) => row.status === "unassigned");
+  const pmrRows = rows.filter((row) => row.isPmr);
+  const nonPmrRows = rows.filter((row) => !row.isPmr);
+  const adaptedVehicleCount = scopeRecordsForCurrentTransportManager("vehicles", data.vehicles || []).filter(transportViewIsAdaptedVehicle).length;
+  const capacityAlerts = quickAssignmentDoorToDoorCapacityAlerts(rows);
+  const alertCount = rows.reduce((count, row) => count + row.alerts.filter((alert) => alert.level !== "info").length, 0) + capacityAlerts.length;
+  return `<section class="view-stack compact-stack">
+    <div class="section-title action-title">
+      <div><p class="eyebrow">Porte-à-porte</p><h2>Domicile - école</h2></div>
+      <span class="badge ok">Lecture seule</span>
+    </div>
+    <article class="info-card">
+      <h3>Résumé porte-à-porte</h3>
+      ${quickAssignmentSummaryRows([
+        ["🏠 Élèves porte-à-porte", rows.length || 0],
+        ["♿ Sous-cas PMR", pmrRows.length || 0],
+        ["👨 Non PMR", nonPmrRows.length || 0],
+        ["🚐 Véhicules adaptés", adaptedVehicleCount || 0],
+        ["🧑‍🦽 Fauteuils roulants", pmrRows.filter((row) => row.wheelchairRequired).length || 0],
+        ["🚨 Alertes", alertCount || 0]
+      ])}
+    </article>
+    <article class="info-card">
+      <h3>Alertes porte-à-porte</h3>
+      ${quickAssignmentDoorToDoorAlertsList(rows, capacityAlerts)}
+    </article>
+    ${quickAssignmentDoorToDoorVehicleSummary(rows, capacityAlerts)}
+    <article class="info-card">
+      <h3>Élèves porte-à-porte affectés</h3>
+      ${quickAssignmentDoorToDoorRowsList(assignedRows, "Aucun élève porte-à-porte affecté.")}
+    </article>
+    <article class="info-card">
+      <h3>Élèves porte-à-porte non affectés</h3>
+      ${quickAssignmentDoorToDoorRowsList(unassignedRows, "Aucun élève porte-à-porte non affecté.")}
+    </article>
+    <article class="info-card">
+      <h3>Sous-cas PMR</h3>
+      ${quickAssignmentDoorToDoorRowsList(pmrRows, "Aucun élève porte-à-porte PMR.")}
+    </article>
+    <article class="info-card">
+      <h3>Sous-cas non PMR</h3>
+      ${quickAssignmentDoorToDoorRowsList(nonPmrRows, "Aucun élève porte-à-porte non PMR.")}
+    </article>
+  </section>`;
+}
+
+function quickAssignmentDoorToDoorRows() {
+  const context = quickAssignmentTransportContext();
+  return scopeRecordsForCurrentTransportManager("children", data.children || [])
+    .map((child) => quickAssignmentDoorToDoorRow(child, context))
+    .filter((row) => row.transportType === "porte_a_porte")
+    .slice()
+    .sort((a, b) => fullName(a.child).localeCompare(fullName(b.child), "fr", { sensitivity: "base" }));
+}
+
+function quickAssignmentDoorToDoorRow(child, context) {
+  const view = transportViewForChild(child, context);
+  const transportType = quickAssignmentTransportTypeForChild(child, view);
+  const isPmr = transportViewIsPmrChild(child);
+  const homeLabel = quickAssignmentDoorToDoorHomeLabel(child);
+  const schoolLabel = quickAssignmentSchoolLabel(child, view);
+  const vehicleIds = uniqueText(view.transport.vehicleIds || []);
+  const vehicleLabels = quickAssignmentVehicleLabels(view, context.vehicles);
+  const driverLabels = quickAssignmentDriverLabels(view, context.drivers);
+  const assistantLabels = quickAssignmentAssistantLabels(view, context.assistants);
+  const wheelchairRequired = quickAssignmentPmrWheelchairRequired(child);
+  const alerts = quickAssignmentDoorToDoorRelevantAlerts(view, { homeLabel, schoolLabel, vehicleIds, driverLabels, isPmr });
+  const hasAdaptedVehicle = vehicleIds
+    .map((id) => context.vehicles.find((vehicle) => vehicle.id === id))
+    .filter(Boolean)
+    .some(transportViewIsAdaptedVehicle);
+  if (isPmr && vehicleIds.length > 0 && !hasAdaptedVehicle) {
+    alerts.push(transportViewAlert("pmr_without_adapted_vehicle", "warning", "Élève PMR sans véhicule adapté."));
+  }
+  const status = homeLabel && schoolLabel && vehicleIds.length > 0 && (!isPmr || hasAdaptedVehicle) ? "assigned" : "unassigned";
+  return {
+    child,
+    view,
+    transportType,
+    isPmr,
+    status,
+    homeLabel,
+    schoolLabel,
+    pmrType: quickAssignmentPmrType(child),
+    wheelchairRequired,
+    pickupTime: quickAssignmentPickupTime(child, view),
+    vehicleIds,
+    vehicleLabels,
+    driverLabels,
+    assistantLabels,
+    alerts
+  };
+}
+
+function quickAssignmentDoorToDoorRelevantAlerts(view, row) {
+  const alerts = [...(view.alerts || [])].filter((alert) => [
+    "missing_transport_assignment",
+    "missing_driver",
+    "missing_vehicle",
+    "pmr_without_adapted_vehicle",
+    "legacy_fallback_used"
+  ].includes(alert.code));
+  if (!row.homeLabel) alerts.push(transportViewAlert("missing_home_address", "warning", "Domicile manquant."));
+  if (!row.schoolLabel) alerts.push(transportViewAlert("missing_school", "warning", "École manquante."));
+  if (!row.vehicleIds.length) alerts.push(transportViewAlert("missing_vehicle", "warning", row.isPmr ? "Véhicule adapté manquant." : "Véhicule manquant."));
+  if (!row.driverLabels.length) alerts.push(transportViewAlert("missing_driver", "warning", "Chauffeur manquant."));
+  return alerts;
+}
+
+function quickAssignmentDoorToDoorHomeLabel(child) {
+  return quickAssignmentReadableValue([
+    child.homeAddress,
+    [child.streetName || child.street, child.streetNumber || child.houseNumber].filter(Boolean).join(" "),
+    child.postalCode,
+    child.city
+  ].filter(Boolean).join(", "), "");
+}
+
+function quickAssignmentPmrType(child) {
+  return quickAssignmentReadableValue(child.medicalDisabilityType || child.disabilityType || child.disability || child.mobilityHelp || "PMR", "PMR");
+}
+
+function quickAssignmentPmrWheelchairRequired(child) {
+  return child.wheelchairRequired === true
+    || child.hasWheelchair === true
+    || String(child.mobilityHelp || "").toLowerCase().includes("fauteuil")
+    || String(child.disability || "").toLowerCase().includes("fauteuil");
+}
+
+function quickAssignmentPickupTime(child, view) {
+  return quickAssignmentReadableValue(view.summary.pickupTime || childMorningPassageTime(child) || child.pickupTime || "", "Aucune");
+}
+
+function quickAssignmentDoorToDoorCapacityAlerts(rows) {
+  const grouped = new Map();
+  rows.filter((row) => row.isPmr).forEach((row) => {
+    row.vehicleIds.forEach((vehicleId) => {
+      const vehicle = scopeRecordsForCurrentTransportManager("vehicles", data.vehicles || []).find((item) => item.id === vehicleId);
+      if (!vehicle) return;
+      const current = grouped.get(vehicleId) || { vehicle, students: 0, wheelchairs: 0 };
+      current.students += 1;
+      if (row.wheelchairRequired) current.wheelchairs += 1;
+      grouped.set(vehicleId, current);
+    });
+  });
+  return [...grouped.values()]
+    .filter((item) => Number(item.vehicle.wheelchairPlaces || 0) > 0 && item.wheelchairs > Number(item.vehicle.wheelchairPlaces || 0))
+    .map((item) => ({
+      code: "pmr_wheelchair_capacity_exceeded",
+      level: "warning",
+      message: `${quickAssignmentVehicleLabel([item.vehicle], item.vehicle.id)} : ${item.wheelchairs}/${Number(item.vehicle.wheelchairPlaces || 0)} fauteuils`
+    }));
+}
+
+function quickAssignmentDoorToDoorAlertsList(rows, capacityAlerts) {
+  const alerts = rows.flatMap((row) => row.alerts.filter((alert) => alert.level !== "info").map((alert) => ({
+    ...alert,
+    studentName: fullName(row.child)
+  }))).concat(capacityAlerts.map((alert) => ({ ...alert, studentName: "Capacité véhicule" })));
+  return `<div class="quick-list-inner">
+    ${alerts.map((alert) => `<div class="child-row">
+      <span>${esc(quickAssignmentReadableValue(alert.studentName, "Aucun élève"))}</span>
+      <small>${esc(alert.message || quickAssignmentDoorToDoorAlertLabel(alert.code))}</small>
+      ${quickAssignmentAlertBadges([alert])}
+    </div>`).join("") || `<p class="muted">Aucune alerte porte-à-porte.</p>`}
+  </div>`;
+}
+
+function quickAssignmentDoorToDoorVehicleSummary(rows, capacityAlerts) {
+  const capacityByVehicle = new Map(capacityAlerts.map((alert) => [String(alert.message || "").split(" : ")[0], alert]));
+  const grouped = new Map();
+  rows.forEach((row) => {
+    const key = row.vehicleLabels[0] || "Aucun véhicule";
+    const current = grouped.get(key) || { label: key, students: 0, wheelchairs: 0, alerts: 0, drivers: new Set(), assistants: new Set(), capacity: "Aucune" };
+    current.students += 1;
+    if (row.wheelchairRequired) current.wheelchairs += 1;
+    current.alerts += row.alerts.filter((alert) => alert.level !== "info").length;
+    row.driverLabels.forEach((label) => current.drivers.add(label));
+    row.assistantLabels.forEach((label) => current.assistants.add(label));
+    const vehicle = row.vehicleIds.map((id) => scopeRecordsForCurrentTransportManager("vehicles", data.vehicles || []).find((item) => item.id === id)).find(Boolean);
+    if (vehicle && Number.isFinite(Number(vehicle.wheelchairPlaces))) current.capacity = String(Number(vehicle.wheelchairPlaces));
+    grouped.set(key, current);
+  });
+  const cards = [...grouped.values()].sort((a, b) => a.label.localeCompare(b.label, "fr", { numeric: true }));
+  return `<article class="info-card">
+    <h3>Véhicules / tournées porte-à-porte (${esc(cards.length || 0)})</h3>
+    <div class="quick-list-inner">
+      ${cards.map((item) => {
+        const capacityAlert = capacityByVehicle.has(item.label);
+        const hasAlert = item.alerts > 0 || capacityAlert;
+        return `<div class="child-row">
+          <span>${esc(quickAssignmentReadableValue(item.label, "Aucun véhicule"))}</span>
+          <small>${esc([
+            `👨 ${item.students || 0} élève${item.students > 1 ? "s" : ""}`,
+            `🧑‍🦽 ${item.wheelchairs || 0}/${quickAssignmentReadableValue(item.capacity, "Aucune")} fauteuils`,
+            `👨 ${quickAssignmentReadableValue([...item.drivers].join(", "), "Aucun chauffeur")}`,
+            `👩 ${quickAssignmentReadableValue([...item.assistants].join(", "), "Aucune convoyeuse")}`
+          ].join(" · "))}</small>
+          ${hasAlert ? `<b class="badge warning">ALERTE</b>` : `<b class="badge ok">COMPLET</b>`}
+        </div>`;
+      }).join("") || `<p class="muted">Aucune tournée porte-à-porte.</p>`}
+    </div>
+  </article>`;
+}
+
+function quickAssignmentDoorToDoorRowsList(rows, emptyLabel) {
+  return `<div class="quick-list-inner">
+    ${rows.map(quickAssignmentDoorToDoorStudentRow).join("") || `<p class="muted">${esc(emptyLabel)}</p>`}
+  </div>`;
+}
+
+function quickAssignmentDoorToDoorStudentRow(row) {
+  const issueCount = row.alerts.filter((alert) => alert.level !== "info").length;
+  return `<button class="child-row" type="button" data-open-child="${esc(row.child.id)}">
+    <span>${esc(quickAssignmentReadableValue(fullName(row.child), "Élève sans nom"))}</span>
+    <small>${esc(`📍 Domicile : ${quickAssignmentReadableValue(row.homeLabel)}`)}<br>
+      ${esc(`⏱ Heure de prise en charge : ${quickAssignmentReadableValue(row.pickupTime, "Aucune")}`)}<br>
+      ${esc(`🏫 École : ${quickAssignmentReadableValue(row.schoolLabel, "Aucune")}`)}<br>
+      ${esc(`♿ Besoin spécifique : ${row.isPmr ? quickAssignmentReadableValue(row.pmrType, "PMR") : "Aucun"}`)}<br>
+      ${esc(`♿ Besoin PMR : ${row.isPmr ? "Oui" : "Non"}`)}<br>
+      ${esc(`🧑‍🦽 Fauteuil roulant : ${row.wheelchairRequired ? "Oui" : "Non"}`)}<br>
+      ${esc(`🚐 Véhicule : ${quickAssignmentReadableValue(row.vehicleLabels.join(", "))}`)}<br>
+      ${esc(`👨 Chauffeur : ${quickAssignmentReadableValue(row.driverLabels.join(", "))}`)}<br>
+      ${esc(`👩 Convoyeuse : ${quickAssignmentReadableValue(row.assistantLabels.join(", "), "Aucune")}`)}</small>
+    <b class="badge">${esc(row.isPmr ? "PMR" : "NON PMR")}</b>
+    ${issueCount ? `<b class="badge warning">${esc(issueCount)} point${issueCount > 1 ? "s" : ""}</b>` : `<b class="badge ok">COMPLET</b>`}
+    ${quickAssignmentAlertBadges(row.alerts)}
+  </button>`;
+}
+
+function quickAssignmentDoorToDoorAlertLabel(code = "") {
+  const labels = {
+    missing_transport_assignment: "Élève porte-à-porte sans affectation.",
+    missing_vehicle: "Véhicule manquant.",
+    missing_driver: "Chauffeur manquant.",
+    missing_home_address: "Domicile manquant.",
+    missing_school: "École manquante.",
+    pmr_without_adapted_vehicle: "PMR sans véhicule adapté.",
+    pmr_wheelchair_capacity_exceeded: "Capacité fauteuil dépassée."
+  };
+  return labels[code] || code || "Alerte PMR";
+}
+
+function quickAssignmentTransferView() {
+  const rows = quickAssignmentTransferRows();
+  const changedRows = rows.filter((row) => row.changesBus);
+  const sameBusRows = rows.filter((row) => !row.changesBus);
+  const alternatingRows = rows.filter((row) => row.alternatingResidenceActive);
+  const pmrRows = rows.filter((row) => row.isPmr);
+  const alerts = rows.flatMap((row) => row.alerts.filter((alert) => alert.level !== "info").map((alert) => ({ ...alert, studentName: fullName(row.child), hubLabel: row.hubLabel })));
+  return `<section class="view-stack compact-stack">
+    <div class="section-title action-title">
+      <div><p class="eyebrow">Avec transfert</p><h2>Transferts détectés</h2></div>
+      <span class="badge ok">Lecture seule</span>
+    </div>
+    <article class="info-card">
+      <h3>Résumé transfert</h3>
+      ${quickAssignmentSummaryRows([
+        ["🔄 Hubs détectés", quickAssignmentTransferHubGroups(rows).length || 0],
+        ["👨 Élèves avec transfert", rows.length || 0],
+        ["🚌 Cars entrants", quickAssignmentTransferIncomingGroups(rows).length || 0],
+        ["🚌 Cars sortants", quickAssignmentTransferOutgoingGroups(rows).length || 0],
+        ["🔁 Élèves qui changent de car", changedRows.length || 0],
+        ["➡ Élèves qui restent dans le même car", sameBusRows.length || 0],
+        ["📅 Garde alternée active", alternatingRows.length || 0],
+        ["♿ PMR avec transfert", pmrRows.length || 0],
+        ["🚨 Alertes transfert", alerts.length || 0]
+      ])}
+    </article>
+    <article class="info-card">
+      <h3>Alertes critiques</h3>
+      ${quickAssignmentTransferAlertsList(alerts)}
+    </article>
+    ${quickAssignmentTransferHubSummary(rows)}
+    ${quickAssignmentTransferSegmentSummary("Cars entrants", quickAssignmentTransferIncomingGroups(rows), "entrant")}
+    ${quickAssignmentTransferSegmentSummary("Cars sortants", quickAssignmentTransferOutgoingGroups(rows), "sortant")}
+    <article class="info-card">
+      <h3>Élèves qui changent de car</h3>
+      ${quickAssignmentTransferRowsList(changedRows, "Aucun changement de car détecté.")}
+    </article>
+    <article class="info-card">
+      <h3>Élèves qui restent dans le même car</h3>
+      ${quickAssignmentTransferRowsList(sameBusRows, "Aucun élève en maintien dans le même car.")}
+    </article>
+    <article class="info-card">
+      <h3>Garde alternée</h3>
+      ${quickAssignmentTransferRowsList(alternatingRows, "Aucun élève en garde alternée avec transfert.")}
+    </article>
+    <article class="info-card">
+      <h3>PMR avec transfert</h3>
+      ${quickAssignmentTransferRowsList(pmrRows, "Aucun élève PMR avec transfert.")}
+    </article>
+  </section>`;
+}
+
+function quickAssignmentTransferRows() {
+  const context = {
+    direction: "morning",
+    transportManagerId: transportManagerIdForUser(state.user),
+    studentAssignments: data.studentAssignments || [],
+    stopPassages: data.stopPassages || [],
+    tripSegments: data.tripSegments || [],
+    vehicles: scopeRecordsForCurrentTransportManager("vehicles", data.vehicles || []),
+    drivers: scopeRecordsForCurrentTransportManager("drivers", data.drivers || []),
+    assistants: scopeRecordsForCurrentTransportManager("assistants", data.assistants || [])
+  };
+  return scopeRecordsForCurrentTransportManager("children", data.children || [])
+    .map((child) => quickAssignmentTransferRow(child, context))
+    .filter((row) => row.hasTransfer)
+    .sort((a, b) => a.hubLabel.localeCompare(b.hubLabel, "fr", { sensitivity: "base" }) || fullName(a.child).localeCompare(fullName(b.child), "fr", { sensitivity: "base" }));
+}
+
+function quickAssignmentTransferRow(child, context) {
+  const view = transportViewForChild(child, context);
+  const hasTransfer = childHasTransfer(child) || view.route.hasTransfer || view.summary.transportType === "avec_transfert";
+  const hubLabel = quickAssignmentTransferHubLabel(child, view);
+  const incomingCircuitLabels = quickAssignmentTransferIncomingCircuits(child, view);
+  const outgoingCircuitLabels = quickAssignmentTransferOutgoingCircuits(child, view);
+  const incomingDriverLabels = quickAssignmentTransferIncomingDrivers(child, view, context.drivers);
+  const outgoingDriverLabels = quickAssignmentTransferOutgoingDrivers(child, view, context.drivers);
+  const incomingAssistantLabels = quickAssignmentTransferIncomingAssistants(child, view, context.assistants);
+  const outgoingAssistantLabels = quickAssignmentTransferOutgoingAssistants(child, view, context.assistants);
+  const incomingVehicleLabels = quickAssignmentTransferIncomingVehicles(child, view, context.vehicles);
+  const outgoingVehicleLabels = quickAssignmentTransferOutgoingVehicles(child, view, context.vehicles);
+  const changesBus = child.changesBusAtTransfer === true || child.staysInSameBus === false || quickAssignmentTransferVehicleChanged(incomingVehicleLabels, outgoingVehicleLabels);
+  const activePickupStop = quickAssignmentReadableValue(activePickupStopForChild(child), "");
+  const schoolLabel = quickAssignmentSchoolLabel(child, view);
+  const alerts = quickAssignmentTransferAlerts({
+    child,
+    view,
+    hubLabel,
+    activePickupStop,
+    schoolLabel,
+    incomingCircuitLabels,
+    outgoingCircuitLabels,
+    incomingDriverLabels,
+    outgoingDriverLabels,
+    incomingAssistantLabels,
+    outgoingAssistantLabels,
+    incomingVehicleLabels,
+    outgoingVehicleLabels,
+    changesBus
+  });
+  return {
+    child,
+    view,
+    hasTransfer,
+    hubLabel,
+    activePickupStop,
+    schoolLabel,
+    changesBus,
+    incomingCircuitLabels,
+    outgoingCircuitLabels,
+    incomingDriverLabels,
+    outgoingDriverLabels,
+    incomingAssistantLabels,
+    outgoingAssistantLabels,
+    incomingVehicleLabels,
+    outgoingVehicleLabels,
+    arrivalTime: quickAssignmentTransferArrivalTime(child, view),
+    departureTime: quickAssignmentTransferDepartureTime(child, view),
+    alternatingResidenceActive: normalizeAlternatingResidence(child).enabled === true,
+    activeResidence: activeResidenceForChild(child),
+    isPmr: transportViewIsPmrChild(child),
+    wheelchairRequired: quickAssignmentPmrWheelchairRequired(child),
+    alerts
+  };
+}
+
+function quickAssignmentTransferHubLabel(child, view) {
+  const label = view.summary.transferLabel || transferNameForChild(child);
+  const cleaned = quickAssignmentReadableValue(label, "");
+  if (!cleaned || cleaned.toLowerCase().includes("transfert non")) return "Aucun hub";
+  return cleaned;
+}
+
+function quickAssignmentTransferIncomingCircuits(child, view) {
+  return uniqueText([
+    quickAssignmentCircuitLabel(child.pickupCircuitId),
+    quickAssignmentCircuitLabel(child.circuitNumber),
+    ...(view.summary.circuitLabels || []).map(quickAssignmentCircuitLabel)
+  ].filter(Boolean));
+}
+
+function quickAssignmentTransferOutgoingCircuits(child, view) {
+  return uniqueText([
+    quickAssignmentCircuitLabel(child.transferSchoolCircuitId),
+    quickAssignmentCircuitLabel(child.transferCircuitId),
+    quickAssignmentCircuitLabel(child.schoolCircuitId),
+    ...(view.summary.circuitLabels || []).map(quickAssignmentCircuitLabel)
+  ].filter(Boolean));
+}
+
+function quickAssignmentTransferIncomingDrivers(child, view, drivers = []) {
+  return uniqueText([
+    ...driverIdsFromRecord(child).filter((id) => id !== child.transferDriverId).map((id) => quickAssignmentPersonLabel(drivers, id)),
+    ...(view.summary.driverLabels || []).filter((label) => label !== child.transferDriverId)
+  ].map((label) => quickAssignmentReadableValue(label, "")).filter(Boolean));
+}
+
+function quickAssignmentTransferOutgoingDrivers(child, view, drivers = []) {
+  const labels = child.transferDriverId ? [quickAssignmentPersonLabel(drivers, child.transferDriverId)] : [];
+  return uniqueText(labels.concat(view.summary.driverLabels || []).map((label) => quickAssignmentReadableValue(label, "")).filter(Boolean));
+}
+
+function quickAssignmentTransferIncomingAssistants(child, view, assistants = []) {
+  return uniqueText([
+    quickAssignmentPersonLabel(assistants, child.assistantId),
+    ...(view.summary.assistantLabels || [])
+  ].map((label) => quickAssignmentReadableValue(label, "")).filter(Boolean));
+}
+
+function quickAssignmentTransferOutgoingAssistants(child, view, assistants = []) {
+  const labels = child.transferAssistantId ? [quickAssignmentPersonLabel(assistants, child.transferAssistantId)] : [];
+  return uniqueText(labels.concat(view.summary.assistantLabels || []).map((label) => quickAssignmentReadableValue(label, "")).filter(Boolean));
+}
+
+function quickAssignmentVehicleLabelByRef(ref, vehicles = []) {
+  const vehicle = Array.isArray(vehicles) ? vehicles.find((item) =>
+    item?.id === ref ||
+    item?.busNumber === ref ||
+    item?.licensePlate === ref
+  ) : null;
+  if (vehicle) return quickAssignmentVehicleLabel(vehicles, vehicle.id);
+  return quickAssignmentReadableValue(ref, "");
+}
+
+function quickAssignmentTransferIncomingVehicles(child, view, vehicles = []) {
+  return uniqueText([
+    quickAssignmentVehicleLabelByRef(child.vehicleId, vehicles),
+    ...(view.summary.vehicleLabels || [])
+  ].map((label) => quickAssignmentReadableValue(label, "")).filter(Boolean));
+}
+
+function quickAssignmentTransferOutgoingVehicles(child, view, vehicles = []) {
+  const labels = child.transferVehicleId ? [quickAssignmentVehicleLabelByRef(child.transferVehicleId, vehicles)] : [];
+  return uniqueText(labels.concat(view.summary.vehicleLabels || []).map((label) => quickAssignmentReadableValue(label, "")).filter(Boolean));
+}
+
+function quickAssignmentTransferVehicleChanged(incomingVehicleLabels = [], outgoingVehicleLabels = []) {
+  if (!incomingVehicleLabels.length || !outgoingVehicleLabels.length) return false;
+  return incomingVehicleLabels[0] !== outgoingVehicleLabels[0];
+}
+
+function quickAssignmentTransferArrivalTime(child, view) {
+  return quickAssignmentReadableValue(view.summary.pickupTime || child.transferArrivalTime || child.transferTime || "", "Aucune");
+}
+
+function quickAssignmentTransferDepartureTime(child, view) {
+  return quickAssignmentReadableValue(view.summary.dropoffTime || child.transferDepartureTime || child.transferTime || "", "Aucune");
+}
+
+function quickAssignmentTransferAlerts(row) {
+  const alerts = [...(row.view.alerts || [])].filter((alert) => [
+    "missing_transport_assignment",
+    "missing_driver",
+    "missing_vehicle",
+    "pmr_without_adapted_vehicle",
+    "legacy_fallback_used"
+  ].includes(alert.code));
+  if (!row.hubLabel || row.hubLabel === "Aucun hub") alerts.push(transportViewAlert("missing_transfer_hub", "critical", "Hub de transfert manquant."));
+  if (!row.activePickupStop) alerts.push(transportViewAlert("missing_pickup", "warning", "Arrêt actif manquant."));
+  if (!row.incomingCircuitLabels.length) alerts.push(transportViewAlert("missing_incoming_circuit", "critical", "Car entrant manquant."));
+  if (!row.outgoingCircuitLabels.length) alerts.push(transportViewAlert("missing_outgoing_circuit", "critical", "Car sortant manquant."));
+  if (!row.incomingDriverLabels.length) alerts.push(transportViewAlert("missing_incoming_driver", "warning", "Chauffeur entrant manquant."));
+  if (!row.outgoingDriverLabels.length) alerts.push(transportViewAlert("missing_outgoing_driver", "warning", "Chauffeur sortant manquant."));
+  if (!row.incomingVehicleLabels.length) alerts.push(transportViewAlert("missing_incoming_vehicle", "warning", "Véhicule entrant manquant."));
+  if (!row.outgoingVehicleLabels.length) alerts.push(transportViewAlert("missing_outgoing_vehicle", "warning", "Véhicule sortant manquant."));
+  if (row.child && transportViewIsPmrChild(row.child)) {
+    const vehicleRefs = uniqueText([row.child.vehicleId, row.child.transferVehicleId].filter(Boolean));
+    const linkedVehicles = vehicleRefs.map((ref) => vehicleByRef(ref)).filter(Boolean);
+    if (linkedVehicles.length && !linkedVehicles.every(transportViewIsAdaptedVehicle)) {
+      alerts.push(transportViewAlert("pmr_without_adapted_vehicle", "warning", "PMR avec transfert sans véhicule adapté sur tout le trajet."));
+    }
+    if (row.changesBus && !row.outgoingAssistantLabels.length) {
+      alerts.push(transportViewAlert("pmr_transfer_without_assistant", "warning", "PMR avec changement de car sans convoyeuse sortante."));
+    }
+  }
+  if (normalizeAlternatingResidence(row.child).enabled === true && !row.activePickupStop) {
+    alerts.push(transportViewAlert("alternating_transfer_missing_pickup", "warning", "Garde alternée sans arrêt actif."));
+  }
+  return alerts;
+}
+
+function quickAssignmentTransferHubGroups(rows = []) {
+  const grouped = new Map();
+  rows.forEach((row) => {
+    const key = row.hubLabel || "Aucun hub";
+    const current = grouped.get(key) || { label: key, students: 0, changed: 0, same: 0, pmr: 0, alerts: 0, incoming: new Set(), outgoing: new Set() };
+    current.students += 1;
+    if (row.changesBus) current.changed += 1;
+    else current.same += 1;
+    if (row.isPmr) current.pmr += 1;
+    current.alerts += row.alerts.filter((alert) => alert.level !== "info").length;
+    row.incomingCircuitLabels.forEach((label) => current.incoming.add(label));
+    row.outgoingCircuitLabels.forEach((label) => current.outgoing.add(label));
+    grouped.set(key, current);
+  });
+  return [...grouped.values()].sort((a, b) => a.label.localeCompare(b.label, "fr", { numeric: true }));
+}
+
+function quickAssignmentTransferIncomingGroups(rows = []) {
+  return quickAssignmentTransferSegmentGroups(rows, "incomingCircuitLabels", "incomingDriverLabels", "incomingAssistantLabels", "incomingVehicleLabels");
+}
+
+function quickAssignmentTransferOutgoingGroups(rows = []) {
+  return quickAssignmentTransferSegmentGroups(rows, "outgoingCircuitLabels", "outgoingDriverLabels", "outgoingAssistantLabels", "outgoingVehicleLabels");
+}
+
+function quickAssignmentTransferSegmentGroups(rows = [], circuitKey, driverKey, assistantKey, vehicleKey) {
+  const grouped = new Map();
+  rows.forEach((row) => {
+    const key = row[circuitKey][0] || "Aucun car";
+    const current = grouped.get(key) || { label: key, students: 0, hubs: new Set(), drivers: new Set(), assistants: new Set(), vehicles: new Set(), schools: new Set(), alerts: 0 };
+    current.students += 1;
+    current.hubs.add(row.hubLabel);
+    if (row.schoolLabel) current.schools.add(row.schoolLabel);
+    row[driverKey].forEach((label) => current.drivers.add(label));
+    row[assistantKey].forEach((label) => current.assistants.add(label));
+    row[vehicleKey].forEach((label) => current.vehicles.add(label));
+    current.alerts += row.alerts.filter((alert) => alert.level !== "info").length;
+    grouped.set(key, current);
+  });
+  return [...grouped.values()].sort((a, b) => a.label.localeCompare(b.label, "fr", { numeric: true }));
+}
+
+function quickAssignmentTransferAlertsList(alerts = []) {
+  return `<div class="quick-list-inner">
+    ${alerts.map((alert) => `<div class="child-row">
+      <span>${esc(quickAssignmentReadableValue(alert.studentName, "Aucun élève"))}</span>
+      <small>${esc(`${quickAssignmentReadableValue(alert.hubLabel, "Aucun hub")} · ${quickAssignmentTransferAlertLabel(alert.code, alert.message)}`)}</small>
+      ${quickAssignmentAlertBadges([alert])}
+    </div>`).join("") || `<p class="muted">Aucune alerte transfert.</p>`}
+  </div>`;
+}
+
+function quickAssignmentTransferHubSummary(rows = []) {
+  const hubs = quickAssignmentTransferHubGroups(rows);
+  return `<article class="info-card">
+    <h3>Hubs détectés (${esc(hubs.length || 0)})</h3>
+    <div class="quick-list-inner">
+      ${hubs.map((hub) => `<div class="child-row">
+        <span>${esc(quickAssignmentReadableValue(hub.label, "Aucun hub"))}</span>
+        <small>${esc([
+          `👨 ${hub.students || 0} élève${hub.students > 1 ? "s" : ""}`,
+          `🚌 ${hub.incoming.size || 0} entrant${hub.incoming.size > 1 ? "s" : ""}`,
+          `🚌 ${hub.outgoing.size || 0} sortant${hub.outgoing.size > 1 ? "s" : ""}`,
+          `🔁 ${hub.changed || 0} changement${hub.changed > 1 ? "s" : ""}`,
+          `➡ ${hub.same || 0} même car`,
+          `♿ ${hub.pmr || 0} PMR`
+        ].join(" · "))}</small>
+        ${hub.alerts ? `<b class="badge warning">ALERTE</b>` : `<b class="badge ok">COMPLET</b>`}
+      </div>`).join("") || `<p class="muted">Aucun hub détecté.</p>`}
+    </div>
+  </article>`;
+}
+
+function quickAssignmentTransferSegmentSummary(title, groups, directionLabel) {
+  return `<article class="info-card">
+    <h3>${esc(title)} (${esc(groups.length || 0)})</h3>
+    <div class="quick-list-inner">
+      ${groups.map((group) => `<div class="child-row">
+        <span>${esc(quickAssignmentReadableValue(group.label, `Aucun car ${directionLabel}`))}</span>
+        <small>${esc([
+          `👨 ${group.students || 0} élève${group.students > 1 ? "s" : ""}`,
+          `🔄 ${quickAssignmentReadableValue([...group.hubs].join(", "), "Aucun hub")}`,
+          `🏫 ${quickAssignmentReadableValue([...group.schools].join(", "), "Aucune école")}`,
+          `👨 ${quickAssignmentReadableValue([...group.drivers].join(", "), "Aucun chauffeur")}`,
+          `👩 ${quickAssignmentReadableValue([...group.assistants].join(", "), "Aucune convoyeuse")}`,
+          `🚐 ${quickAssignmentReadableValue([...group.vehicles].join(", "), "Aucun véhicule")}`
+        ].join(" · "))}</small>
+        ${group.alerts ? `<b class="badge warning">ALERTE</b>` : `<b class="badge ok">COMPLET</b>`}
+      </div>`).join("") || `<p class="muted">Aucun car ${esc(directionLabel)} détecté.</p>`}
+    </div>
+  </article>`;
+}
+
+function quickAssignmentTransferRowsList(rows = [], emptyLabel) {
+  return `<div class="quick-list-inner">
+    ${rows.map(quickAssignmentTransferStudentRow).join("") || `<p class="muted">${esc(emptyLabel)}</p>`}
+  </div>`;
+}
+
+function quickAssignmentTransferStudentRow(row) {
+  const issueCount = row.alerts.filter((alert) => alert.level !== "info").length;
+  return `<button class="child-row" type="button" data-open-child="${esc(row.child.id)}">
+    <span>${esc(quickAssignmentReadableValue(fullName(row.child), "Élève sans nom"))}</span>
+    <small>${esc(`📍 Arrêt actif : ${quickAssignmentReadableValue(row.activePickupStop)}`)}<br>
+      ${esc(`🚌 Car entrant : ${quickAssignmentReadableValue(row.incomingCircuitLabels.join(", "))} · ${quickAssignmentReadableValue(row.incomingVehicleLabels.join(", "))}`)}<br>
+      ${esc(`🔄 Hub : ${quickAssignmentReadableValue(row.hubLabel, "Aucun hub")}`)}<br>
+      ${esc(`🚌 Car sortant : ${quickAssignmentReadableValue(row.outgoingCircuitLabels.join(", "))} · ${quickAssignmentReadableValue(row.outgoingVehicleLabels.join(", "))}`)}<br>
+      ${esc(`🏫 École : ${quickAssignmentReadableValue(row.schoolLabel, "Aucune")}`)}<br>
+      ${esc(`⏱ Arrivée transfert : ${quickAssignmentReadableValue(row.arrivalTime, "Aucune")}`)}<br>
+      ${esc(`⏱ Départ transfert : ${quickAssignmentReadableValue(row.departureTime, "Aucune")}`)}<br>
+      ${esc(`👨 Chauffeur entrant : ${quickAssignmentReadableValue(row.incomingDriverLabels.join(", "))}`)}<br>
+      ${esc(`👨 Chauffeur sortant : ${quickAssignmentReadableValue(row.outgoingDriverLabels.join(", "))}`)}<br>
+      ${esc(`👩 Convoyeuse entrante : ${quickAssignmentReadableValue(row.incomingAssistantLabels.join(", "), "Aucune")}`)}<br>
+      ${esc(`👩 Convoyeuse sortante : ${quickAssignmentReadableValue(row.outgoingAssistantLabels.join(", "), "Aucune")}`)}${row.alternatingResidenceActive ? `<br>${esc(`📅 Garde alternée : ${quickAssignmentReadableValue(row.activeResidence.parentLabel, "Parent actif")} · semaine ${row.activeResidence.weekNumber || 0}`)}` : ""}${row.isPmr ? `<br>${esc(`♿ PMR : ${row.wheelchairRequired ? "Fauteuil roulant" : "Oui"}`)}` : ""}</small>
+    <b class="badge ${row.changesBus ? "warning" : "ok"}">${esc(row.changesBus ? "CHANGEMENT DE CAR" : "MÊME CAR")}</b>
+    ${issueCount ? `<b class="badge warning">${esc(issueCount)} point${issueCount > 1 ? "s" : ""}</b>` : `<b class="badge ok">COMPLET</b>`}
+    ${quickAssignmentAlertBadges(row.alerts)}
+  </button>`;
+}
+
+function quickAssignmentTransferAlertLabel(code = "", message = "") {
+  const labels = {
+    missing_transfer_hub: "Hub de transfert manquant.",
+    missing_pickup: "Arrêt actif manquant.",
+    missing_incoming_circuit: "Car entrant manquant.",
+    missing_outgoing_circuit: "Car sortant manquant.",
+    missing_incoming_driver: "Chauffeur entrant manquant.",
+    missing_outgoing_driver: "Chauffeur sortant manquant.",
+    missing_incoming_vehicle: "Véhicule entrant manquant.",
+    missing_outgoing_vehicle: "Véhicule sortant manquant.",
+    pmr_transfer_without_assistant: "PMR avec changement de car sans convoyeuse sortante.",
+    alternating_transfer_missing_pickup: "Garde alternée sans arrêt actif."
+  };
+  return labels[code] || message || code || "Alerte transfert";
+}
+
+function quickAssignmentClosedCircuitRows() {
+  const context = {
+    direction: "morning",
+    transportManagerId: transportManagerIdForUser(state.user),
+    studentAssignments: data.studentAssignments || [],
+    stopPassages: data.stopPassages || [],
+    tripSegments: data.tripSegments || [],
+    vehicles: scopeRecordsForCurrentTransportManager("vehicles", data.vehicles || []),
+    drivers: scopeRecordsForCurrentTransportManager("drivers", data.drivers || []),
+    assistants: scopeRecordsForCurrentTransportManager("assistants", data.assistants || [])
+  };
+  return scopeRecordsForCurrentTransportManager("children", data.children || [])
+    .slice()
+    .sort((a, b) => fullName(a).localeCompare(fullName(b), "fr", { sensitivity: "base" }))
+    .map((child) => quickAssignmentClosedCircuitRow(child, context))
+    .filter((row) => row.transportType === "circuit_ferme");
+}
+
+function quickAssignmentClosedCircuitRow(child, context) {
+  const view = transportViewForChild(child, context);
+  const transportType = quickAssignmentTransportTypeForChild(child, view);
+  const hasTransfer = view.route.hasTransfer || view.summary.transportType === "avec_transfert" || childHasTransfer(child);
+  const startLabel = quickAssignmentStartLabel(child, view);
+  const schoolLabel = quickAssignmentSchoolLabel(child, view);
+  const circuitLabels = quickAssignmentCircuitLabels(view);
+  const driverLabels = quickAssignmentDriverLabels(view, context.drivers);
+  const assistantLabels = quickAssignmentAssistantLabels(view, context.assistants);
+  const vehicleLabels = quickAssignmentVehicleLabels(view, context.vehicles);
+  const alerts = quickAssignmentRelevantAlerts(view, { startLabel, schoolLabel, circuitLabels });
+  const hasCoreAssignment = view.source !== "unassigned" && (circuitLabels.length > 0 || startLabel || schoolLabel);
+  const isCompleteEnough = hasCoreAssignment && startLabel && schoolLabel && circuitLabels.length > 0;
+  const status = hasTransfer ? "transfer" : isCompleteEnough ? "assigned" : "unassigned";
+  return { child, view, transportType, status, startLabel, schoolLabel, circuitLabels, driverLabels, assistantLabels, vehicleLabels, alerts };
+}
+
+function quickAssignmentRelevantAlerts(view, row) {
+  const alerts = [...(view.alerts || [])].filter((alert) => [
+    "missing_transport_assignment",
+    "missing_driver",
+    "missing_vehicle",
+    "pmr_without_adapted_vehicle",
+    "legacy_fallback_used"
+  ].includes(alert.code));
+  if (!row.startLabel) alerts.push(transportViewAlert("missing_pickup", "warning", "Arrêt actif ou domicile PMR manquant."));
+  if (!row.schoolLabel) alerts.push(transportViewAlert("missing_school", "warning", "École manquante."));
+  if (!row.circuitLabels.length) alerts.push(transportViewAlert("missing_circuit", "warning", "Circuit manquant."));
+  return alerts;
+}
+
+function quickAssignmentReadableValue(value, replacement = "Aucun") {
+  const text = String(value || "").trim();
+  const emptyLegacyLabel = ["non", "renseigné"].join(" ");
+  if (!text || text.toLowerCase() === emptyLegacyLabel || quickAssignmentIsTechnicalId(text)) return replacement;
+  return text;
+}
+
+function quickAssignmentIsTechnicalId(value = "") {
+  const text = String(value || "").trim();
+  return /^[a-z]+-[0-9a-z-]+$/i.test(text) || /^[a-z]+s-[0-9a-z-]+$/i.test(text) || /^[a-z]+_[0-9a-z_]+$/i.test(text);
+}
+
+function quickAssignmentStartLabel(child, view) {
+  const pickup = view.summary.activePickupStopLabel || activePickupStopForChild(child);
+  if (quickAssignmentReadableValue(pickup, "")) return quickAssignmentReadableValue(pickup, "");
+  if (!view.student.hasPmrNeeds) return "";
+  return [child.homeAddress, child.streetName || child.street, child.streetNumber || child.houseNumber, child.postalCode, child.city]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function quickAssignmentSchoolLabel(child, view) {
+  const summarySchool = quickAssignmentReadableValue(view.summary.schoolLabel, "");
+  if (summarySchool) return summarySchool;
+  const school = scopeRecordsForCurrentTransportManager("schools", data.schools || []).find((item) => item.id === child.schoolId);
+  return school ? schoolOptionLabel(school) : child.schoolName || child.school || "";
+}
+
+function quickAssignmentCircuitLabel(ref) {
+  const circuit = circuitByRef(ref);
+  if (circuit) return quickAssignmentReadableValue(circuit.name || circuitOptionLabel(circuit), "");
+  const label = quickAssignmentReadableValue(ref, "");
+  return quickAssignmentIsTechnicalId(label) ? "" : label;
+}
+
+function quickAssignmentCircuitLabels(view) {
+  return uniqueText((view.transport.circuitIds || view.summary.circuitLabels || [])
+    .map(quickAssignmentCircuitLabel)
+    .filter(Boolean));
+}
+
+function quickAssignmentPersonLabel(records = [], id = "") {
+  const record = Array.isArray(records) ? records.find((item) => item?.id === id) : null;
+  if (!record) return quickAssignmentIsTechnicalId(id) ? "" : quickAssignmentReadableValue(id, "");
+  return quickAssignmentReadableValue(fullName(record), "") || quickAssignmentReadableValue(record.name || record.label || "", "");
+}
+
+function quickAssignmentDriverLabels(view, drivers = []) {
+  return uniqueText((view.transport.driverIds || [])
+    .map((id) => quickAssignmentPersonLabel(drivers, id))
+    .concat(view.summary.driverLabels || [])
+    .map((label) => quickAssignmentIsTechnicalId(label) ? "" : quickAssignmentReadableValue(label, ""))
+    .filter(Boolean));
+}
+
+function quickAssignmentAssistantLabels(view, assistants = []) {
+  return uniqueText((view.transport.assistantIds || [])
+    .map((id) => quickAssignmentPersonLabel(assistants, id))
+    .concat(view.summary.assistantLabels || [])
+    .map((label) => quickAssignmentIsTechnicalId(label) ? "" : quickAssignmentReadableValue(label, ""))
+    .filter(Boolean));
+}
+
+function quickAssignmentVehicleLabel(vehicles = [], id = "") {
+  const vehicle = Array.isArray(vehicles) ? vehicles.find((item) => item?.id === id) : null;
+  if (!vehicle) return quickAssignmentIsTechnicalId(id) ? "" : quickAssignmentReadableValue(id, "");
+  return quickAssignmentReadableValue([vehicle.busNumber, vehicle.licensePlate].filter(Boolean).join(" - ") || vehicle.name || vehicle.label, "");
+}
+
+function quickAssignmentVehicleLabels(view, vehicles = []) {
+  return uniqueText((view.transport.vehicleIds || [])
+    .map((id) => quickAssignmentVehicleLabel(vehicles, id))
+    .concat(view.summary.vehicleLabels || [])
+    .map((label) => quickAssignmentIsTechnicalId(label) ? "" : quickAssignmentReadableValue(label, ""))
+    .filter(Boolean));
+}
+
+function quickAssignmentCircuitSummary(rows) {
+  const grouped = new Map();
+  rows.forEach((row) => {
+    const key = row.circuitLabels[0] || "Aucun circuit";
+    const current = grouped.get(key) || { label: key, students: 0, alerts: 0, drivers: new Set(), assistants: new Set(), vehicles: new Set(), schools: new Set() };
+    current.students += 1;
+    current.alerts += row.alerts.filter((alert) => alert.level !== "info").length;
+    row.driverLabels.forEach((label) => current.drivers.add(label));
+    row.assistantLabels.forEach((label) => current.assistants.add(label));
+    row.vehicleLabels.forEach((label) => current.vehicles.add(label));
+    if (row.schoolLabel) current.schools.add(row.schoolLabel);
+    grouped.set(key, current);
+  });
+  const cards = [...grouped.values()].sort((a, b) => a.label.localeCompare(b.label, "fr", { numeric: true }));
+  return `<article class="info-card">
+    <h3>Circuits (${esc(cards.length || 0)})</h3>
+    <div class="quick-list-inner">
+      ${cards.map((item) => `<div class="child-row">
+        <span>${esc(quickAssignmentReadableValue(item.label, "Aucun circuit"))}</span>
+        <small>${esc([
+          `👨 ${item.students || 0} élève${item.students > 1 ? "s" : ""}`,
+          `🏫 ${quickAssignmentReadableValue([...item.schools].join(", "), "Aucune école")}`,
+          `👨 ${quickAssignmentReadableValue([...item.drivers].join(", "), "Aucun chauffeur")}`,
+          `👩 ${quickAssignmentReadableValue([...item.assistants].join(", "), "Aucune convoyeuse")}`,
+          `🚐 ${quickAssignmentReadableValue([...item.vehicles].join(", "), "Aucun véhicule")}`
+        ].join(" · "))}</small>
+        <b class="badge">${esc(item.students || 0)} élève${item.students > 1 ? "s" : ""}</b>
+        ${item.alerts ? `<b class="badge warning">ALERTE</b>` : `<b class="badge ok">COMPLET</b>`}
+      </div>`).join("") || `<p class="muted">Aucun circuit fermé affecté.</p>`}
+    </div>
+  </article>`;
+}
+
+function quickAssignmentRowsList(rows, emptyLabel) {
+  return `<div class="quick-list-inner">
+    ${rows.map(quickAssignmentStudentRow).join("") || `<p class="muted">${esc(emptyLabel)}</p>`}
+  </div>`;
+}
+
+function quickAssignmentStudentRow(row) {
+  const issueCount = row.alerts.filter((alert) => alert.level !== "info").length;
+  return `<button class="child-row" type="button" data-open-child="${esc(row.child.id)}">
+    <span>${esc(quickAssignmentReadableValue(fullName(row.child), "Élève sans nom"))}</span>
+    <small>${esc(`📍 Arrêt / domicile : ${quickAssignmentReadableValue(row.startLabel)}`)}<br>
+      ${esc(`🏫 École : ${quickAssignmentReadableValue(row.schoolLabel, "Aucune")}`)}<br>
+      ${esc(`🚌 Circuit : ${quickAssignmentReadableValue(row.circuitLabels.join(", "))}`)}<br>
+      ${esc(`👨 Chauffeur : ${quickAssignmentReadableValue(row.driverLabels.join(", "))}`)}<br>
+      ${esc(`👩 Convoyeuse : ${quickAssignmentReadableValue(row.assistantLabels.join(", "), "Aucune")}`)}<br>
+      ${esc(`🚐 Véhicule : ${quickAssignmentReadableValue(row.vehicleLabels.join(", "))}`)}</small>
+    ${issueCount ? `<b class="badge warning">${esc(issueCount)} point${issueCount > 1 ? "s" : ""}</b>` : `<b class="badge ok">COMPLET</b>`}
+    ${quickAssignmentAlertBadges(row.alerts)}
+  </button>`;
+}
+
+function quickAssignmentAlertBadges(alerts = []) {
+  const labels = {
+    missing_transport_assignment: "Non affecté",
+    missing_driver: "Chauffeur manquant",
+    missing_vehicle: "Véhicule manquant",
+    pmr_without_adapted_vehicle: "PMR véhicule",
+    legacy_fallback_used: "LEGACY",
+    missing_pickup: "Arrêt manquant",
+    missing_home_address: "Domicile manquant",
+    missing_school: "École manquante",
+    missing_circuit: "Circuit manquant",
+    pmr_wheelchair_capacity_exceeded: "Capacité dépassée",
+    missing_transfer_hub: "Hub manquant",
+    missing_incoming_circuit: "Car entrant manquant",
+    missing_outgoing_circuit: "Car sortant manquant",
+    missing_incoming_driver: "Chauffeur entrant",
+    missing_outgoing_driver: "Chauffeur sortant",
+    missing_incoming_vehicle: "Véhicule entrant",
+    missing_outgoing_vehicle: "Véhicule sortant",
+    pmr_transfer_without_assistant: "PMR accompagnement",
+    alternating_transfer_missing_pickup: "Garde alternée arrêt"
+  };
+  return alerts.map((alert) => {
+    const levelClass = alert.level === "info" ? "" : alert.level === "critical" ? "danger" : "warning";
+    return `<b class="badge ${levelClass}">${esc(labels[alert.code] || alert.code)}</b>`;
+  }).join("");
 }
 
 function circuitAssignmentsView() {
