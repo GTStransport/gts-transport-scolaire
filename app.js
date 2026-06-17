@@ -6556,6 +6556,311 @@ function tripSegmentsForChild(child = {}, assignments = [], tripSegments = [], c
     .sort((a, b) => (a.segmentOrder || 0) - (b.segmentOrder || 0));
 }
 
+function uniqueArray(values = []) {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function transportViewDayKey(date = new Date()) {
+  const source = date instanceof Date ? date : new Date(date);
+  if (Number.isNaN(source.getTime())) return "";
+  return ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"][source.getDay()];
+}
+
+function transportViewWeekPattern(date = new Date()) {
+  const week = isoWeekNumber(date);
+  if (!week) return "all";
+  return week % 2 === 0 ? "even" : "odd";
+}
+
+function transportViewLabelById(records = [], id = "", fallback = "") {
+  if (!id || !Array.isArray(records)) return fallback || id || "";
+  const record = records.find((item) => item?.id === id);
+  return record ? (fullName(record) !== "Non renseigné" ? fullName(record) : record.name || record.label || record.id) : fallback || id;
+}
+
+function transportViewVehicleLabel(vehicle = {}) {
+  return vehicle.busNumber || vehicle.licensePlate || vehicle.name || vehicle.label || vehicle.id || "";
+}
+
+function transportViewVehicleLabels(vehicleIds = [], vehicles = []) {
+  return uniqueArray(vehicleIds).map((id) => {
+    const vehicle = Array.isArray(vehicles) ? vehicles.find((item) => item?.id === id) : null;
+    return vehicle ? transportViewVehicleLabel(vehicle) : id;
+  }).filter(Boolean);
+}
+
+function transportViewIsPmrChild(child = {}) {
+  return child.pmrRequired === true
+    || child.requiresAdaptedVehicle === true
+    || child.wheelchairRequired === true
+    || child.hasWheelchair === true
+    || String(child.mobilityHelp || "").toLowerCase().includes("fauteuil")
+    || String(child.disability || "").toLowerCase().includes("pmr");
+}
+
+function transportViewIsAdaptedVehicle(vehicle = {}) {
+  return vehicle.pmrCompatible === true
+    || vehicle.isPmr === true
+    || vehicle.adaptedVehicle === true
+    || vehicle.wheelchairCompatible === true
+    || Number(vehicle.wheelchairPlaces || 0) > 0;
+}
+
+function transportViewAlert(code, level, message) {
+  return { code, level, message };
+}
+
+function transportViewHasLegacyTransport(child = {}) {
+  return [
+    child.pickupStop,
+    child.motherPickupStop,
+    child.fatherPickupStop,
+    child.circuitNumber,
+    child.pickupCircuitId,
+    child.schoolCircuitId,
+    child.transferSchoolCircuitId,
+    child.driverId,
+    ...(Array.isArray(child.driverIds) ? child.driverIds : []),
+    child.assistantId,
+    child.vehicleId
+  ].some(Boolean);
+}
+
+function transportViewLegacyCircuitIds(child = {}) {
+  return uniqueArray([
+    child.pickupCircuitId,
+    child.schoolCircuitId,
+    child.transferSchoolCircuitId,
+    child.transferCircuitId,
+    child.circuitId,
+    child.circuitNumber
+  ]);
+}
+
+function transportViewLegacyDriverIds(child = {}) {
+  return uniqueArray([...(Array.isArray(child.driverIds) ? child.driverIds : []), child.driverId, child.transferDriverId]);
+}
+
+function transportViewLegacyAssistantIds(child = {}) {
+  return uniqueArray([child.assistantId, child.transferAssistantId]);
+}
+
+function transportViewBase(child = {}, resolvedContext = {}, activeResidence = {}) {
+  const alternatingResidence = normalizeAlternatingResidence(child);
+  return {
+    source: "unassigned",
+    student: {
+      id: child.id || "",
+      firstName: child.firstName || "",
+      lastName: child.lastName || "",
+      displayName: fullName(child),
+      schoolId: child.schoolId || "",
+      schoolName: child.schoolName || child.school || "",
+      parentIds: uniqueArray([...(Array.isArray(child.parentIds) ? child.parentIds : []), child.parentId, child.motherId, child.fatherId].filter(Boolean)),
+      hasPmrNeeds: transportViewIsPmrChild(child)
+    },
+    summary: {
+      direction: resolvedContext.direction || "",
+      directionLabel: resolvedContext.direction === "evening" ? "Soir" : "Matin",
+      transportType: "unknown",
+      activeParentLabel: activeResidence.parentLabel || "",
+      activePickupStopLabel: activeResidence.pickupStop || "",
+      pickupTime: "",
+      dropoffTime: "",
+      circuitLabels: [],
+      transferLabel: "",
+      schoolLabel: child.schoolName || child.school || "",
+      driverLabels: [],
+      assistantLabels: [],
+      vehicleLabels: [],
+      isAlternatingResidenceActive: alternatingResidence.enabled === true,
+      isPmr: transportViewIsPmrChild(child)
+    },
+    route: {
+      direction: resolvedContext.direction || "",
+      assignments: [],
+      passages: [],
+      segments: [],
+      hasTransfer: false,
+      hasVehicleChange: false,
+      hasDriverChange: false,
+      hasAssistantChange: false
+    },
+    transport: {
+      transportManagerId: resolvedContext.transportManagerId || "",
+      circuitIds: [],
+      driverIds: [],
+      assistantIds: [],
+      vehicleIds: []
+    },
+    alternatingResidence: {
+      enabled: alternatingResidence.enabled === true,
+      weekPattern: activeResidence.weekPattern || "default",
+      weekNumber: activeResidence.weekNumber || 0,
+      activeParentLabel: activeResidence.parentLabel || "",
+      activePickupStop: activeResidence.pickupStop || "",
+      motherPickupStop: alternatingResidence.motherPickupStop || "",
+      fatherPickupStop: alternatingResidence.fatherPickupStop || "",
+      evenWeekParent: alternatingResidence.evenWeekParent || "",
+      oddWeekParent: alternatingResidence.oddWeekParent || "",
+      sourceResidenceKey: activeResidence.sourceResidenceKey || "default"
+    },
+    alerts: [],
+    notifications: {
+      parentRecipientIds: [],
+      driverRecipientIds: [],
+      assistantRecipientIds: [],
+      transporterRecipientIds: [],
+      routeLabel: ""
+    },
+    pdf: {
+      title: `Transport - ${fullName(child)}`,
+      sections: []
+    },
+    raw: {}
+  };
+}
+
+function transportViewForChild(child = {}, context = {}) {
+  const date = context.date ? (context.date instanceof Date ? context.date : new Date(context.date)) : new Date();
+  const resolvedContext = {
+    date,
+    direction: context.direction || "morning",
+    day: context.day || transportViewDayKey(date),
+    weekPattern: context.weekPattern || transportViewWeekPattern(date),
+    transportManagerId: context.transportManagerId || ""
+  };
+  const activeResidence = activeResidenceForChild(child, date);
+  const activePickupStop = activePickupStopForChild(child, date);
+  const sourceAssignments = Array.isArray(context.studentAssignments) ? context.studentAssignments : Array.isArray(context.assignments) ? context.assignments : [];
+  const sourcePassages = Array.isArray(context.stopPassages) ? context.stopPassages : [];
+  const sourceSegments = Array.isArray(context.tripSegments) ? context.tripSegments : [];
+  const vehicles = Array.isArray(context.vehicles) ? context.vehicles : [];
+  const drivers = Array.isArray(context.drivers) ? context.drivers : [];
+  const assistants = Array.isArray(context.assistants) ? context.assistants : [];
+  const view = transportViewBase(child, resolvedContext, { ...activeResidence, pickupStop: activePickupStop });
+  const childAssignments = assignmentsForChild(child, sourceAssignments, resolvedContext);
+  const childPassages = stopPassagesForChild(child, sourceAssignments, sourcePassages, resolvedContext);
+  const childSegments = tripSegmentsForChild(child, sourceAssignments, sourceSegments, resolvedContext);
+  const hasV2 = childAssignments.length > 0;
+  const hasLegacy = transportViewHasLegacyTransport(child);
+
+  if (hasV2) {
+    const passageIds = new Set(childPassages.map((passage) => passage.id));
+    const segmentIds = new Set(childSegments.map((segment) => segment.id));
+    const pickupPassage = childPassages.find((passage) => childAssignments.some((assignment) => assignment.pickupPassageId === passage.id))
+      || childPassages.find((passage) => passage.passageType === "pickup")
+      || null;
+    const dropoffPassage = childPassages.find((passage) => childAssignments.some((assignment) => assignment.dropoffPassageId === passage.id))
+      || childPassages.find((passage) => passage.passageType === "dropoff" || passage.passageType === "school_arrival")
+      || null;
+    const circuitIds = uniqueArray(childAssignments.flatMap((assignment) => assignment.circuitIds || []).concat(childSegments.map((segment) => segment.circuitId)));
+    const driverIds = uniqueArray(childAssignments.flatMap((assignment) => assignment.driverIds || []).concat(childSegments.map((segment) => segment.driverId), childPassages.map((passage) => passage.driverId)));
+    const assistantIds = uniqueArray(childAssignments.flatMap((assignment) => assignment.assistantIds || []).concat(childSegments.map((segment) => segment.assistantId), childPassages.map((passage) => passage.assistantId)));
+    const vehicleIds = uniqueArray(childAssignments.flatMap((assignment) => assignment.vehicleIds || []).concat(childSegments.map((segment) => segment.vehicleId), childPassages.map((passage) => passage.vehicleId)));
+    const transferPassage = childPassages.find((passage) => passage.passageType === "transfer_arrival" || passage.passageType === "transfer_departure");
+
+    view.source = childPassages.length && childSegments.length ? "v2" : "mixed";
+    view.route.assignments = childAssignments;
+    view.route.passages = childPassages;
+    view.route.segments = childSegments;
+    view.route.hasTransfer = childPassages.some((passage) => passage.stop?.type === "transfer_hub") || childSegments.some((segment) => segment.from?.type === "transfer_hub" || segment.to?.type === "transfer_hub");
+    view.route.hasVehicleChange = vehicleIds.length > 1;
+    view.route.hasDriverChange = driverIds.length > 1;
+    view.route.hasAssistantChange = assistantIds.length > 1;
+    view.transport = { transportManagerId: resolvedContext.transportManagerId || childAssignments[0]?.transportManagerId || "", circuitIds, driverIds, assistantIds, vehicleIds };
+    view.summary.transportType = childAssignments[0]?.transportType || childSegments[0]?.transportType || "unknown";
+    view.summary.activePickupStopLabel = pickupPassage?.stop?.label || activePickupStop || "";
+    view.summary.pickupTime = pickupPassage?.plannedTime || "";
+    view.summary.dropoffTime = dropoffPassage?.plannedTime || "";
+    view.summary.circuitLabels = circuitIds;
+    view.summary.transferLabel = transferPassage?.stop?.label || "";
+    view.summary.driverLabels = driverIds.map((id) => transportViewLabelById(drivers, id, id));
+    view.summary.assistantLabels = assistantIds.map((id) => transportViewLabelById(assistants, id, id));
+    view.summary.vehicleLabels = transportViewVehicleLabels(vehicleIds, vehicles);
+    view.notifications.driverRecipientIds = driverIds;
+    view.notifications.assistantRecipientIds = assistantIds;
+    view.notifications.transporterRecipientIds = uniqueArray([view.transport.transportManagerId]);
+    view.notifications.routeLabel = view.summary.circuitLabels.join(", ");
+    view.raw = context.includeRaw === false ? {} : { assignments: childAssignments, stopPassages: childPassages, tripSegments: childSegments };
+
+    const expectedPassageIds = new Set(childAssignments.flatMap((assignment) => assignment.passageIds || []));
+    const expectedSegmentIds = new Set(childAssignments.flatMap((assignment) => assignment.tripSegmentIds || []));
+    if ([...expectedPassageIds].some((id) => !passageIds.has(id)) || [...expectedSegmentIds].some((id) => !segmentIds.has(id))) {
+      view.source = "mixed";
+    }
+  } else if (hasLegacy) {
+    const circuitIds = transportViewLegacyCircuitIds(child);
+    const driverIds = transportViewLegacyDriverIds(child);
+    const assistantIds = transportViewLegacyAssistantIds(child);
+    const vehicleIds = uniqueArray([child.vehicleId]);
+    view.source = "legacy";
+    view.summary.transportType = childHasTransfer(child) ? "avec_transfert" : "unknown";
+    view.summary.activePickupStopLabel = activePickupStop;
+    view.summary.circuitLabels = circuitIds;
+    view.summary.transferLabel = child.transferLocation || child.transferName || "";
+    view.summary.driverLabels = driverIds;
+    view.summary.assistantLabels = assistantIds;
+    view.summary.vehicleLabels = vehicleIds;
+    view.route.hasTransfer = childHasTransfer(child);
+    view.transport = { transportManagerId: resolvedContext.transportManagerId || child.transportManagerId || "", circuitIds, driverIds, assistantIds, vehicleIds };
+    view.notifications.driverRecipientIds = driverIds;
+    view.notifications.assistantRecipientIds = assistantIds;
+    view.notifications.transporterRecipientIds = uniqueArray([view.transport.transportManagerId]);
+    view.notifications.routeLabel = circuitIds.join(", ");
+    view.raw = context.includeRaw === false ? {} : {
+      legacyFields: {
+        pickupStop: child.pickupStop,
+        motherPickupStop: child.motherPickupStop,
+        fatherPickupStop: child.fatherPickupStop,
+        circuitNumber: child.circuitNumber,
+        pickupCircuitId: child.pickupCircuitId,
+        schoolCircuitId: child.schoolCircuitId,
+        transferSchoolCircuitId: child.transferSchoolCircuitId,
+        driverId: child.driverId,
+        driverIds: child.driverIds,
+        assistantId: child.assistantId,
+        vehicleId: child.vehicleId
+      }
+    };
+    view.alerts.push(transportViewAlert("legacy_fallback_used", "info", "Vue transport construite depuis les champs legacy de l'élève."));
+  } else {
+    view.source = "unassigned";
+    view.alerts.push(transportViewAlert("missing_transport_assignment", "critical", "Aucune affectation transport V2 ou legacy trouvée pour cet élève."));
+  }
+
+  if (view.source !== "unassigned" && view.transport.driverIds.length === 0) {
+    view.alerts.push(transportViewAlert("missing_driver", "warning", "Aucun chauffeur trouvé pour ce transport."));
+  }
+  if (view.source !== "unassigned" && view.transport.vehicleIds.length === 0) {
+    view.alerts.push(transportViewAlert("missing_vehicle", "warning", "Aucun véhicule trouvé pour ce transport."));
+  }
+  if (view.student.hasPmrNeeds && view.transport.vehicleIds.length > 0) {
+    const linkedVehicles = view.transport.vehicleIds.map((id) => vehicles.find((vehicle) => vehicle?.id === id)).filter(Boolean);
+    if (linkedVehicles.length > 0 && !linkedVehicles.some(transportViewIsAdaptedVehicle)) {
+      view.alerts.push(transportViewAlert("pmr_without_adapted_vehicle", "warning", "Élève PMR sans véhicule adapté identifié dans la vue transport."));
+    }
+  }
+
+  view.pdf.sections = [
+    {
+      title: "Résumé transport",
+      rows: [
+        { label: "Sens", value: view.summary.directionLabel },
+        { label: "Arrêt actif", value: view.summary.activePickupStopLabel },
+        { label: "Circuit", value: view.summary.circuitLabels.join(", ") },
+        { label: "Transfert", value: view.summary.transferLabel },
+        { label: "École", value: view.summary.schoolLabel },
+        { label: "Chauffeur", value: view.summary.driverLabels.join(", ") },
+        { label: "Convoyeuse", value: view.summary.assistantLabels.join(", ") },
+        { label: "Véhicule", value: view.summary.vehicleLabels.join(", ") }
+      ].filter((row) => row.value)
+    }
+  ];
+
+  return view;
+}
+
 function normalizeTecStop(stop = {}) {
   const stopId = stop.stop_id || stop.stopId || stop.code || stop.id || "";
   const code = stop.code || stop.stop_code || "";
