@@ -6491,6 +6491,86 @@ function isValidTripSegment(segment = {}) {
   return typeof segment.active === "boolean";
 }
 
+function normalizeTripSegment(segment = {}) {
+  const from = segment.from || {};
+  const to = segment.to || {};
+  const normalized = {
+    id: String(segment.id || "").trim(),
+    transportManagerId: String(segment.transportManagerId || "").trim(),
+    direction: GTS_V2_DIRECTIONS.includes(segment.direction) ? segment.direction : "morning",
+    transportType: GTS_V2_TRANSPORT_TYPES.includes(segment.transportType) ? segment.transportType : "circuit_ferme",
+    circuitId: String(segment.circuitId || "").trim(),
+    segmentOrder: Number.isInteger(Number(segment.segmentOrder)) ? Number(segment.segmentOrder) : 0,
+    from: {
+      type: GTS_V2_POINT_TYPES.includes(from.type) ? from.type : "custom_address",
+      id: String(from.id || "").trim(),
+      label: String(from.label || "").trim()
+    },
+    to: {
+      type: GTS_V2_POINT_TYPES.includes(to.type) ? to.type : "custom_address",
+      id: String(to.id || "").trim(),
+      label: String(to.label || "").trim()
+    },
+    plannedDepartureTime: String(segment.plannedDepartureTime || "").trim(),
+    plannedArrivalTime: String(segment.plannedArrivalTime || "").trim(),
+    vehicleId: String(segment.vehicleId || "").trim(),
+    driverId: String(segment.driverId || "").trim(),
+    validDays: Array.isArray(segment.validDays) ? segment.validDays.filter((day) => GTS_V2_VALID_DAYS.includes(day)) : [],
+    weekPattern: GTS_V2_WEEK_PATTERNS.includes(segment.weekPattern) ? segment.weekPattern : "all",
+    active: segment.active !== false
+  };
+  if (isNonEmptyString(segment.assistantId)) normalized.assistantId = String(segment.assistantId).trim();
+  if (isNonEmptyString(segment.transferHubId)) normalized.transferHubId = String(segment.transferHubId).trim();
+  if (Array.isArray(segment.schoolIds)) normalized.schoolIds = uniqueArray(segment.schoolIds.map((id) => String(id || "").trim()).filter(Boolean));
+  if (Array.isArray(segment.stopPassageIds)) normalized.stopPassageIds = uniqueArray(segment.stopPassageIds.map((id) => String(id || "").trim()).filter(Boolean));
+  if (isNonEmptyString(segment.replacementVehicleId)) normalized.replacementVehicleId = String(segment.replacementVehicleId).trim();
+  if (isNonEmptyString(segment.replacementDriverId)) normalized.replacementDriverId = String(segment.replacementDriverId).trim();
+  if (isNonEmptyString(segment.replacementAssistantId)) normalized.replacementAssistantId = String(segment.replacementAssistantId).trim();
+  if (segment.pmrCompatibleRequired === true) normalized.pmrCompatibleRequired = true;
+  if (segment.wheelchairCompatibleRequired === true) normalized.wheelchairCompatibleRequired = true;
+  if (Number.isFinite(Number(segment.capacity))) normalized.capacity = Number(segment.capacity);
+  if (Number.isFinite(Number(segment.wheelchairPlaces))) normalized.wheelchairPlaces = Number(segment.wheelchairPlaces);
+  if (isNonEmptyString(segment.notes)) normalized.notes = String(segment.notes).trim();
+  if (segment.createdAt) normalized.createdAt = segment.createdAt;
+  if (segment.updatedAt) normalized.updatedAt = segment.updatedAt;
+  return normalized;
+}
+
+function buildTripSegmentFromDraft(draft = {}, defaults = {}) {
+  return normalizeTripSegment({
+    ...defaults,
+    ...draft,
+    from: { ...(defaults.from || {}), ...(draft.from || {}) },
+    to: { ...(defaults.to || {}), ...(draft.to || {}) },
+    validDays: draft.validDays || defaults.validDays || GTS_V2_VALID_DAYS,
+    weekPattern: draft.weekPattern || defaults.weekPattern || "all",
+    active: draft.active ?? defaults.active ?? true
+  });
+}
+
+function tripSegmentSummary(segment = {}) {
+  const normalized = normalizeTripSegment(segment);
+  const fromLabel = normalized.from.label || normalized.from.id || "Départ non renseigné";
+  const toLabel = normalized.to.label || normalized.to.id || "Arrivée non renseignée";
+  return {
+    id: normalized.id,
+    label: `${fromLabel} → ${toLabel}`,
+    direction: normalized.direction,
+    transportType: normalized.transportType,
+    circuitId: normalized.circuitId,
+    routeLabel: `${fromLabel} → ${toLabel}`,
+    timeLabel: [normalized.plannedDepartureTime, normalized.plannedArrivalTime].filter(Boolean).join(" - "),
+    vehicleId: normalized.vehicleId,
+    driverId: normalized.driverId,
+    assistantId: normalized.assistantId || "",
+    transferHubId: normalized.transferHubId || "",
+    validDays: normalized.validDays,
+    weekPattern: normalized.weekPattern,
+    active: normalized.active,
+    isValid: isValidTripSegment(normalized)
+  };
+}
+
 function isValidStopPassage(passage = {}) {
   if (!passage || typeof passage !== "object") return false;
   if (!isNonEmptyString(passage.id)) return false;
