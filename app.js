@@ -6689,6 +6689,78 @@ function isValidStudentAssignment(assignment = {}) {
   return typeof assignment.active === "boolean";
 }
 
+function normalizeStudentAssignment(assignment = {}) {
+  const normalized = {
+    id: String(assignment.id || "").trim(),
+    studentId: String(assignment.studentId || "").trim(),
+    transportManagerId: String(assignment.transportManagerId || "").trim(),
+    direction: GTS_V2_DIRECTIONS.includes(assignment.direction) ? assignment.direction : "morning",
+    transportType: GTS_V2_TRANSPORT_TYPES.includes(assignment.transportType) ? assignment.transportType : "circuit_ferme",
+    weekPattern: GTS_V2_WEEK_PATTERNS.includes(assignment.weekPattern) ? assignment.weekPattern : "all",
+    validDays: Array.isArray(assignment.validDays) ? assignment.validDays.filter((day) => GTS_V2_VALID_DAYS.includes(day)) : [],
+    pickupPassageId: String(assignment.pickupPassageId || "").trim(),
+    dropoffPassageId: String(assignment.dropoffPassageId || "").trim(),
+    passageIds: Array.isArray(assignment.passageIds) ? uniqueArray(assignment.passageIds.map((id) => String(id || "").trim()).filter(Boolean)) : [],
+    tripSegmentIds: Array.isArray(assignment.tripSegmentIds) ? uniqueArray(assignment.tripSegmentIds.map((id) => String(id || "").trim()).filter(Boolean)) : [],
+    circuitIds: Array.isArray(assignment.circuitIds) ? uniqueArray(assignment.circuitIds.map((id) => String(id || "").trim()).filter(Boolean)) : [],
+    active: assignment.active !== false
+  };
+  if (normalized.pickupPassageId && !normalized.passageIds.includes(normalized.pickupPassageId)) normalized.passageIds.unshift(normalized.pickupPassageId);
+  if (normalized.dropoffPassageId && !normalized.passageIds.includes(normalized.dropoffPassageId)) normalized.passageIds.push(normalized.dropoffPassageId);
+  if (Array.isArray(assignment.transferHubIds)) normalized.transferHubIds = uniqueArray(assignment.transferHubIds.map((id) => String(id || "").trim()).filter(Boolean));
+  if (Array.isArray(assignment.driverIds)) normalized.driverIds = uniqueArray(assignment.driverIds.map((id) => String(id || "").trim()).filter(Boolean));
+  if (Array.isArray(assignment.assistantIds)) normalized.assistantIds = uniqueArray(assignment.assistantIds.map((id) => String(id || "").trim()).filter(Boolean));
+  if (Array.isArray(assignment.vehicleIds)) normalized.vehicleIds = uniqueArray(assignment.vehicleIds.map((id) => String(id || "").trim()).filter(Boolean));
+  if (Array.isArray(assignment.parentIds)) normalized.parentIds = uniqueArray(assignment.parentIds.map((id) => String(id || "").trim()).filter(Boolean));
+  if (isNonEmptyString(assignment.schoolId)) normalized.schoolId = String(assignment.schoolId).trim();
+  if (["mother", "father"].includes(assignment.activeParentKey)) normalized.activeParentKey = assignment.activeParentKey;
+  if (isNonEmptyString(assignment.alternatingResidenceMode)) normalized.alternatingResidenceMode = String(assignment.alternatingResidenceMode).trim();
+  if (assignment.pmrRequired === true) normalized.pmrRequired = true;
+  if (assignment.wheelchairRequired === true) normalized.wheelchairRequired = true;
+  if (isNonEmptyString(assignment.source)) normalized.source = String(assignment.source).trim();
+  if (isNonEmptyString(assignment.migrationStatus)) normalized.migrationStatus = String(assignment.migrationStatus).trim();
+  if (isNonEmptyString(assignment.notes)) normalized.notes = String(assignment.notes).trim();
+  if (assignment.createdAt) normalized.createdAt = assignment.createdAt;
+  if (assignment.updatedAt) normalized.updatedAt = assignment.updatedAt;
+  return normalized;
+}
+
+function buildStudentAssignmentFromDraft(draft = {}, defaults = {}) {
+  return normalizeStudentAssignment({
+    ...defaults,
+    ...draft,
+    validDays: draft.validDays || defaults.validDays || GTS_V2_VALID_DAYS,
+    weekPattern: draft.weekPattern || defaults.weekPattern || "all",
+    active: draft.active ?? defaults.active ?? true
+  });
+}
+
+function studentAssignmentSummary(assignment = {}) {
+  const normalized = normalizeStudentAssignment(assignment);
+  return {
+    id: normalized.id,
+    studentId: normalized.studentId,
+    label: [normalized.studentId, normalized.direction, normalized.weekPattern].filter(Boolean).join(" · "),
+    direction: normalized.direction,
+    transportType: normalized.transportType,
+    weekPattern: normalized.weekPattern,
+    validDays: normalized.validDays,
+    pickupPassageId: normalized.pickupPassageId,
+    dropoffPassageId: normalized.dropoffPassageId,
+    passageCount: normalized.passageIds.length,
+    segmentCount: normalized.tripSegmentIds.length,
+    circuitIds: normalized.circuitIds,
+    transferHubIds: normalized.transferHubIds || [],
+    driverIds: normalized.driverIds || [],
+    assistantIds: normalized.assistantIds || [],
+    vehicleIds: normalized.vehicleIds || [],
+    schoolId: normalized.schoolId || "",
+    activeParentKey: normalized.activeParentKey || "",
+    active: normalized.active,
+    isValid: isValidStudentAssignment(normalized)
+  };
+}
+
 function assignmentsForChild(child = {}, assignments = [], context = {}) {
   if (!child?.id || !Array.isArray(assignments)) return [];
   return assignments
