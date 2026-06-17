@@ -6590,6 +6590,86 @@ function isValidStopPassage(passage = {}) {
   return typeof passage.active === "boolean";
 }
 
+function normalizeStopPassage(passage = {}) {
+  const stop = passage.stop || {};
+  const normalized = {
+    id: String(passage.id || "").trim(),
+    transportManagerId: String(passage.transportManagerId || "").trim(),
+    tripSegmentId: String(passage.tripSegmentId || "").trim(),
+    circuitId: String(passage.circuitId || "").trim(),
+    direction: GTS_V2_DIRECTIONS.includes(passage.direction) ? passage.direction : "morning",
+    transportType: GTS_V2_TRANSPORT_TYPES.includes(passage.transportType) ? passage.transportType : "circuit_ferme",
+    passageType: GTS_V2_PASSAGE_TYPES.includes(passage.passageType) ? passage.passageType : "pickup",
+    stop: {
+      type: GTS_V2_POINT_TYPES.includes(stop.type) ? stop.type : "custom_address",
+      id: String(stop.id || "").trim(),
+      label: String(stop.label || "").trim()
+    },
+    plannedTime: String(passage.plannedTime || "").trim(),
+    passageOrder: Number.isInteger(Number(passage.passageOrder)) ? Number(passage.passageOrder) : 0,
+    validDays: Array.isArray(passage.validDays) ? passage.validDays.filter((day) => GTS_V2_VALID_DAYS.includes(day)) : [],
+    weekPattern: GTS_V2_WEEK_PATTERNS.includes(passage.weekPattern) ? passage.weekPattern : "all",
+    active: passage.active !== false
+  };
+  if (isNonEmptyString(passage.transferHubId)) normalized.transferHubId = String(passage.transferHubId).trim();
+  if (isNonEmptyString(passage.schoolId)) normalized.schoolId = String(passage.schoolId).trim();
+  if (isNonEmptyString(passage.tecStopId)) normalized.tecStopId = String(passage.tecStopId).trim();
+  if (isNonEmptyString(passage.vehicleId)) normalized.vehicleId = String(passage.vehicleId).trim();
+  if (isNonEmptyString(passage.driverId)) normalized.driverId = String(passage.driverId).trim();
+  if (isNonEmptyString(passage.assistantId)) normalized.assistantId = String(passage.assistantId).trim();
+  if (Array.isArray(passage.studentIds)) normalized.studentIds = uniqueArray(passage.studentIds.map((id) => String(id || "").trim()).filter(Boolean));
+  if (Number.isFinite(Number(passage.capacity))) normalized.capacity = Number(passage.capacity);
+  if (Number.isFinite(Number(passage.wheelchairPlaces))) normalized.wheelchairPlaces = Number(passage.wheelchairPlaces);
+  if (passage.isTransferPoint === true) normalized.isTransferPoint = true;
+  if (passage.isTerminalPoint === true) normalized.isTerminalPoint = true;
+  if (passage.isPmrHomePickup === true) normalized.isPmrHomePickup = true;
+  if (passage.isPmrHomeDropoff === true) normalized.isPmrHomeDropoff = true;
+  if (isNonEmptyString(passage.notes)) normalized.notes = String(passage.notes).trim();
+  if (passage.createdAt) normalized.createdAt = passage.createdAt;
+  if (passage.updatedAt) normalized.updatedAt = passage.updatedAt;
+  return normalized;
+}
+
+function buildStopPassageFromDraft(draft = {}, defaults = {}) {
+  return normalizeStopPassage({
+    ...defaults,
+    ...draft,
+    stop: { ...(defaults.stop || {}), ...(draft.stop || {}) },
+    validDays: draft.validDays || defaults.validDays || GTS_V2_VALID_DAYS,
+    weekPattern: draft.weekPattern || defaults.weekPattern || "all",
+    active: draft.active ?? defaults.active ?? true
+  });
+}
+
+function stopPassageSummary(passage = {}) {
+  const normalized = normalizeStopPassage(passage);
+  const stopLabel = normalized.stop.label || normalized.stop.id || "Point non renseigné";
+  return {
+    id: normalized.id,
+    label: `${normalized.plannedTime || "--:--"} - ${stopLabel}`,
+    direction: normalized.direction,
+    transportType: normalized.transportType,
+    passageType: normalized.passageType,
+    stopType: normalized.stop.type,
+    stopId: normalized.stop.id,
+    stopLabel,
+    plannedTime: normalized.plannedTime,
+    passageOrder: normalized.passageOrder,
+    tripSegmentId: normalized.tripSegmentId,
+    circuitId: normalized.circuitId,
+    vehicleId: normalized.vehicleId || "",
+    driverId: normalized.driverId || "",
+    assistantId: normalized.assistantId || "",
+    transferHubId: normalized.transferHubId || "",
+    schoolId: normalized.schoolId || "",
+    tecStopId: normalized.tecStopId || "",
+    validDays: normalized.validDays,
+    weekPattern: normalized.weekPattern,
+    active: normalized.active,
+    isValid: isValidStopPassage(normalized)
+  };
+}
+
 function isValidStudentAssignment(assignment = {}) {
   if (!assignment || typeof assignment !== "object") return false;
   if (!isNonEmptyString(assignment.id)) return false;
