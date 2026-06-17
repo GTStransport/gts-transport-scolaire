@@ -3,6 +3,10 @@ const SESSION_KEY = "gts-session";
 const VIEW_STATE_KEY = "gts-view-state";
 const THEME_KEY = "gts-theme";
 const NOTIFICATION_SEEN_KEY = "gts-notifications-seen";
+const ADMIN_SUBDOMAIN_HOSTNAME = "admin.gts-connect.be";
+const ADMIN_SUBDOMAIN_ACCESS_MESSAGE = "Accès réservé à l’administration";
+const ADMIN_SUBDOMAIN_REDIRECT_DELAY_MS = 1800;
+const PUBLIC_SITE_URL = "https://gts-connect.be";
 const MAINTENANCE_NOTICE_ACK_KEY = "gts-maintenance-notice-ack";
 const OFFLINE_QUEUE_KEY = "gts-offline-queue";
 const OFFLINE_DB_NAME = "gts-offline-db";
@@ -577,14 +581,19 @@ const demoMessageKeys = new Set(["child-1", "child-2", "child-3", "support-demo-
 
 function isDemoRecord(collection, item = {}) {
   if (!item || typeof item !== "object") return false;
-  if (demoRecordIds[collection]?.has(item.id)) return true;
   if (["drivers", "users"].includes(collection) && item.id === "driver" && item.firstName === "Marc" && item.lastName === "Lefèvre") return true;
   if (["assistants", "users"].includes(collection) && item.id === "assistant" && item.firstName === "Nadia" && item.lastName === "Lambert") return true;
   if (collection === "vehicles" && item.busNumber === "BUS 14" && item.licensePlate === "1-ABC-234") return true;
   if (collection === "schools" && item.name === "Institut Sainte-Marie" && String(item.email || "").includes("sainte-marie.example")) return true;
   if (collection === "circuits" && ["circuit-12", "circuit-18"].includes(item.id) && item.schoolName === "Institut Sainte-Marie") return true;
-  if (["children", "students"].includes(collection) && ["child-1", "child-2", "child-3"].includes(item.id)) return true;
+  if (["children", "students"].includes(collection) && item.id === "child-1" && item.firstName === "Lucas" && item.lastName === "Moreau") return true;
+  if (["children", "students"].includes(collection) && item.id === "child-2" && item.firstName === "Emma" && item.lastName === "Dubois") return true;
+  if (["children", "students"].includes(collection) && item.id === "child-3" && item.firstName === "Noah" && item.lastName === "Bernard") return true;
   if (collection === "parents" && ["parent-1", "parent-2"].includes(item.id) && String(item.email || "").endsWith("@example.com")) return true;
+  if (collection === "parentChangeRequests" && item.id === "request-demo-1" && item.childName === "Lucas Moreau") return true;
+  if (collection === "supportRequests" && item.id === "support-demo-1" && item.subject === "Question trajet matin") return true;
+  if (collection === "roleAnnouncements" && item.id === "announcement-driver-1" && item.createdBy === "admin") return true;
+  if (collection === "roleAnnouncements" && item.id === "announcement-assistant-1" && item.createdBy === "admin") return true;
   return false;
 }
 
@@ -599,9 +608,9 @@ function systemSeedUsers() {
 }
 
 function removeDemoRecords(target = {}) {
-  Object.entries(demoRecordIds).forEach(([collection, ids]) => {
+  Object.keys(demoRecordIds).forEach((collection) => {
     if (Array.isArray(target[collection])) {
-      target[collection] = target[collection].filter((item) => !ids.has(item?.id) && !isDemoRecord(collection, item));
+      target[collection] = target[collection].filter((item) => !isDemoRecord(collection, item));
     }
   });
   ["messages", "supportMessages", "directMessageItems", "teamMessageItems", "studentIssueMessages"].forEach((key) => {
@@ -711,6 +720,8 @@ function syncCollectionAliases(target = data) {
 }
 
 let data = loadData();
+let appStateReady = false;
+let adminSubdomainRedirectTimer = null;
 let serviceHealth = {
   status: "degraded",
   message: "Vérification des services en cours...",
@@ -796,6 +807,7 @@ let state = {
   appLocked: false,
   appUnlockError: ""
 };
+appStateReady = true;
 
 if (pendingFirstLoginSession) {
   state.firstLoginType = pendingFirstLoginSession.type;
@@ -1370,6 +1382,25 @@ function isPermissionDeniedQueueItem(item = {}) {
   return String(item.lastError || "").includes("permission-denied");
 }
 
+function isFirestoreUnavailableQueueItem(item = {}) {
+  const error = String(item.lastError || "").toLowerCase();
+  return [
+    "firestore indisponible",
+    "firestore non initialisé",
+    "unavailable",
+    "offline",
+    "missing or insufficient permissions",
+    "permission-denied"
+  ].some((pattern) => error.includes(pattern));
+}
+
+function isCurrentUserQueueItem(item = {}) {
+  const payload = item.payload || {};
+  const data = payload.data || {};
+  const queuedId = payload.id || data.id || (payload.pathSegments || [])[1];
+  return Boolean(state.user?.id && queuedId === state.user.id);
+}
+
 function shouldDiscardDeniedQueueItem(item = {}) {
   if (!isPermissionDeniedQueueItem(item)) return false;
   const collectionNames = queueItemCollectionNames(item);
@@ -1395,6 +1426,17 @@ function shouldDiscardDeniedQueueItem(item = {}) {
     && !item.payload?.data?.temporaryAccessHash;
 }
 
+function shouldDiscardNonBlockingQueueItem(item = {}) {
+  if (shouldDiscardDeniedQueueItem(item)) return true;
+  if (!isFirestoreUnavailableQueueItem(item)) return false;
+  const collectionNames = queueItemCollectionNames(item);
+  if (collectionNames.some((name) => ["securityLogs", "loginLogs", "connectionLogs", "historyLogs", "notifications"].includes(name))) return true;
+  if (collectionNames.includes("directMessages")) return true;
+  if (collectionNames.some((name) => ["users", "parents"].includes(name)) && isCurrentUserQueueItem(item)) return true;
+  if (collectionNames.includes("users") && state.user?.role === "support") return true;
+  return false;
+}
+
 function shouldDiscardDeniedPathSet(queueType, pathSegments, payloadData) {
   return shouldDiscardDeniedQueueItem({
     lastError: "permission-denied",
@@ -1410,14 +1452,14 @@ function shouldDiscardDeniedPathSet(queueType, pathSegments, payloadData) {
 
 function hasBlockingOfflineConflict() {
   cleanupNonBlockingOfflineConflicts();
-  return loadOfflineQueue().some((item) => item.status === "conflict" && !shouldDiscardDeniedQueueItem(item));
+  return loadOfflineQueue().some((item) => item.status === "conflict" && !shouldDiscardNonBlockingQueueItem(item));
 }
 
 function cleanupNonBlockingOfflineConflicts() {
   const queue = loadOfflineQueue();
   const filtered = queue.filter((item) => {
     if (queueItemCollectionNames(item).includes("directMessages")) return false;
-    return !(item.status === "conflict" && shouldDiscardDeniedQueueItem(item));
+    return !(["conflict", "pending"].includes(item.status || "pending") && shouldDiscardNonBlockingQueueItem(item));
   });
   saveOfflineQueue(filtered);
 }
@@ -1776,7 +1818,7 @@ async function syncOfflineQueue() {
     } catch (error) {
       item.retryCount = Number(item.retryCount || 0) + 1;
       item.lastError = firestoreSyncErrorMessage(error);
-      if (shouldDiscardDeniedQueueItem(item)) continue;
+      if (shouldDiscardNonBlockingQueueItem(item)) continue;
       item.status = shouldKeepOfflineConflict(error, item.retryCount) ? "conflict" : "pending";
       nextQueue.push(item);
       console.warn("Synchronisation différée impossible.", error);
@@ -2480,11 +2522,11 @@ async function saveCollectionItemToFirestore(type, item) {
     );
     removeSyncedQueueItemsForRecord(type, item.id);
   } catch (error) {
-    if (String(error?.code || "").includes("permission-denied") && shouldDiscardDeniedQueueItem({
-      lastError: "permission-denied",
+    if (shouldDiscardNonBlockingQueueItem({
+      lastError: firestoreSyncErrorMessage(error),
       payload: { operation: "set", collectionName: collections[0], collections, id: item.id, data: item }
     })) {
-      console.warn("Modification non autorisée par Firestore, conservée seulement en local.", error);
+      console.warn("Modification non bloquante conservée seulement en local.", error);
       return;
     }
     if (String(error?.code || "").includes("permission-denied") && ["users", "parents"].includes(type) && (["driver", "assistant", "parent"].includes(state.user?.role) || isTransportManagerUser())) {
@@ -3258,6 +3300,7 @@ function getSessionUser() {
           localStorage.removeItem(SESSION_KEY);
           return null;
         }
+        if (!ensureAdminSubdomainAccess(snapshot)) return null;
         return snapshot;
       }
       return null;
@@ -3268,6 +3311,7 @@ function getSessionUser() {
       localStorage.removeItem(SESSION_KEY);
       return null;
     }
+    if (!ensureAdminSubdomainAccess(user)) return null;
     return user;
   } catch {
     return null;
@@ -3539,6 +3583,57 @@ function isTransportManagerUser(user = state.user) {
   return user?.role === "transport_manager" || (user?.role === "admin" && !isPrimaryAdminUser(user) && !isSpwAccount(user));
 }
 
+function adminSubdomainHostname() {
+  return String(window.__GTS_HOSTNAME_OVERRIDE__ || window.location.hostname || "").toLowerCase();
+}
+
+function isAdminSubdomain() {
+  // Sous-domaine admin : admin.gts-connect.be affiche uniquement l'espace administration/support et bloque les autres profils.
+  return adminSubdomainHostname() === ADMIN_SUBDOMAIN_HOSTNAME;
+}
+
+function isAdminSubdomainAuthorizedUser(user = {}, claims = {}) {
+  const claimRole = String(claims.role || claims.userRole || "").toLowerCase();
+  const localRole = String(user.role || "").toLowerCase();
+  if (localRole === "support" || claimRole === "support") return true;
+  if (isSpwAccount(user) || isTransportManagerUser(user)) return false;
+  return localRole === "system_admin"
+    || claimRole === "system_admin"
+    || isPrimaryAdminUser(user)
+    || (claimRole === "admin" && localRole !== "parent");
+}
+
+function publicSiteUrl() {
+  return String(window.__GTS_PUBLIC_SITE_URL_OVERRIDE__ || PUBLIC_SITE_URL);
+}
+
+function scheduleAdminSubdomainRedirect() {
+  if (adminSubdomainRedirectTimer) return;
+  adminSubdomainRedirectTimer = window.setTimeout(() => {
+    window.location.assign(publicSiteUrl());
+  }, ADMIN_SUBDOMAIN_REDIRECT_DELAY_MS);
+}
+
+function blockAdminSubdomainAccess() {
+  sessionExpiredMessage = ADMIN_SUBDOMAIN_ACCESS_MESSAGE;
+  signOutFirebaseAuth();
+  localStorage.removeItem(SESSION_KEY);
+  localStorage.removeItem(VIEW_STATE_KEY);
+  scheduleAdminSubdomainRedirect();
+  if (appStateReady) {
+    resetViewState();
+    state.user = null;
+    state.loginMode = "";
+  }
+}
+
+function ensureAdminSubdomainAccess(user = {}, claims = {}) {
+  if (!isAdminSubdomain()) return true;
+  if (isAdminSubdomainAuthorizedUser(user, claims)) return true;
+  blockAdminSubdomainAccess();
+  return false;
+}
+
 function userIdentityIds(user = state.user) {
   const profile = linkedTransportProfileForUser(user);
   return [...new Set([user?.id, user?.firebaseUid, user?.profileId, profile?.id, profile?.firebaseUid].filter(Boolean))];
@@ -3640,6 +3735,12 @@ async function hydrateSessionFromFirebaseAuth() {
     if (!account) return false;
     const user = upsertAuthenticatedAccount({ user: account, uid: currentFirebaseUser.uid });
     if (!user) return false;
+    let claims = {};
+    try {
+      const { getIdTokenResult } = await import("firebase/auth");
+      claims = (await getIdTokenResult(currentFirebaseUser, true))?.claims || {};
+    } catch {}
+    if (!ensureAdminSubdomainAccess(user, claims)) return true;
     if (requiresFirstLoginCodeSetup(user)) {
       state.user = null;
       state.activeApp = "gts";
@@ -6215,6 +6316,246 @@ function normalizeAlternatingResidence(child = {}) {
   };
 }
 
+function isoWeekNumber(date = new Date()) {
+  const source = date instanceof Date ? date : new Date(date);
+  if (Number.isNaN(source.getTime())) return 0;
+  const utc = new Date(Date.UTC(source.getFullYear(), source.getMonth(), source.getDate()));
+  const day = utc.getUTCDay() || 7;
+  utc.setUTCDate(utc.getUTCDate() + 4 - day);
+  const yearStart = new Date(Date.UTC(utc.getUTCFullYear(), 0, 1));
+  return Math.ceil((((utc - yearStart) / 86400000) + 1) / 7);
+}
+
+function activeResidenceForChild(child = {}, date = new Date()) {
+  const residence = normalizeAlternatingResidence(child);
+  const weekNumber = isoWeekNumber(date);
+  const defaultResidence = {
+    enabled: false,
+    weekPattern: "default",
+    weekNumber,
+    parentLabel: "",
+    address: child.homeAddress || "",
+    postalCode: child.postalCode || "",
+    city: child.city || "",
+    pickupStop: child.pickupStop || "",
+    sourceResidenceKey: "default"
+  };
+  if (residence.enabled !== true) return defaultResidence;
+  if (weekNumber > 0 && weekNumber % 2 === 0) {
+    return {
+      enabled: true,
+      weekPattern: "even",
+      weekNumber,
+      parentLabel: residence.evenWeekParent || "Maman",
+      address: residence.motherAddress || child.homeAddress || "",
+      postalCode: residence.motherPostalCode || child.postalCode || "",
+      city: residence.motherCity || child.city || "",
+      pickupStop: residence.motherPickupStop || child.pickupStop || "",
+      sourceResidenceKey: "mother"
+    };
+  }
+  return {
+    enabled: true,
+    weekPattern: "odd",
+    weekNumber,
+    parentLabel: residence.oddWeekParent || "Papa",
+    address: residence.fatherAddress || child.homeAddress || "",
+    postalCode: residence.fatherPostalCode || child.postalCode || "",
+    city: residence.fatherCity || child.city || "",
+    pickupStop: residence.fatherPickupStop || child.pickupStop || "",
+    sourceResidenceKey: "father"
+  };
+}
+
+function activePickupStopForChild(child = {}, date = new Date()) {
+  return activeResidenceForChild(child, date).pickupStop || "";
+}
+
+/**
+ * @typedef {Object} TripSegment
+ * @property {string} id
+ * @property {string} transportManagerId
+ * @property {"morning"|"evening"} direction
+ * @property {"avec_transfert"|"circuit_ferme"|"porte_a_porte"} transportType
+ * @property {string} circuitId
+ * @property {number} segmentOrder
+ * @property {{ type: string, id?: string, label: string }} from
+ * @property {{ type: string, id?: string, label: string }} to
+ * @property {string} plannedDepartureTime
+ * @property {string} plannedArrivalTime
+ * @property {string} vehicleId
+ * @property {string} driverId
+ * @property {string=} assistantId
+ * @property {string[]} validDays
+ * @property {"all"|"even"|"odd"} weekPattern
+ * @property {boolean} active
+ */
+
+/**
+ * @typedef {Object} StopPassage
+ * @property {string} id
+ * @property {string} transportManagerId
+ * @property {string} tripSegmentId
+ * @property {string} circuitId
+ * @property {"morning"|"evening"} direction
+ * @property {"avec_transfert"|"circuit_ferme"|"porte_a_porte"} transportType
+ * @property {"pickup"|"dropoff"|"transfer_arrival"|"transfer_departure"|"school_arrival"|"school_departure"} passageType
+ * @property {{ type: string, id?: string, label: string }} stop
+ * @property {string} plannedTime
+ * @property {number} passageOrder
+ * @property {string[]} validDays
+ * @property {"all"|"even"|"odd"} weekPattern
+ * @property {boolean} active
+ */
+
+/**
+ * @typedef {Object} StudentAssignment
+ * @property {string} id
+ * @property {string} studentId
+ * @property {string} transportManagerId
+ * @property {"morning"|"evening"} direction
+ * @property {"avec_transfert"|"circuit_ferme"|"porte_a_porte"} transportType
+ * @property {"all"|"even"|"odd"} weekPattern
+ * @property {string[]} validDays
+ * @property {string} pickupPassageId
+ * @property {string} dropoffPassageId
+ * @property {string[]} passageIds
+ * @property {string[]} tripSegmentIds
+ * @property {string[]} circuitIds
+ * @property {boolean} active
+ */
+
+const GTS_V2_DIRECTIONS = ["morning", "evening"];
+const GTS_V2_TRANSPORT_TYPES = ["avec_transfert", "circuit_ferme", "porte_a_porte"];
+const GTS_V2_WEEK_PATTERNS = ["all", "even", "odd"];
+const GTS_V2_VALID_DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday"];
+const GTS_V2_POINT_TYPES = ["tec_stop", "transfer_hub", "school", "home_address", "custom_address"];
+const GTS_V2_PASSAGE_TYPES = ["pickup", "dropoff", "transfer_arrival", "transfer_departure", "school_arrival", "school_departure"];
+
+function isNonEmptyString(value) {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isValidGtsV2IdList(value, allowEmpty = false) {
+  if (!Array.isArray(value)) return false;
+  if (!allowEmpty && value.length === 0) return false;
+  return value.every(isNonEmptyString);
+}
+
+function isValidGtsV2Time(value) {
+  return typeof value === "string" && /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+}
+
+function isValidGtsV2ValidDays(value) {
+  return Array.isArray(value)
+    && value.length > 0
+    && value.every((day) => GTS_V2_VALID_DAYS.includes(day));
+}
+
+function isValidGtsV2Point(point = {}) {
+  return !!point
+    && GTS_V2_POINT_TYPES.includes(point.type)
+    && isNonEmptyString(point.label);
+}
+
+function gtsV2TimeToMinutes(value) {
+  if (!isValidGtsV2Time(value)) return -1;
+  const [hours, minutes] = value.split(":").map(Number);
+  return (hours * 60) + minutes;
+}
+
+function hasMatchingGtsV2Schedule(record = {}, context = {}) {
+  if (record.active !== true) return false;
+  if (context.direction && record.direction !== context.direction) return false;
+  if (context.transportManagerId && record.transportManagerId !== context.transportManagerId) return false;
+  if (context.day && Array.isArray(record.validDays) && !record.validDays.includes(context.day)) return false;
+  if (context.weekPattern && record.weekPattern !== "all" && record.weekPattern !== context.weekPattern) return false;
+  return true;
+}
+
+function isValidTripSegment(segment = {}) {
+  if (!segment || typeof segment !== "object") return false;
+  if (!isNonEmptyString(segment.id)) return false;
+  if (!isNonEmptyString(segment.transportManagerId)) return false;
+  if (!GTS_V2_DIRECTIONS.includes(segment.direction)) return false;
+  if (!GTS_V2_TRANSPORT_TYPES.includes(segment.transportType)) return false;
+  if (!isNonEmptyString(segment.circuitId)) return false;
+  if (!Number.isInteger(segment.segmentOrder) || segment.segmentOrder < 0) return false;
+  if (!isValidGtsV2Point(segment.from) || !isValidGtsV2Point(segment.to)) return false;
+  if (!isValidGtsV2Time(segment.plannedDepartureTime) || !isValidGtsV2Time(segment.plannedArrivalTime)) return false;
+  if (gtsV2TimeToMinutes(segment.plannedArrivalTime) < gtsV2TimeToMinutes(segment.plannedDepartureTime)) return false;
+  if (!isNonEmptyString(segment.vehicleId)) return false;
+  if (!isNonEmptyString(segment.driverId)) return false;
+  if (!isValidGtsV2ValidDays(segment.validDays)) return false;
+  if (!GTS_V2_WEEK_PATTERNS.includes(segment.weekPattern)) return false;
+  return typeof segment.active === "boolean";
+}
+
+function isValidStopPassage(passage = {}) {
+  if (!passage || typeof passage !== "object") return false;
+  if (!isNonEmptyString(passage.id)) return false;
+  if (!isNonEmptyString(passage.transportManagerId)) return false;
+  if (!isNonEmptyString(passage.tripSegmentId)) return false;
+  if (!isNonEmptyString(passage.circuitId)) return false;
+  if (!GTS_V2_DIRECTIONS.includes(passage.direction)) return false;
+  if (!GTS_V2_TRANSPORT_TYPES.includes(passage.transportType)) return false;
+  if (!GTS_V2_PASSAGE_TYPES.includes(passage.passageType)) return false;
+  if (!isValidGtsV2Point(passage.stop)) return false;
+  if (!isValidGtsV2Time(passage.plannedTime)) return false;
+  if (!Number.isInteger(passage.passageOrder) || passage.passageOrder < 0) return false;
+  if (!isValidGtsV2ValidDays(passage.validDays)) return false;
+  if (!GTS_V2_WEEK_PATTERNS.includes(passage.weekPattern)) return false;
+  if (passage.stop.type === "transfer_hub" && !isNonEmptyString(passage.transferHubId || passage.stop.id)) return false;
+  if (passage.stop.type === "school" && !isNonEmptyString(passage.schoolId || passage.stop.id)) return false;
+  return typeof passage.active === "boolean";
+}
+
+function isValidStudentAssignment(assignment = {}) {
+  if (!assignment || typeof assignment !== "object") return false;
+  if (!isNonEmptyString(assignment.id)) return false;
+  if (!isNonEmptyString(assignment.studentId)) return false;
+  if (!isNonEmptyString(assignment.transportManagerId)) return false;
+  if (!GTS_V2_DIRECTIONS.includes(assignment.direction)) return false;
+  if (!GTS_V2_TRANSPORT_TYPES.includes(assignment.transportType)) return false;
+  if (!GTS_V2_WEEK_PATTERNS.includes(assignment.weekPattern)) return false;
+  if (!isValidGtsV2ValidDays(assignment.validDays)) return false;
+  if (!isNonEmptyString(assignment.pickupPassageId)) return false;
+  if (!isNonEmptyString(assignment.dropoffPassageId)) return false;
+  if (!isValidGtsV2IdList(assignment.passageIds)) return false;
+  if (!assignment.passageIds.includes(assignment.pickupPassageId)) return false;
+  if (!assignment.passageIds.includes(assignment.dropoffPassageId)) return false;
+  if (!isValidGtsV2IdList(assignment.tripSegmentIds)) return false;
+  if (!isValidGtsV2IdList(assignment.circuitIds)) return false;
+  return typeof assignment.active === "boolean";
+}
+
+function assignmentsForChild(child = {}, assignments = [], context = {}) {
+  if (!child?.id || !Array.isArray(assignments)) return [];
+  return assignments
+    .filter((assignment) => assignment.studentId === child.id)
+    .filter((assignment) => hasMatchingGtsV2Schedule(assignment, context));
+}
+
+function stopPassagesForChild(child = {}, assignments = [], stopPassages = [], context = {}) {
+  if (!Array.isArray(stopPassages)) return [];
+  const childAssignments = assignmentsForChild(child, assignments, context);
+  const passageIds = new Set(childAssignments.flatMap((assignment) => assignment.passageIds || []));
+  return stopPassages
+    .filter((passage) => passageIds.has(passage.id))
+    .filter((passage) => hasMatchingGtsV2Schedule(passage, context))
+    .sort((a, b) => (a.passageOrder || 0) - (b.passageOrder || 0));
+}
+
+function tripSegmentsForChild(child = {}, assignments = [], tripSegments = [], context = {}) {
+  if (!Array.isArray(tripSegments)) return [];
+  const childAssignments = assignmentsForChild(child, assignments, context);
+  const segmentIds = new Set(childAssignments.flatMap((assignment) => assignment.tripSegmentIds || []));
+  return tripSegments
+    .filter((segment) => segmentIds.has(segment.id))
+    .filter((segment) => hasMatchingGtsV2Schedule(segment, context))
+    .sort((a, b) => (a.segmentOrder || 0) - (b.segmentOrder || 0));
+}
+
 function normalizeTecStop(stop = {}) {
   const stopId = stop.stop_id || stop.stopId || stop.code || stop.id || "";
   const code = stop.code || stop.stop_code || "";
@@ -6641,6 +6982,9 @@ function render() {
     }
     if (!state.user) {
       return renderLogin();
+    }
+    if (!ensureAdminSubdomainAccess(state.user)) {
+      return renderLogin(ADMIN_SUBDOMAIN_ACCESS_MESSAGE);
     }
     if (mobileSessionUnlockRequired() || state.appLocked) {
       state.appLocked = true;
@@ -7502,7 +7846,9 @@ function renderLogin(error = "") {
   sessionExpiredMessage = "";
   const notice = state.loginNotice;
   state.loginNotice = "";
-  const allowedLoginModes = ["transport_manager", "spw", "driver", "assistant", "parent", ...(state.loginSupportUnlocked ? ["system_admin", "support"] : [])];
+  const allowedLoginModes = isAdminSubdomain()
+    ? ["system_admin", "support"]
+    : ["transport_manager", "spw", "driver", "assistant", "parent", ...(state.loginSupportUnlocked ? ["system_admin", "support"] : [])];
   const loginMode = allowedLoginModes.includes(state.loginMode) ? state.loginMode : "";
   const hasSelectedProfile = !!loginMode;
   const effectiveLoginMode = loginMode || "parent";
@@ -7512,25 +7858,28 @@ function renderLogin(error = "") {
   const parentMode = hasSelectedProfile && loginRole === "parent";
   const supportTemporaryMode = hasSelectedProfile && loginRole === "support" && state.loginSupportTemporaryOpen;
   const loginActionLabel = supportTemporaryMode ? "Ouvrir assistance" : parentMode ? "Connexion parent" : "Se connecter";
+  const loginTitle = isAdminSubdomain() ? "Administration GTS Connect" : "Connexion";
   const profiles = [
-    ["transport_manager", "Transporteur", "Gestion opérationnelle terrain", "manager-bus", "blue"],
-    ["driver", "Chauffeurs", "Gestion des trajets et transport", "driver-bus", "orange"],
-    ["spw", "SPW", "Supervision et suivi global", "administration", "green"],
-    ["assistant", "Convoyeuses", "Suivi et accompagnement", "assistant-children", "violet"],
-    ["parent", "Parents", "Suivi des enfants et notifications", "parents", "turquoise"],
-    ...(state.loginSupportUnlocked ? [["system_admin", "Administrateur", "Configuration et sécurité globales", "shield", "blue"]] : []),
-    ...(state.loginSupportUnlocked ? [["support", "Support", "Maintenance et assistance technique", "support", "blue"]] : [])
+    ...(!isAdminSubdomain() ? [
+      ["transport_manager", "Transporteur", "Gestion opérationnelle terrain", "manager-bus", "blue"],
+      ["driver", "Chauffeurs", "Gestion des trajets et transport", "driver-bus", "orange"],
+      ["spw", "SPW", "Supervision et suivi global", "administration", "green"],
+      ["assistant", "Convoyeuses", "Suivi et accompagnement", "assistant-children", "violet"],
+      ["parent", "Parents", "Suivi des enfants et notifications", "parents", "turquoise"]
+    ] : []),
+    ...((state.loginSupportUnlocked || isAdminSubdomain()) ? [["system_admin", "Administrateur", "Configuration et sécurité globales", "shield", "blue"]] : []),
+    ...((state.loginSupportUnlocked || isAdminSubdomain()) ? [["support", "Support", "Maintenance et assistance technique", "support", "blue"]] : [])
   ];
   const selectedProfile = profiles.find(([value]) => value === loginMode);
   const selectedProfileTitle = selectedProfile?.[1] || "Connexion";
   document.getElementById("root").innerHTML = `
-    <main class="premium-login-screen">
+    <main class="premium-login-screen ${isAdminSubdomain() ? "admin-login-screen" : ""}">
       <section class="premium-login-panel">
         <button class="premium-lock-icon login-brand-logo" type="button" id="login-secret-trigger" aria-label="Connexion sécurisée">
           <img src="/assets/gts-bookmark-source.jpg" alt="Gestion Transport Scolaire" loading="eager">
         </button>
         <div class="login-copy">
-          <h1>Connexion</h1>
+          <h1>${esc(loginTitle)}</h1>
         </div>
         ${maintenanceNoticeCard({ login: true })}
         <form class="login-form" id="login-form">
@@ -7627,6 +7976,10 @@ function renderLogin(error = "") {
         recordLoginAttempt(null, code, "refusée");
         return renderLogin("Identifiant support ou code incorrect");
       }
+      if (!ensureAdminSubdomainAccess(supportUser, supportAuthData?.claims || supportAuthData?.customClaims || {})) {
+        recordLoginAttempt(supportUser, code, "refusée");
+        return renderLogin(ADMIN_SUBDOMAIN_ACCESS_MESSAGE);
+      }
       if (!supportTempCode) return renderLogin("Code support temporaire obligatoire");
       const validation = await validateTemporarySupportAccess(supportTempCode, supportUser);
       if (!validation.ok) return renderLogin(validation.message);
@@ -7655,17 +8008,11 @@ function renderLogin(error = "") {
       }
     }
 
-    if (!user && !firebaseAuthData?.error) {
-      // Si l'auth Firebase a été refusée (identifiants invalides), ne pas retomber en local.
-      if (loginCandidate) registerLoginFailure(loginCandidate);
-      recordLoginAttempt(null, code, "refusée");
-      return renderLogin(loginRole === "parent" ? "Nom de l’élève ou code d’accès incorrect" : "Numéro identifiant ou code incorrect");
-    }
-
-    if (!user && firebaseAuthData?.error === true && firebaseAuthData.reason === "offline") {
+    if (!user) {
       loginAccount = await findLoginAccount(localRoleForLookup, identifier, code, studentLastName);
       user = loginAccount?.user || null;
       if (!user) {
+        if (loginCandidate) registerLoginFailure(loginCandidate);
         recordLoginAttempt(null, code, "refusée");
         return renderLogin(loginRole === "parent" ? "Nom de l’élève ou code d’accès incorrect" : "Numéro identifiant ou code incorrect");
       }
@@ -7685,6 +8032,12 @@ function renderLogin(error = "") {
     if (isMaintenanceActive() && !canAccessDuringMaintenance(user)) {
       recordLoginAttempt(user, code, "refusée");
       return renderLogin(maintenanceAccessMessage());
+    }
+
+    const firebaseClaims = firebaseAuthData?.claims || firebaseAuthData?.customClaims || {};
+    if (!ensureAdminSubdomainAccess(user, firebaseClaims)) {
+      recordLoginAttempt(user, code, "refusée");
+      return renderLogin(ADMIN_SUBDOMAIN_ACCESS_MESSAGE);
     }
 
     if (firebaseAuthData?.uid) user.firebaseUid = firebaseAuthData.uid;
@@ -9236,6 +9589,7 @@ function parentDashboard(child) {
   const driver = childDriver(child);
   const assistant = childAssistant(child);
   const medicalSheet = normalizeMedicalHelpSheet(child);
+  const activePickupStop = activePickupStopForChild(child);
   const cards = [
     { id: "school", label: parentT("dashboard.school"), render: (label) => metric(label, child.schoolName || parentT("common.unknown")) },
     { id: "circuit", label: parentT("dashboard.circuit"), render: (label) => metric(label, child.circuitNumber || parentT("common.unknown")) },
@@ -9243,7 +9597,7 @@ function parentDashboard(child) {
     { id: "outOfServiceVehicles", label: "Véhicules hors service", render: (label) => dashboardOutOfServiceMetric(label, child) },
     { id: "driver", label: parentT("dashboard.driver"), render: (label) => metric(label, driver ? fullName(driver) : parentT("common.unknown")) },
     { id: "assistant", label: parentT("dashboard.assistant"), render: (label) => metric(label, assistant ? fullName(assistant) : parentT("common.unknown")) },
-    { id: "stop", label: parentT("dashboard.stop"), render: (label) => metric(label, child.pickupStop || parentT("common.unknown")) },
+    { id: "stop", label: parentT("dashboard.stop"), render: (label) => metric(label, activePickupStop || parentT("common.unknown")) },
     { id: "morningPassage", label: parentT("dashboard.morningPassage"), render: (label) => metric(label, childMorningPassageTime(child) || parentT("common.unknown")) },
     { id: "important", label: parentT("dashboard.important"), render: (label) => metric(label, medicalSheet.careAdviceNotes || medicalSheet.allergiesDetails || parentT("dashboard.noAlert")) }
   ];
@@ -9301,6 +9655,8 @@ function studentAbsencesDashboardCard() {
 }
 
 function parentChildFile(child) {
+  const activeResidence = activeResidenceForChild(child);
+  const activeAddress = [activeResidence.address, activeResidence.postalCode, activeResidence.city].filter(Boolean).join(" ");
   const parentInfoRows = [
     [parentT("child.firstName"), child.firstName],
     [parentT("child.lastName"), child.lastName],
@@ -9312,8 +9668,8 @@ function parentChildFile(child) {
     [parentT("dashboard.assistant"), childAssistant(child) ? fullName(childAssistant(child)) : parentT("common.unknown")],
     [parentT("child.assistantPhone"), childAssistant(child)?.phone || parentT("common.unknown")],
     ["Heure de passage matin", childMorningPassageTime(child)],
-    [parentT("child.stop"), child.pickupStop],
-    [parentT("child.address"), child.homeAddress]
+    [parentT("child.stop"), activeResidence.pickupStop],
+    [parentT("child.address"), activeAddress || child.homeAddress]
   ];
   return `<section class="view-stack child-detail">
     <div class="detail-head parent-child-detail-head">
@@ -9485,6 +9841,8 @@ function openChildPdfPreview(child) {
   const transferAssistantData = transferAssistant(child);
   const generatedAt = formatDateTime(new Date().toISOString());
   const title = `Fiche élève - ${fullName(child)}`;
+  const activeResidence = activeResidenceForChild(child);
+  const activeAddress = [activeResidence.address, activeResidence.postalCode, activeResidence.city].filter(Boolean).join(" ");
   const sections = [
     ["Informations générales", [
       ["Prénom", child.firstName],
@@ -9503,8 +9861,8 @@ function openChildPdfPreview(child) {
       ["Chauffeurs associés", drivers.map(fullName).join(", ")],
       ["Convoyeuse associée", assistant ? fullName(assistant) : ""],
       ["Téléphone convoyeuse", assistant?.phone],
-      ["Arrêt de prise en charge", child.pickupStop],
-      ["Adresse", [child.homeAddress, child.postalCode, child.city].filter(Boolean).join(" ")]
+      ["Arrêt de prise en charge", activeResidence.pickupStop],
+      ["Adresse", activeAddress || [child.homeAddress, child.postalCode, child.city].filter(Boolean).join(" ")]
     ]],
     ["Transfert entre cars", [
       ["Changement de car", transferChanges ? "oui" : "non"],
@@ -12028,6 +12386,7 @@ function parentSafeChildSearchText(child) {
     child.circuitNumber,
     childPickupCircuitLabel(child),
     childSchoolCircuitLabel(child),
+    activePickupStopForChild(child),
     child.pickupStop,
     child.homeAddress,
     child.postalCode,
@@ -12464,7 +12823,7 @@ function transferCard(transfer) {
       ["Chauffeurs", driverNamesByIds(driverIdsFromRecord(transfer)) || (driverByRef(transfer.driverId) ? fullName(driverByRef(transfer.driverId)) : "")],
       ["Convoyeuse", assistantByRef(transfer.convoyeurId || transfer.assistantId) ? fullName(assistantByRef(transfer.convoyeurId || transfer.assistantId)) : ""]
     ])}
-    ${students.length ? `<div class="quick-list-inner compact-list">${students.slice(0, 6).map((child) => `<button class="child-row" type="button" data-open-child="${esc(child.id)}"><span>${esc(fullName(child))}</span><small>${esc(child.pickupStop || "")}</small>${delayBadge(child)}</button>`).join("")}${students.length > 6 ? `<p class="muted">+ ${esc(students.length - 6)} autre${students.length - 6 > 1 ? "s" : ""} élève${students.length - 6 > 1 ? "s" : ""}</p>` : ""}</div>` : ""}
+    ${students.length ? `<div class="quick-list-inner compact-list">${students.slice(0, 6).map((child) => `<button class="child-row" type="button" data-open-child="${esc(child.id)}"><span>${esc(fullName(child))}</span><small>${esc(activePickupStopForChild(child) || "")}</small>${delayBadge(child)}</button>`).join("")}${students.length > 6 ? `<p class="muted">+ ${esc(students.length - 6)} autre${students.length - 6 > 1 ? "s" : ""} élève${students.length - 6 > 1 ? "s" : ""}</p>` : ""}</div>` : ""}
     ${canManageLocation ? transferLocationForm(transfer) : ""}
     ${canManageLocation ? `<div class="form-actions"><button class="danger-button compact-action" type="button" data-delete-transport-transfer="${esc(transfer.transferId || transfer.id)}">Supprimer ce lieu</button></div>` : ""}
     ${delay ? activeDelayPanel(delay, false) : ""}
@@ -12837,7 +13196,7 @@ function childrenList() {
         <button class="record-card" data-open-child="${esc(child.id)}">
           <div><strong>${esc(fullName(child))}</strong><span>${esc(child.schoolName)} - ${esc(child.circuitNumber)}</span></div>
           ${badge(child)}${alternatingCustodyBadge(child)}${absenceBadge(child)}${delayBadge(child)}${specialAttentionBadge(child, false)}
-          <small>${esc(child.pickupStop)}</small>
+          <small>${esc(activePickupStopForChild(child))}</small>
         </button>`).join("")}</div>
     </section>`;
 }
@@ -12865,7 +13224,7 @@ function circuitStudentsView() {
 }
 
 function childRow(child) {
-  return `<button class="child-row" data-open-child="${esc(child.id)}"><span>${esc(fullName(child))}</span><small>${esc(child.pickupStop)} - ${esc(child.circuitNumber)}</small>${badge(child)}${alternatingCustodyBadge(child)}${absenceBadge(child)}${delayBadge(child)}${specialAttentionBadge(child, false)}</button>`;
+  return `<button class="child-row" data-open-child="${esc(child.id)}"><span>${esc(fullName(child))}</span><small>${esc(activePickupStopForChild(child))} - ${esc(child.circuitNumber)}</small>${badge(child)}${alternatingCustodyBadge(child)}${absenceBadge(child)}${delayBadge(child)}${specialAttentionBadge(child, false)}</button>`;
 }
 
 function childGeneralRows(child) {
@@ -12891,7 +13250,7 @@ function childTransportRows(child) {
     ["Chauffeurs associés", childDrivers(child).map(fullName).join(", ")],
     [parentT("child.assistantLinked"), childAssistant(child) ? fullName(childAssistant(child)) : ""],
     ["Heure de passage matin", childMorningPassageTime(child)],
-    [parentT("child.pickupStop"), child.pickupStop],
+    [parentT("child.pickupStop"), activePickupStopForChild(child)],
     ["Transfert", hasTransfer ? "oui" : "non"]
   ];
   if (!isParent()) {
@@ -13014,6 +13373,40 @@ function childStatusAlerts(child) {
   </div>`;
 }
 
+function canSeeTransportSummary() {
+  return !isSupportAssistanceSession()
+    && (isTransportManagerUser() || isSpwAccount() || ["driver", "assistant"].includes(state.user?.role));
+}
+
+function transportSummaryBlock(child) {
+  if (!canSeeTransportSummary()) return "";
+  const activeResidence = activeResidenceForChild(child);
+  const activePickupStop = activePickupStopForChild(child);
+  const hasTransfer = childHasTransfer(child);
+  const drivers = childDrivers(child).map(fullName).filter(Boolean).join(", ");
+  const assistant = childAssistant(child);
+  const circuit = child.circuitNumber || childPickupCircuitLabel(child) || childSchoolCircuitLabel(child);
+  const transfer = hasTransfer
+    ? ["Oui", transferNameForChild(child), child.transferLocation].filter(Boolean).join(" - ")
+    : "Non";
+  const rows = [
+    ["Arrêt actif", activePickupStop],
+    ["Circuit actuel", circuit],
+    ["Transfert", transfer],
+    ["École", child.schoolName],
+    ["Chauffeur actuel", drivers],
+    ["Convoyeuse actuelle", assistant ? fullName(assistant) : ""]
+  ];
+  if (activeResidence.enabled) {
+    rows.push(
+      ["Semaine active", activeResidence.weekPattern === "even" ? "Paire" : "Impaire"],
+      ["Parent actif", activeResidence.parentLabel],
+      ["Arrêt actif de la semaine", activeResidence.pickupStop]
+    );
+  }
+  return `<article class="info-card transport-summary-card"><h3>Résumé transport</h3>${sectionRows(rows)}</article>`;
+}
+
 function childDetail(child) {
   const canManage = canManageChild(child);
   const canDelete = canDeleteChild(child);
@@ -13024,6 +13417,7 @@ function childDetail(child) {
         <div><p class="eyebrow">${esc(parentT("child.fileTitle"))}</p><h2>${esc(fullName(child))}</h2></div>
         ${badge(child)}${alternatingCustodyBadge(child)}${specialAttentionBadge(child)}
       </div>
+      ${transportSummaryBlock(child)}
       <div class="action-row child-detail-actions">${canPdf ? `<button class="secondary-button" data-generate-child-pdf="${esc(child.id)}">Générer PDF</button>` : ""}${canManage ? `<button class="action-button as-button" data-edit-child="${esc(child.id)}">${esc(parentT("action.edit"))}</button>${canDelete ? `<button class="danger-button" data-delete-child="${esc(child.id)}">${esc(parentT("action.delete"))}</button>` : ""}` : ""}</div>
       ${studentIssueUrgentAlert(child)}
       ${specialAttentionBox(child)}
@@ -16258,7 +16652,7 @@ function itemTitle(type, item) {
 }
 
 function itemDetail(type, item) {
-  if (type === "children") return `${item.pickupStop || ""} ${item.circuitNumber || ""}`.trim();
+  if (type === "children") return `${activePickupStopForChild(item) || ""} ${item.circuitNumber || ""}`.trim();
   if (type === "vehicles") return usesSpwIdentity() ? (item.schoolName || item.circuitId || "") : [item.licensePlate, item.circuitId, driverNamesByIds(driverIdsFromRecord(item))].filter(Boolean).join(" - ");
   if (type === "schools") return item.phone || item.email || "";
   if (type === "circuits") return [item.transferName, circuitSchoolNames(item).join(", ") || item.schoolName].filter(Boolean).join(" - ");
