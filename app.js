@@ -6429,8 +6429,9 @@ const GTS_V2_DIRECTIONS = ["morning", "evening"];
 const GTS_V2_TRANSPORT_TYPES = ["avec_transfert", "circuit_ferme", "porte_a_porte"];
 const GTS_V2_WEEK_PATTERNS = ["all", "even", "odd"];
 const GTS_V2_VALID_DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday"];
-const GTS_V2_POINT_TYPES = ["tec_stop", "transfer_hub", "school", "home_address", "specialized_center", "custom_address"];
-const GTS_V2_DESTINATION_TYPES = ["school", "home_address", "specialized_center", "boarding_school", "custom_address"];
+const GTS_V2_POINT_TYPES = ["tec_stop", "transfer_hub", "school", "home_address", "specialized_center", "boarding_school", "custom_address"];
+const GTS_V2_DESTINATION_TYPES = ["school", "home_address", "specialized_center", "boarding_school", "weekend_parent_home", "custom_address"];
+const GTS_V2_BOARDING_MODES = ["full_week", "continuous", "weekly_return", "alternate_weekend_return"];
 const GTS_V2_PASSAGE_TYPES = ["pickup", "dropoff", "transfer_arrival", "transfer_departure", "school_arrival", "school_departure"];
 
 function isNonEmptyString(value) {
@@ -6484,6 +6485,22 @@ function hasGtsV2SpecializedCenterDestination(record = {}) {
     || record.stop?.type === "specialized_center";
 }
 
+function isGtsV2BoardingStudent(record = {}) {
+  return GTS_V2_BOARDING_MODES.includes(record.boardingMode)
+    || record.destinationType === "boarding_school"
+    || record.destinationType === "weekend_parent_home"
+    || record.from?.type === "boarding_school"
+    || record.to?.type === "boarding_school"
+    || record.stop?.type === "boarding_school";
+}
+
+function hasValidGtsV2BoardingSchedule(record = {}) {
+  if (!record.boardingMode) return true;
+  if (!GTS_V2_BOARDING_MODES.includes(record.boardingMode)) return false;
+  if (record.boardingMode === "alternate_weekend_return" && !["even", "odd"].includes(record.weekPattern)) return false;
+  return true;
+}
+
 function hasInvalidGtsV2TransferCombination(record = {}) {
   if (hasGtsV2PmrNeed(record) && hasGtsV2TransferReference(record)) return true;
   if (hasGtsV2SpecializedCenterDestination(record) && hasGtsV2TransferReference(record)) return true;
@@ -6515,6 +6532,7 @@ function isValidTripSegment(segment = {}) {
   if (!Number.isInteger(segment.segmentOrder) || segment.segmentOrder < 0) return false;
   if (!isValidGtsV2Point(segment.from) || !isValidGtsV2Point(segment.to)) return false;
   if (segment.destinationType && !GTS_V2_DESTINATION_TYPES.includes(segment.destinationType)) return false;
+  if (!hasValidGtsV2BoardingSchedule(segment)) return false;
   if (hasInvalidGtsV2TransferCombination(segment)) return false;
   if (!isValidGtsV2Time(segment.plannedDepartureTime) || !isValidGtsV2Time(segment.plannedArrivalTime)) return false;
   if (gtsV2TimeToMinutes(segment.plannedArrivalTime) < gtsV2TimeToMinutes(segment.plannedDepartureTime)) return false;
@@ -6556,6 +6574,7 @@ function normalizeTripSegment(segment = {}) {
   if (isNonEmptyString(segment.assistantId)) normalized.assistantId = String(segment.assistantId).trim();
   if (isNonEmptyString(segment.transferHubId)) normalized.transferHubId = String(segment.transferHubId).trim();
   if (GTS_V2_DESTINATION_TYPES.includes(segment.destinationType)) normalized.destinationType = segment.destinationType;
+  if (GTS_V2_BOARDING_MODES.includes(segment.boardingMode)) normalized.boardingMode = segment.boardingMode;
   if (Array.isArray(segment.schoolIds)) normalized.schoolIds = uniqueArray(segment.schoolIds.map((id) => String(id || "").trim()).filter(Boolean));
   if (Array.isArray(segment.stopPassageIds)) normalized.stopPassageIds = uniqueArray(segment.stopPassageIds.map((id) => String(id || "").trim()).filter(Boolean));
   if (isNonEmptyString(segment.replacementVehicleId)) normalized.replacementVehicleId = String(segment.replacementVehicleId).trim();
@@ -6602,6 +6621,7 @@ function tripSegmentSummary(segment = {}) {
     assistantId: normalized.assistantId || "",
     transferHubId: normalized.transferHubId || "",
     destinationType: normalized.destinationType || "",
+    boardingMode: normalized.boardingMode || "",
     validDays: normalized.validDays,
     weekPattern: normalized.weekPattern,
     active: normalized.active,
@@ -6620,6 +6640,7 @@ function isValidStopPassage(passage = {}) {
   if (!GTS_V2_PASSAGE_TYPES.includes(passage.passageType)) return false;
   if (!isValidGtsV2Point(passage.stop)) return false;
   if (passage.destinationType && !GTS_V2_DESTINATION_TYPES.includes(passage.destinationType)) return false;
+  if (!hasValidGtsV2BoardingSchedule(passage)) return false;
   if (hasInvalidGtsV2TransferCombination(passage)) return false;
   if (!isValidGtsV2Time(passage.plannedTime)) return false;
   if (!Number.isInteger(passage.passageOrder) || passage.passageOrder < 0) return false;
@@ -6653,6 +6674,7 @@ function normalizeStopPassage(passage = {}) {
   };
   if (isNonEmptyString(passage.transferHubId)) normalized.transferHubId = String(passage.transferHubId).trim();
   if (GTS_V2_DESTINATION_TYPES.includes(passage.destinationType)) normalized.destinationType = passage.destinationType;
+  if (GTS_V2_BOARDING_MODES.includes(passage.boardingMode)) normalized.boardingMode = passage.boardingMode;
   if (isNonEmptyString(passage.schoolId)) normalized.schoolId = String(passage.schoolId).trim();
   if (isNonEmptyString(passage.tecStopId)) normalized.tecStopId = String(passage.tecStopId).trim();
   if (isNonEmptyString(passage.vehicleId)) normalized.vehicleId = String(passage.vehicleId).trim();
@@ -6705,6 +6727,7 @@ function stopPassageSummary(passage = {}) {
     assistantId: normalized.assistantId || "",
     transferHubId: normalized.transferHubId || "",
     destinationType: normalized.destinationType || "",
+    boardingMode: normalized.boardingMode || "",
     schoolId: normalized.schoolId || "",
     tecStopId: normalized.tecStopId || "",
     validDays: normalized.validDays,
@@ -6723,6 +6746,7 @@ function isValidStudentAssignment(assignment = {}) {
   if (!GTS_V2_TRANSPORT_TYPES.includes(assignment.transportType)) return false;
   if (!GTS_V2_WEEK_PATTERNS.includes(assignment.weekPattern)) return false;
   if (assignment.destinationType && !GTS_V2_DESTINATION_TYPES.includes(assignment.destinationType)) return false;
+  if (!hasValidGtsV2BoardingSchedule(assignment)) return false;
   if (hasInvalidGtsV2TransferCombination(assignment)) return false;
   if (!isValidGtsV2ValidDays(assignment.validDays)) return false;
   if (!isNonEmptyString(assignment.pickupPassageId)) return false;
@@ -6760,7 +6784,13 @@ function normalizeStudentAssignment(assignment = {}) {
   if (Array.isArray(assignment.parentIds)) normalized.parentIds = uniqueArray(assignment.parentIds.map((id) => String(id || "").trim()).filter(Boolean));
   if (isNonEmptyString(assignment.schoolId)) normalized.schoolId = String(assignment.schoolId).trim();
   if (GTS_V2_DESTINATION_TYPES.includes(assignment.destinationType)) normalized.destinationType = assignment.destinationType;
+  if (GTS_V2_BOARDING_MODES.includes(assignment.boardingMode)) normalized.boardingMode = assignment.boardingMode;
   if (["mother", "father"].includes(assignment.activeParentKey)) normalized.activeParentKey = assignment.activeParentKey;
+  if (isNonEmptyString(assignment.activeParentLabel)) normalized.activeParentLabel = String(assignment.activeParentLabel).trim();
+  if (isNonEmptyString(assignment.responsibleParentId)) normalized.responsibleParentId = String(assignment.responsibleParentId).trim();
+  if (isNonEmptyString(assignment.boardingSchoolId)) normalized.boardingSchoolId = String(assignment.boardingSchoolId).trim();
+  if (isNonEmptyString(assignment.boardingSchoolLabel)) normalized.boardingSchoolLabel = String(assignment.boardingSchoolLabel).trim();
+  if (typeof assignment.isAdultStudent === "boolean") normalized.isAdultStudent = assignment.isAdultStudent;
   if (isNonEmptyString(assignment.alternatingResidenceMode)) normalized.alternatingResidenceMode = String(assignment.alternatingResidenceMode).trim();
   if (assignment.pmrRequired === true) normalized.pmrRequired = true;
   if (assignment.wheelchairRequired === true) normalized.wheelchairRequired = true;
@@ -6803,7 +6833,14 @@ function studentAssignmentSummary(assignment = {}) {
     vehicleIds: normalized.vehicleIds || [],
     schoolId: normalized.schoolId || "",
     destinationType: normalized.destinationType || "",
+    boardingMode: normalized.boardingMode || "",
+    isBoardingStudent: isGtsV2BoardingStudent(normalized),
     activeParentKey: normalized.activeParentKey || "",
+    activeParentLabel: normalized.activeParentLabel || "",
+    responsibleParentId: normalized.responsibleParentId || "",
+    boardingSchoolId: normalized.boardingSchoolId || "",
+    boardingSchoolLabel: normalized.boardingSchoolLabel || "",
+    isAdultStudent: normalized.isAdultStudent === true,
     active: normalized.active,
     isValid: isValidStudentAssignment(normalized)
   };
@@ -6954,7 +6991,12 @@ function transportViewBase(child = {}, resolvedContext = {}, activeResidence = {
       assistantLabels: [],
       vehicleLabels: [],
       isAlternatingResidenceActive: alternatingResidence.enabled === true,
-      isPmr: transportViewIsPmrChild(child)
+      isPmr: transportViewIsPmrChild(child),
+      isBoardingStudent: false,
+      boardingMode: "",
+      destinationType: "",
+      activeParentKey: "",
+      activeParentLabel: activeResidence.parentLabel || ""
     },
     route: {
       direction: resolvedContext.direction || "",
@@ -7039,6 +7081,13 @@ function transportViewForChild(child = {}, context = {}) {
     const assistantIds = uniqueArray(childAssignments.flatMap((assignment) => assignment.assistantIds || []).concat(childSegments.map((segment) => segment.assistantId), childPassages.map((passage) => passage.assistantId)));
     const vehicleIds = uniqueArray(childAssignments.flatMap((assignment) => assignment.vehicleIds || []).concat(childSegments.map((segment) => segment.vehicleId), childPassages.map((passage) => passage.vehicleId)));
     const transferPassage = childPassages.find((passage) => passage.passageType === "transfer_arrival" || passage.passageType === "transfer_departure");
+    const boardingRecord = childAssignments.find(isGtsV2BoardingStudent)
+      || childSegments.find(isGtsV2BoardingStudent)
+      || childPassages.find(isGtsV2BoardingStudent)
+      || null;
+    const activeParentKey = childAssignments.find((assignment) => assignment.activeParentKey)?.activeParentKey || "";
+    const activeParentLabel = childAssignments.find((assignment) => assignment.activeParentLabel)?.activeParentLabel
+      || (activeParentKey === "mother" ? "Maman" : activeParentKey === "father" ? "Papa" : activeResidence.parentLabel || "");
 
     view.source = childPassages.length && childSegments.length ? "v2" : "mixed";
     view.route.assignments = childAssignments;
@@ -7050,6 +7099,14 @@ function transportViewForChild(child = {}, context = {}) {
     view.route.hasAssistantChange = assistantIds.length > 1;
     view.transport = { transportManagerId: resolvedContext.transportManagerId || childAssignments[0]?.transportManagerId || "", circuitIds, driverIds, assistantIds, vehicleIds };
     view.summary.transportType = childAssignments[0]?.transportType || childSegments[0]?.transportType || "unknown";
+    view.summary.destinationType = childAssignments.find((assignment) => assignment.destinationType)?.destinationType
+      || childSegments.find((segment) => segment.destinationType)?.destinationType
+      || childPassages.find((passage) => passage.destinationType)?.destinationType
+      || "";
+    view.summary.isBoardingStudent = !!boardingRecord;
+    view.summary.boardingMode = boardingRecord?.boardingMode || "";
+    view.summary.activeParentKey = activeParentKey;
+    view.summary.activeParentLabel = activeParentLabel;
     view.summary.activePickupStopLabel = pickupPassage?.stop?.label || activePickupStop || "";
     view.summary.pickupTime = pickupPassage?.plannedTime || "";
     view.summary.dropoffTime = dropoffPassage?.plannedTime || "";
@@ -7076,6 +7133,11 @@ function transportViewForChild(child = {}, context = {}) {
     const vehicleIds = uniqueArray([child.vehicleId]);
     view.source = "legacy";
     view.summary.transportType = childHasTransfer(child) ? "avec_transfert" : "unknown";
+    view.summary.destinationType = "";
+    view.summary.isBoardingStudent = false;
+    view.summary.boardingMode = "";
+    view.summary.activeParentKey = "";
+    view.summary.activeParentLabel = activeResidence.parentLabel || "";
     view.summary.activePickupStopLabel = activePickupStop;
     view.summary.circuitLabels = circuitIds;
     view.summary.transferLabel = child.transferLocation || child.transferName || "";
@@ -7131,6 +7193,10 @@ function transportViewForChild(child = {}, context = {}) {
         { label: "Circuit", value: view.summary.circuitLabels.join(", ") },
         { label: "Transfert", value: view.summary.transferLabel },
         { label: "École", value: view.summary.schoolLabel },
+        { label: "Internat", value: view.summary.isBoardingStudent ? "Oui" : "" },
+        { label: "Mode internat", value: view.summary.boardingMode },
+        { label: "Destination", value: view.summary.destinationType },
+        { label: "Parent actif", value: view.summary.activeParentLabel },
         { label: "Chauffeur", value: view.summary.driverLabels.join(", ") },
         { label: "Convoyeuse", value: view.summary.assistantLabels.join(", ") },
         { label: "Véhicule", value: view.summary.vehicleLabels.join(", ") }

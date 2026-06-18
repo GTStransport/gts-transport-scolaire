@@ -83,6 +83,8 @@ export async function loadGtsV2Helpers() {
     "GTS_V2_WEEK_PATTERNS",
     "GTS_V2_VALID_DAYS",
     "GTS_V2_POINT_TYPES",
+    "GTS_V2_DESTINATION_TYPES",
+    "GTS_V2_BOARDING_MODES",
     "GTS_V2_PASSAGE_TYPES"
   ];
   const functionNames = [
@@ -96,6 +98,12 @@ export async function loadGtsV2Helpers() {
     "isValidGtsV2Time",
     "isValidGtsV2ValidDays",
     "isValidGtsV2Point",
+    "hasGtsV2PmrNeed",
+    "hasGtsV2TransferReference",
+    "hasGtsV2SpecializedCenterDestination",
+    "isGtsV2BoardingStudent",
+    "hasValidGtsV2BoardingSchedule",
+    "hasInvalidGtsV2TransferCombination",
     "gtsV2TimeToMinutes",
     "hasMatchingGtsV2Schedule",
     "isValidTripSegment",
