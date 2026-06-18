@@ -6429,7 +6429,8 @@ const GTS_V2_DIRECTIONS = ["morning", "evening"];
 const GTS_V2_TRANSPORT_TYPES = ["avec_transfert", "circuit_ferme", "porte_a_porte"];
 const GTS_V2_WEEK_PATTERNS = ["all", "even", "odd"];
 const GTS_V2_VALID_DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday"];
-const GTS_V2_POINT_TYPES = ["tec_stop", "transfer_hub", "school", "home_address", "custom_address"];
+const GTS_V2_POINT_TYPES = ["tec_stop", "transfer_hub", "school", "home_address", "specialized_center", "custom_address"];
+const GTS_V2_DESTINATION_TYPES = ["school", "home_address", "specialized_center", "boarding_school", "custom_address"];
 const GTS_V2_PASSAGE_TYPES = ["pickup", "dropoff", "transfer_arrival", "transfer_departure", "school_arrival", "school_departure"];
 
 function isNonEmptyString(value) {
@@ -6458,6 +6459,37 @@ function isValidGtsV2Point(point = {}) {
     && isNonEmptyString(point.label);
 }
 
+function hasGtsV2PmrNeed(record = {}) {
+  return record.pmrRequired === true
+    || record.wheelchairRequired === true
+    || record.pmrCompatibleRequired === true
+    || record.wheelchairCompatibleRequired === true
+    || record.isPmrHomePickup === true
+    || record.isPmrHomeDropoff === true;
+}
+
+function hasGtsV2TransferReference(record = {}) {
+  return record.transportType === "avec_transfert"
+    || isNonEmptyString(record.transferHubId)
+    || (Array.isArray(record.transferHubIds) && record.transferHubIds.length > 0)
+    || record.from?.type === "transfer_hub"
+    || record.to?.type === "transfer_hub"
+    || record.stop?.type === "transfer_hub";
+}
+
+function hasGtsV2SpecializedCenterDestination(record = {}) {
+  return record.destinationType === "specialized_center"
+    || record.from?.type === "specialized_center"
+    || record.to?.type === "specialized_center"
+    || record.stop?.type === "specialized_center";
+}
+
+function hasInvalidGtsV2TransferCombination(record = {}) {
+  if (hasGtsV2PmrNeed(record) && hasGtsV2TransferReference(record)) return true;
+  if (hasGtsV2SpecializedCenterDestination(record) && hasGtsV2TransferReference(record)) return true;
+  return false;
+}
+
 function gtsV2TimeToMinutes(value) {
   if (!isValidGtsV2Time(value)) return -1;
   const [hours, minutes] = value.split(":").map(Number);
@@ -6482,6 +6514,8 @@ function isValidTripSegment(segment = {}) {
   if (!isNonEmptyString(segment.circuitId)) return false;
   if (!Number.isInteger(segment.segmentOrder) || segment.segmentOrder < 0) return false;
   if (!isValidGtsV2Point(segment.from) || !isValidGtsV2Point(segment.to)) return false;
+  if (segment.destinationType && !GTS_V2_DESTINATION_TYPES.includes(segment.destinationType)) return false;
+  if (hasInvalidGtsV2TransferCombination(segment)) return false;
   if (!isValidGtsV2Time(segment.plannedDepartureTime) || !isValidGtsV2Time(segment.plannedArrivalTime)) return false;
   if (gtsV2TimeToMinutes(segment.plannedArrivalTime) < gtsV2TimeToMinutes(segment.plannedDepartureTime)) return false;
   if (!isNonEmptyString(segment.vehicleId)) return false;
@@ -6521,11 +6555,14 @@ function normalizeTripSegment(segment = {}) {
   };
   if (isNonEmptyString(segment.assistantId)) normalized.assistantId = String(segment.assistantId).trim();
   if (isNonEmptyString(segment.transferHubId)) normalized.transferHubId = String(segment.transferHubId).trim();
+  if (GTS_V2_DESTINATION_TYPES.includes(segment.destinationType)) normalized.destinationType = segment.destinationType;
   if (Array.isArray(segment.schoolIds)) normalized.schoolIds = uniqueArray(segment.schoolIds.map((id) => String(id || "").trim()).filter(Boolean));
   if (Array.isArray(segment.stopPassageIds)) normalized.stopPassageIds = uniqueArray(segment.stopPassageIds.map((id) => String(id || "").trim()).filter(Boolean));
   if (isNonEmptyString(segment.replacementVehicleId)) normalized.replacementVehicleId = String(segment.replacementVehicleId).trim();
   if (isNonEmptyString(segment.replacementDriverId)) normalized.replacementDriverId = String(segment.replacementDriverId).trim();
   if (isNonEmptyString(segment.replacementAssistantId)) normalized.replacementAssistantId = String(segment.replacementAssistantId).trim();
+  if (segment.pmrRequired === true) normalized.pmrRequired = true;
+  if (segment.wheelchairRequired === true) normalized.wheelchairRequired = true;
   if (segment.pmrCompatibleRequired === true) normalized.pmrCompatibleRequired = true;
   if (segment.wheelchairCompatibleRequired === true) normalized.wheelchairCompatibleRequired = true;
   if (Number.isFinite(Number(segment.capacity))) normalized.capacity = Number(segment.capacity);
@@ -6564,6 +6601,7 @@ function tripSegmentSummary(segment = {}) {
     driverId: normalized.driverId,
     assistantId: normalized.assistantId || "",
     transferHubId: normalized.transferHubId || "",
+    destinationType: normalized.destinationType || "",
     validDays: normalized.validDays,
     weekPattern: normalized.weekPattern,
     active: normalized.active,
@@ -6581,6 +6619,8 @@ function isValidStopPassage(passage = {}) {
   if (!GTS_V2_TRANSPORT_TYPES.includes(passage.transportType)) return false;
   if (!GTS_V2_PASSAGE_TYPES.includes(passage.passageType)) return false;
   if (!isValidGtsV2Point(passage.stop)) return false;
+  if (passage.destinationType && !GTS_V2_DESTINATION_TYPES.includes(passage.destinationType)) return false;
+  if (hasInvalidGtsV2TransferCombination(passage)) return false;
   if (!isValidGtsV2Time(passage.plannedTime)) return false;
   if (!Number.isInteger(passage.passageOrder) || passage.passageOrder < 0) return false;
   if (!isValidGtsV2ValidDays(passage.validDays)) return false;
@@ -6612,6 +6652,7 @@ function normalizeStopPassage(passage = {}) {
     active: passage.active !== false
   };
   if (isNonEmptyString(passage.transferHubId)) normalized.transferHubId = String(passage.transferHubId).trim();
+  if (GTS_V2_DESTINATION_TYPES.includes(passage.destinationType)) normalized.destinationType = passage.destinationType;
   if (isNonEmptyString(passage.schoolId)) normalized.schoolId = String(passage.schoolId).trim();
   if (isNonEmptyString(passage.tecStopId)) normalized.tecStopId = String(passage.tecStopId).trim();
   if (isNonEmptyString(passage.vehicleId)) normalized.vehicleId = String(passage.vehicleId).trim();
@@ -6622,6 +6663,8 @@ function normalizeStopPassage(passage = {}) {
   if (Number.isFinite(Number(passage.wheelchairPlaces))) normalized.wheelchairPlaces = Number(passage.wheelchairPlaces);
   if (passage.isTransferPoint === true) normalized.isTransferPoint = true;
   if (passage.isTerminalPoint === true) normalized.isTerminalPoint = true;
+  if (passage.pmrRequired === true) normalized.pmrRequired = true;
+  if (passage.wheelchairRequired === true) normalized.wheelchairRequired = true;
   if (passage.isPmrHomePickup === true) normalized.isPmrHomePickup = true;
   if (passage.isPmrHomeDropoff === true) normalized.isPmrHomeDropoff = true;
   if (isNonEmptyString(passage.notes)) normalized.notes = String(passage.notes).trim();
@@ -6661,6 +6704,7 @@ function stopPassageSummary(passage = {}) {
     driverId: normalized.driverId || "",
     assistantId: normalized.assistantId || "",
     transferHubId: normalized.transferHubId || "",
+    destinationType: normalized.destinationType || "",
     schoolId: normalized.schoolId || "",
     tecStopId: normalized.tecStopId || "",
     validDays: normalized.validDays,
@@ -6678,6 +6722,8 @@ function isValidStudentAssignment(assignment = {}) {
   if (!GTS_V2_DIRECTIONS.includes(assignment.direction)) return false;
   if (!GTS_V2_TRANSPORT_TYPES.includes(assignment.transportType)) return false;
   if (!GTS_V2_WEEK_PATTERNS.includes(assignment.weekPattern)) return false;
+  if (assignment.destinationType && !GTS_V2_DESTINATION_TYPES.includes(assignment.destinationType)) return false;
+  if (hasInvalidGtsV2TransferCombination(assignment)) return false;
   if (!isValidGtsV2ValidDays(assignment.validDays)) return false;
   if (!isNonEmptyString(assignment.pickupPassageId)) return false;
   if (!isNonEmptyString(assignment.dropoffPassageId)) return false;
@@ -6713,6 +6759,7 @@ function normalizeStudentAssignment(assignment = {}) {
   if (Array.isArray(assignment.vehicleIds)) normalized.vehicleIds = uniqueArray(assignment.vehicleIds.map((id) => String(id || "").trim()).filter(Boolean));
   if (Array.isArray(assignment.parentIds)) normalized.parentIds = uniqueArray(assignment.parentIds.map((id) => String(id || "").trim()).filter(Boolean));
   if (isNonEmptyString(assignment.schoolId)) normalized.schoolId = String(assignment.schoolId).trim();
+  if (GTS_V2_DESTINATION_TYPES.includes(assignment.destinationType)) normalized.destinationType = assignment.destinationType;
   if (["mother", "father"].includes(assignment.activeParentKey)) normalized.activeParentKey = assignment.activeParentKey;
   if (isNonEmptyString(assignment.alternatingResidenceMode)) normalized.alternatingResidenceMode = String(assignment.alternatingResidenceMode).trim();
   if (assignment.pmrRequired === true) normalized.pmrRequired = true;
@@ -6755,6 +6802,7 @@ function studentAssignmentSummary(assignment = {}) {
     assistantIds: normalized.assistantIds || [],
     vehicleIds: normalized.vehicleIds || [],
     schoolId: normalized.schoolId || "",
+    destinationType: normalized.destinationType || "",
     activeParentKey: normalized.activeParentKey || "",
     active: normalized.active,
     isValid: isValidStudentAssignment(normalized)
@@ -13313,16 +13361,144 @@ function dashboardQuickActions() {
 function transfersView() {
   const managerView = isTransportManagerUser();
   const spwView = isSpwAccount();
+  if (managerView || spwView) return transferLocationsOfficialView();
   const transfers = visibleTransportTransfers();
-  const title = spwView || managerView ? "Lieux de transfert" : "Mes transferts";
-  const emptyText = spwView
-    ? "Aucun transfert disponible pour le moment."
-    : managerView ? "Aucun transfert disponible pour le moment." : "Aucun transfert lié à vos circuits pour le moment.";
+  const title = "Mes transferts";
+  const emptyText = "Aucun transfert lié à vos circuits pour le moment.";
   return `<section class="view-stack">
     <div class="section-title"><p class="eyebrow">Organisation transport</p><h2>${esc(title)}</h2></div>
-    ${managerView ? createTransferLocationForm() : ""}
     ${transfers.length ? `<div class="card-grid transfer-grid">${transfers.map(transferCard).join("")}</div>` : `<article class="info-card"><p>${esc(emptyText)}</p></article>`}
   </section>`;
+}
+
+function officialTransportTransfers() {
+  const transfers = Array.isArray(data.transportTransfers) ? data.transportTransfers : [];
+  const visible = isSpwAccount()
+    ? transfers
+    : scopeRecordsForCurrentTransportManager("transportTransfers", transfers);
+  return visible
+    .filter((transfer) => transfer && typeof transfer === "object")
+    .sort((a, b) => String(transferLocationLabel(a)).localeCompare(String(transferLocationLabel(b)), "fr"));
+}
+
+function transferLocationLabel(transfer = {}) {
+  return transfer.label || transfer.transferName || transfer.name || transfer.locationLabel || transfer.transferLocation || "Lieu de transfert";
+}
+
+function transferLocationPlace(transfer = {}) {
+  return transfer.locationLabel || transfer.transferLocation || transfer.transferPlace || transfer.location || transfer.address || "";
+}
+
+function transferLocationCity(transfer = {}) {
+  return transfer.city || transfer.locality || transfer.town || "";
+}
+
+function transferLocationSource(transfer = {}) {
+  return transfer.source || (transfer.migrationStatus ? "legacy_review" : "legacy");
+}
+
+function transferLocationStatusBadge(transfer = {}) {
+  if (transfer.active === false || transfer.migrationStatus === "archived") return `<b class="badge danger">Inactif</b>`;
+  if (transfer.migrationStatus === "draft") return `<b class="badge warning">Brouillon</b>`;
+  return `<b class="badge ok">Actif</b>`;
+}
+
+function transferLocationPmrLabel(transfer = {}) {
+  if (transfer.pmrAccessible === true) return "Oui";
+  if (transfer.pmrAccessible === false) return "Non";
+  return "À vérifier";
+}
+
+function transferDuplicateKey(transfer = {}) {
+  return normalizeTextSearch([
+    transferLocationCity(transfer),
+    transferLocationPlace(transfer) || transferLocationLabel(transfer)
+  ].filter(Boolean).join("|"));
+}
+
+function transferDuplicateGroups(transfers = officialTransportTransfers()) {
+  const byKey = new Map();
+  transfers.forEach((transfer) => {
+    const key = transfer.normalizedKey || transferDuplicateKey(transfer);
+    if (!key) return;
+    const items = byKey.get(key) || [];
+    items.push(transfer);
+    byKey.set(key, items);
+  });
+  return [...byKey.values()].filter((items) => items.length > 1);
+}
+
+function transferHasDuplicate(transfer = {}, groups = transferDuplicateGroups()) {
+  const id = transfer.transferId || transfer.id;
+  if (!id) return false;
+  return groups.some((group) => group.some((item) => (item.transferId || item.id) === id));
+}
+
+function transferLocationUsageSummary(transfer = {}) {
+  const id = transfer.transferId || transfer.id || transfer.transferHubId || "";
+  const incoming = (data.tripSegments || []).filter((segment) =>
+    segment.transferHubId === id && (segment.to?.id === id || segment.to?.type === "transfer_hub")
+  );
+  const outgoing = (data.tripSegments || []).filter((segment) =>
+    segment.transferHubId === id && (segment.from?.id === id || segment.from?.type === "transfer_hub")
+  );
+  const schools = uniqueText([
+    ...(transfer.schoolIds || []),
+    ...incoming.flatMap((segment) => segment.schoolIds || []),
+    ...outgoing.flatMap((segment) => segment.schoolIds || [])
+  ]);
+  const circuits = uniqueText([
+    ...(transfer.circuitIds || []),
+    ...incoming.map((segment) => segment.circuitId),
+    ...outgoing.map((segment) => segment.circuitId)
+  ].filter(Boolean));
+  return { incomingCount: incoming.length, outgoingCount: outgoing.length, schoolCount: schools.length, circuitCount: circuits.length };
+}
+
+function transferLocationsOfficialView() {
+  const transfers = officialTransportTransfers();
+  const duplicateGroups = transferDuplicateGroups(transfers);
+  const duplicateCount = duplicateGroups.reduce((total, group) => total + group.length, 0);
+  return `<section class="view-stack">
+    <div class="section-title">
+      <p class="eyebrow">Référentiel officiel</p>
+      <h2>Lieux de transfert</h2>
+    </div>
+    <article class="info-card">
+      <p class="muted">Lecture seule. Les lieux affichés proviennent uniquement de <code>transportTransfers</code>. Les valeurs legacy des fiches élèves ne créent pas de lieu officiel.</p>
+      ${sectionRows([
+        ["Lieux officiels", transfers.length],
+        ["Doublons potentiels", duplicateCount],
+        ["Source officielle", "transportTransfers"]
+      ])}
+    </article>
+    ${transfers.length
+      ? `<div class="card-grid transfer-grid">${transfers.map((transfer) => transferLocationOfficialCard(transfer, duplicateGroups)).join("")}</div>`
+      : `<article class="info-card"><p>Aucun lieu de transfert officiel n’est encore enregistré.</p></article>`}
+  </section>`;
+}
+
+function transferLocationOfficialCard(transfer = {}, duplicateGroups = []) {
+  const usage = transferLocationUsageSummary(transfer);
+  const duplicate = transferHasDuplicate(transfer, duplicateGroups);
+  return `<article class="record-card transfer-card">
+    <div>
+      <strong>${esc(transferLocationLabel(transfer))}</strong>
+      <span>${esc(transferLocationCity(transfer) || "Ville non renseignée")}</span>
+    </div>
+    ${transferLocationStatusBadge(transfer)}
+    ${duplicate ? `<b class="badge warning">Doublon possible</b>` : `<b class="badge ok">Unique</b>`}
+    ${sectionRows([
+      ["Adresse / lieu", transferLocationPlace(transfer) || "Aucun"],
+      ["Accessibilité PMR", transferLocationPmrLabel(transfer)],
+      ["Source", transferLocationSource(transfer)],
+      ["Circuits détectés", usage.circuitCount],
+      ["Cars entrants", usage.incomingCount],
+      ["Cars sortants", usage.outgoingCount],
+      ["Écoles liées", usage.schoolCount],
+      ["Dernière modification", transfer.updatedAt ? formatDateTime(transfer.updatedAt) : "Aucune"]
+    ])}
+  </article>`;
 }
 
 function createTransferLocationForm() {

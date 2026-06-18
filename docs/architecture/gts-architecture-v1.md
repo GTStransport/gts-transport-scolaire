@@ -183,6 +183,13 @@ Transport individualise depuis ou vers une adresse, notamment pour les eleves PM
 
 Les donnees PMR officielles restent dans `children`, sous responsabilite SPW.
 
+Regle officielle :
+
+- PMR ne passe jamais par un transfert ;
+- PMR est organise en direct ecole <-> domicile ou ecole <-> centre specialise ;
+- `porte_a_porte` reste un type de trajet possible pour les eleves PMR et non PMR ;
+- un trajet vers un centre specialise ne doit pas etre modelise comme un transfert.
+
 L'organisation PMR est geree par le transporteur :
 
 - vehicule adapte ;
@@ -350,4 +357,3 @@ Les donnees medicales, PMR, garde alternee et donnees administratives ne doivent
 ## 15. Reference Officielle
 
 Cette architecture V1 est la reference officielle du projet GTS a partir du 17/06/2026.
-

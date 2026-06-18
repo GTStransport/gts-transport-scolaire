@@ -439,6 +439,8 @@ Alertes recommandees :
 - `missing_assistant` : convoyeuse absente ;
 - `missing_vehicle` : vehicule absent ;
 - `pmr_vehicle_missing` : besoin PMR sans vehicule adapte ;
+- `pmr_transfer_invalid` : besoin PMR associe a un transfert, interdit en V2 ;
+- `specialized_center_transfer_invalid` : centre specialise associe a un transfert, interdit en V2 ;
 - `transfer_incomplete` : transfert sans arrivee ou depart ;
 - `alternating_residence_incomplete` : garde alternee active mais arret ou parent manquant.
 

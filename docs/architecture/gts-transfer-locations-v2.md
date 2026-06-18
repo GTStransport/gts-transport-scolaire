@@ -284,11 +284,14 @@ Elle ne doit jamais creer directement un document officiel.
 
 Le PMR est un besoin specifique, pas un type de transfert.
 
-Un lieu de transfert peut etre :
+Regle metier officielle :
 
-- accessible PMR ;
-- non accessible PMR ;
-- a verifier.
+- un eleve PMR ne passe jamais par un lieu de transfert ;
+- un eleve PMR doit etre organise en trajet direct ecole <-> domicile ou ecole <-> centre specialise ;
+- `transportType = "avec_transfert"` est interdit pour un eleve PMR ;
+- `transferHubId`, `transferHubIds` et `stop.type = "transfer_hub"` sont interdits pour un trajet PMR.
+
+Un lieu de transfert peut conserver une information d'accessibilite terrain, mais cette information ne doit pas autoriser l'affectation d'un eleve PMR a ce transfert.
 
 Champs recommandes :
 
@@ -300,13 +303,13 @@ Champs recommandes :
 }
 ```
 
-Alerte obligatoire :
+Alerte obligatoire si une donnee legacy ou V2 associe un eleve PMR a un transfert :
 
 ```text
-pmr_accessibility_unknown
+pmr_transfer_invalid
 ```
 
-si un eleve PMR est affecte a un transfert dont `pmrAccessible` est vide ou inconnu.
+Cette alerte doit bloquer la validation V2 du trajet concerne.
 
 ## 9. Workflow Transporteur
 
@@ -655,4 +658,3 @@ Pour GTS V2 :
 - creation officielle : manuelle ou import valide ;
 - legacy : lecture et alerte uniquement ;
 - aucune creation automatique depuis `children.transferLocation`.
-

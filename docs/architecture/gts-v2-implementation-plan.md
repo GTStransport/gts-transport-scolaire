@@ -92,6 +92,13 @@ Regle metier centrale :
 
 Un eleve ne doit pas etre affecte simplement a un arret TEC. Il doit etre affecte a un passage precis.
 
+Regle PMR et centre specialise :
+
+- un eleve PMR ne passe jamais par un transfert ;
+- un trajet PMR ne doit jamais contenir `transferHubId`, `transferHubIds` ou un point `transfer_hub` ;
+- un trajet vers un `specialized_center` est direct et ne doit pas utiliser `avec_transfert` ;
+- `porte_a_porte` est un type de trajet, PMR est un besoin specifique.
+
 Exemple :
 
 ```txt
@@ -208,6 +215,7 @@ Exemple :
   "transportManagerId": "tm-1",
   "direction": "morning",
   "transportType": "circuit_ferme",
+  "destinationType": "school",
   "weekPattern": "even",
   "validDays": ["monday", "tuesday", "wednesday", "thursday", "friday"],
   "pickupPassageId": "pass-even-pick",
@@ -295,11 +303,19 @@ Les donnees PMR officielles restent dans `children`, gere par le SPW.
 La V2 traduit l'impact transport dans :
 
 - `tripSegments.transportType = "porte_a_porte"` ;
+- `tripSegments.destinationType = "school"` ou `"specialized_center"` ;
 - `tripSegments.pmrCompatibleRequired = true` ;
 - `tripSegments.wheelchairCompatibleRequired = true` ;
 - `stopPassages.stop.type = "home_address"` ;
 - `studentAssignments.pmrRequired = true` ;
 - `studentAssignments.wheelchairRequired = true`.
+
+Regles obligatoires :
+
+- `pmrRequired = true` + `transportType = "avec_transfert"` est invalide ;
+- `pmrRequired = true` + `transferHubId` ou `transferHubIds` est invalide ;
+- `pmrRequired = true` + `stop.type = "transfer_hub"` est invalide ;
+- `destinationType = "specialized_center"` + transfert est invalide.
 
 Les vehicules adaptes restent geres dans `vehicles`.
 

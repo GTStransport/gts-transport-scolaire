@@ -162,10 +162,13 @@ Travaux :
 - filtrer vehicules compatibles PMR ;
 - afficher besoins PMR aux equipages autorises ;
 - gerer passages domicile ;
+- gerer destinations centre specialise en trajet direct ;
 - gerer `requiresAdaptedVehicle` ;
 - alerter si aucun vehicule adapte n'est affecte.
 
 Rappel : les donnees PMR officielles restent gerees par le SPW dans `children`.
+
+Regle bloquante : PMR + transfert est invalide. Aucun `transferHubId`, `transferHubIds` ou point `transfer_hub` ne doit etre associe a un trajet PMR.
 
 ## 10. Phase 8 : Transferts Avances
 
@@ -246,7 +249,9 @@ Priorite 3 :
 
 Priorite 4 :
 
-- PMR et porte-a-porte.
+- porte-a-porte ;
+- PMR sans transfert ;
+- centres specialises en trajet direct.
 
 Priorite 5 :
 
@@ -265,4 +270,3 @@ La V2 est reussie si :
 - le parent voit le trajet actif correct ;
 - les cas PMR sont couverts ;
 - les transferts sont representes comme des hubs reels.
-
