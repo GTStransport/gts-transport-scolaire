@@ -15641,6 +15641,7 @@ function quickAssignmentClosedCircuitView() {
       <p class="muted">Cette vue utilise les données transport déjà présentes. Les trajets avec transfert sont exclus de ce lot.</p>
     </article>
     ${quickAssignmentCategoryOverview()}
+    ${quickAssignmentBoardingView()}
     ${quickAssignmentCircuitSummary(assignedRows)}
     <article class="info-card">
       <h3>Élèves affectés</h3>
@@ -15678,6 +15679,7 @@ function quickAssignmentCategoryOverview() {
   const unassignedRows = rows.filter((row) => !row.isAssigned);
   const alertRows = rows.filter((row) => row.hasAlert);
   const alternatingRows = rows.filter((row) => row.hasAlternatingResidence);
+  const boardingRows = rows.filter((row) => row.isBoardingStudent);
   return `<article class="info-card">
     <h3>Filtres rapides</h3>
     <div class="quick-list-inner">
@@ -15691,7 +15693,8 @@ function quickAssignmentCategoryOverview() {
         ["Élèves affectés", assignedRows.length],
         ["Élèves non affectés", unassignedRows.length],
         ["Alertes", alertRows.length],
-        ["Garde alternée", alternatingRows.length]
+        ["Garde alternée", alternatingRows.length],
+        ["Internat", boardingRows.length]
       ].map(([label, count]) => `<div class="child-row"><span>${esc(label)}</span><b class="badge">${esc(count || 0)}</b></div>`).join("")}
     </div>
     <p class="muted">PMR est un besoin spécifique. Porte-à-porte, circuit fermé et avec transfert restent les types de trajet.</p>
@@ -15704,7 +15707,9 @@ function quickAssignmentCategoryOverview() {
       ["Avec transfert PMR", transferRows.filter((row) => row.isPmr).length || 0],
       ["Avec transfert non PMR", transferRows.filter((row) => !row.isPmr).length || 0],
       ["Circuit fermé PMR", circuitRows.filter((row) => row.isPmr).length || 0],
-      ["Circuit fermé non PMR", circuitRows.filter((row) => !row.isPmr).length || 0]
+      ["Circuit fermé non PMR", circuitRows.filter((row) => !row.isPmr).length || 0],
+      ["Internat", boardingRows.length || 0],
+      ["Internat + garde alternée", boardingRows.filter((row) => row.hasAlternatingResidence).length || 0]
     ])}
   </article>`;
 }
@@ -15725,8 +15730,90 @@ function quickAssignmentCategoryRows() {
     const hasAlert = view.alerts.some((alert) => alert.level !== "info")
       || !isAssigned
       || (isPmr && (view.transport.vehicleIds || []).length === 0);
-    return { child, view, transportType, isPmr, isAssigned, hasAlert, hasAlternatingResidence };
+    return {
+      child,
+      view,
+      transportType,
+      isPmr,
+      isAssigned,
+      hasAlert,
+      hasAlternatingResidence,
+      isBoardingStudent: view.summary.isBoardingStudent === true,
+      boardingMode: view.summary.boardingMode || "",
+      destinationType: view.summary.destinationType || "",
+      activeParentLabel: view.summary.activeParentLabel || ""
+    };
   });
+}
+
+function quickAssignmentBoardingModeLabel(mode = "") {
+  const labels = {
+    full_week: "Internat semaine complète",
+    continuous: "Internat continu",
+    weekly_return: "Retour chaque week-end",
+    alternate_weekend_return: "Retour un week-end sur deux"
+  };
+  return labels[mode] || quickAssignmentReadableValue(mode, "Mode internat à vérifier");
+}
+
+function quickAssignmentDestinationTypeLabel(type = "") {
+  const labels = {
+    school: "École",
+    home_address: "Domicile",
+    specialized_center: "Centre spécialisé",
+    boarding_school: "Internat",
+    weekend_parent_home: "Domicile parent week-end",
+    custom_address: "Adresse spécifique"
+  };
+  return labels[type] || quickAssignmentReadableValue(type, "Destination à vérifier");
+}
+
+function quickAssignmentTransportTypeLabel(type = "") {
+  const labels = {
+    circuit_ferme: "Circuit fermé",
+    avec_transfert: "Avec transfert",
+    porte_a_porte: "Porte-à-porte",
+    unknown: "Type à vérifier"
+  };
+  return labels[type] || quickAssignmentReadableValue(type, "Type à vérifier");
+}
+
+function quickAssignmentBoardingRows() {
+  return quickAssignmentCategoryRows()
+    .filter((row) => row.isBoardingStudent)
+    .sort((a, b) => fullName(a.child).localeCompare(fullName(b.child), "fr", { sensitivity: "base" }));
+}
+
+function quickAssignmentBoardingView() {
+  const rows = quickAssignmentBoardingRows();
+  const alternatingRows = rows.filter((row) => row.hasAlternatingResidence);
+  const alertRows = rows.filter((row) => row.hasAlert);
+  if (!rows.length) return "";
+  return `<article class="info-card">
+    <h3>Internat</h3>
+    ${quickAssignmentSummaryRows([
+      ["🏠 Élèves internat", rows.length || 0],
+      ["📅 Garde alternée week-end", alternatingRows.length || 0],
+      ["🚨 Alertes", alertRows.length || 0]
+    ])}
+    <div class="quick-list-inner">
+      ${rows.map(quickAssignmentBoardingStudentRow).join("")}
+    </div>
+  </article>`;
+}
+
+function quickAssignmentBoardingStudentRow(row) {
+  const issueCount = row.view.alerts.filter((alert) => alert.level !== "info").length;
+  return `<button class="child-row" type="button" data-open-child="${esc(row.child.id)}">
+    <span>${esc(quickAssignmentReadableValue(fullName(row.child), "Élève sans nom"))}</span>
+    <small>${esc(`🏠 Internat : ${row.isBoardingStudent ? "Oui" : "Non"}`)}<br>
+      ${esc(`📅 Mode : ${quickAssignmentBoardingModeLabel(row.boardingMode)}`)}<br>
+      ${esc(`🎯 Destination : ${quickAssignmentDestinationTypeLabel(row.destinationType)}`)}${row.hasAlternatingResidence || row.activeParentLabel ? `<br>${esc(`👪 Parent actif : ${quickAssignmentReadableValue(row.activeParentLabel, "Parent actif à vérifier")}`)}` : ""}<br>
+      ${esc(`🚌 Type de trajet : ${quickAssignmentTransportTypeLabel(row.transportType)}`)}</small>
+    <b class="badge">INTERNAT</b>
+    ${issueCount ? `<b class="badge warning">${esc(issueCount)} point${issueCount > 1 ? "s" : ""}</b>` : `<b class="badge ok">LECTURE OK</b>`}
+    ${quickAssignmentAlertBadges(row.view.alerts)}
+  </button>`;
 }
 
 function quickAssignmentTransportContext() {
