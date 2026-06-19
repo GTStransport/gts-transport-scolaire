@@ -70,14 +70,45 @@ service cloud.firestore {
       return isSignedIn() && request.auth.token.linkedChildrenIds is list ? request.auth.token.linkedChildrenIds : [];
     }
 
+    function hasProfileId() {
+      return isSignedIn() && request.auth.token.profileId is string && request.auth.token.profileId != "";
+    }
+
+    function profileId() {
+      return hasProfileId() ? request.auth.token.profileId : "";
+    }
+
+    function hasTokenUserId() {
+      return isSignedIn() && request.auth.token.userId is string && request.auth.token.userId != "";
+    }
+
+    function tokenUserId() {
+      return hasTokenUserId() ? request.auth.token.userId : "";
+    }
+
+    function uidMatches(userId) {
+      return isSignedIn()
+        && userId is string
+        && userId != ""
+        && (
+          request.auth.uid == userId
+          || (hasTokenUserId() && tokenUserId() == userId)
+          || (hasProfileId() && profileId() == userId)
+        );
+    }
+
     function uidIn(values) {
       return isSignedIn()
         && values is list
-        && (request.auth.uid in values || request.auth.token.userId in values || request.auth.token.profileId in values);
+        && (
+          request.auth.uid in values
+          || (hasTokenUserId() && tokenUserId() in values)
+          || (hasProfileId() && profileId() in values)
+        );
     }
 
     function isCurrentUserId(userId) {
-      return isSignedIn() && (request.auth.uid == userId || request.auth.token.userId == userId || request.auth.token.profileId == userId);
+      return uidMatches(userId);
     }
 
     function validString(value, maxLength) {
@@ -152,6 +183,32 @@ service cloud.firestore {
 
     function isTransportOperator() {
       return isTransportManager() || isSpw() || isDriver() || isAssistant();
+    }
+
+    function hasTransportManagerScope(data) {
+      return transportManagerId() != ""
+        && (
+          data.transportManagerId == transportManagerId()
+          || (data.transportManagerIds is list && transportManagerId() in data.transportManagerIds)
+        );
+    }
+
+    function hasAnyId(listA, listB) {
+      return listA is list && listB is list && listA.hasAny(listB);
+    }
+
+    function canReadTransportV2(data) {
+      return isSignedIn()
+        && !isSupport()
+        && (
+          isSpw()
+          || isSystemAdmin()
+          || (isTransportManager() && hasTransportManagerScope(data))
+          || ((isDriver() || isAssistant() || isParent()) && uidIn(data.participantIds))
+          || (isDriver() && uidIn(data.driverIds))
+          || (isAssistant() && uidIn(data.assistantIds))
+          || (isParent() && uidIn(data.parentIds))
+        );
     }
 
     function profileIsSystemAdmin(data) {
@@ -254,8 +311,7 @@ service cloud.firestore {
     }
 
     function canCreateStudent() {
-      return isSpw()
-        || (isTransportManager() && !request.resource.data.keys().hasAny(studentSensitiveKeys()));
+      return isSpw() || isSystemAdmin();
     }
 
     function canUpdateStudent(studentId) {
@@ -392,14 +448,14 @@ service cloud.firestore {
       allow read: if canReadStudent(resource.data, studentId);
       allow create: if canCreateStudent();
       allow update: if canReadStudent(resource.data, studentId) && canUpdateStudent(studentId);
-      allow delete: if isTransportManager() || isSpw();
+      allow delete: if isSpw() || isSystemAdmin();
     }
 
     match /children/{studentId} {
       allow read: if canReadStudent(resource.data, studentId);
       allow create: if canCreateStudent();
       allow update: if canReadStudent(resource.data, studentId) && canUpdateStudent(studentId);
-      allow delete: if isTransportManager() || isSpw();
+      allow delete: if isSpw() || isSystemAdmin();
     }
 
     match /studentMedical/{studentId} {
@@ -758,22 +814,34 @@ service cloud.firestore {
     }
 
     match /transportTransfers/{transferId} {
-      allow read: if !isSpw()
-        && (
-          isTransportManager()
-          || request.auth.uid == resource.data.driverId
-          || request.auth.uid == resource.data.convoyeurId
-          || uidIn(resource.data.parentIds)
-          || uidIn(resource.data.studentsIds)
-          || isAssignedToCircuit(resource.data.circuitId)
-        );
-      allow create, update: if isTransportManager()
-        || ((isDriver() || isAssistant())
-        && (
-          request.auth.uid == request.resource.data.driverId
-          || request.auth.uid == request.resource.data.convoyeurId
-        ));
-      allow delete: if isTransportManager();
+      allow read: if isSpw()
+        || isSystemAdmin()
+        || (isTransportManager() && hasTransportManagerScope(resource.data))
+        || (
+          isDriver()
+          && (
+            uidMatches(resource.data.driverId)
+            || uidIn(resource.data.driverIds)
+            || isAssignedToCircuit(resource.data.circuitId)
+          )
+        )
+        || (
+          isAssistant()
+          && (
+            uidMatches(resource.data.assistantId)
+            || uidMatches(resource.data.convoyeurId)
+            || uidIn(resource.data.assistantIds)
+            || isAssignedToCircuit(resource.data.circuitId)
+          )
+        )
+        || uidIn(resource.data.parentIds)
+        || uidIn(resource.data.studentsIds);
+      allow create: if isTransportManager()
+        && hasTransportManagerScope(request.resource.data);
+      allow update: if isTransportManager()
+        && hasTransportManagerScope(resource.data)
+        && hasTransportManagerScope(request.resource.data);
+      allow delete: if false;
     }
 
     match /transferDelays/{delayId} {
@@ -970,6 +1038,24 @@ service cloud.firestore {
 
     match /belgianAddresses/{addressId} {
       allow read, write: if false;
+    }
+
+    // Lot 3 V2 : lecture contrôlée uniquement.
+    match /studentAssignments/{assignmentId} {
+      allow read: if canReadTransportV2(resource.data);
+      allow create, update, delete: if false;
+    }
+
+    // Lot 3 V2 : lecture contrôlée uniquement.
+    match /stopPassages/{passageId} {
+      allow read: if canReadTransportV2(resource.data);
+      allow create, update, delete: if false;
+    }
+
+    // Lot 3 V2 : lecture contrôlée uniquement.
+    match /tripSegments/{segmentId} {
+      allow read: if canReadTransportV2(resource.data);
+      allow create, update, delete: if false;
     }
 
     match /{document=**} {
