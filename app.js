@@ -633,6 +633,8 @@ const collectionAliasMap = {
   vehicleRepairs: ["vehicleReports"]
 };
 
+let studentAttendanceFirestorePresent = false;
+
 const firestoreBootstrapCollections = [
   "users",
   "transportManagers",
@@ -2668,6 +2670,7 @@ async function startFirestoreRealtimeSync() {
       "directMessages",
       "accessRequests",
       "studentAbsences",
+      "studentAttendance",
       "transportTransfers",
       "transferDelays",
       "studentMedical",
@@ -2702,6 +2705,7 @@ async function startFirestoreRealtimeSync() {
         const remoteItems = snapshot.docs
           .filter((docSnap) => !["__meta__", "_meta"].includes(docSnap.id))
           .map((docSnap) => ({ id: docSnap.id, ...docSnap.data() }));
+        if (type === "studentAttendance" && remoteItems.length > 0) studentAttendanceFirestorePresent = true;
         if (!remoteItems.length && Array.isArray(data[type]) && data[type].length > 0) {
           return;
         }
@@ -9254,6 +9258,7 @@ function baseNavigationItems(role = roleKey()) {
   if (role === "driver") return [
     { screen: "dashboard", label: "Tableau de bord" },
     { screen: "dailyBriefing", label: "Briefing du jour" },
+    { screen: "studentAttendance", label: "Présences" },
     { screen: "children", label: "Élèves" },
     { screen: "replacementRules", label: "Transfert" },
     { screen: "messages", label: messagesNavLabel() },
@@ -9265,6 +9270,7 @@ function baseNavigationItems(role = roleKey()) {
   if (role === "assistant") return [
     { screen: "dashboard", label: "Tableau de bord" },
     { screen: "dailyBriefing", label: "Briefing du jour" },
+    { screen: "studentAttendance", label: "Présences" },
     { screen: "children", label: "Élèves" },
     { screen: "spwContacts", label: "Contact SPW" },
     { screen: "replacementRules", label: "Organisation transferts" },
@@ -9340,6 +9346,7 @@ function navIcon(screen) {
   const icons = {
     dashboard: '<path d="M4 11.5 12 5l8 6.5"></path><path d="M6.5 10.5V20h11v-9.5"></path><path d="M9.5 20v-5h5v5"></path>',
     dailyBriefing: '<path d="M7 4.5h10"></path><path d="M8.5 2.8v4"></path><path d="M15.5 2.8v4"></path><path d="M5.5 8.5h13"></path><path d="M6.5 5.5h11v15h-11v-15Z"></path><path d="M9 12h6"></path><path d="M9 15h4"></path>',
+    studentAttendance: '<path d="M5.5 5.5h13v15h-13v-15Z"></path><path d="M8.5 10.5h2.5"></path><path d="m8.5 14.5 1.2 1.2 2.4-3"></path><path d="M14 10.5h2"></path><path d="M14 15h2"></path>',
     children: '<path d="M9 10a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"></path><path d="M4 20a5 5 0 0 1 10 0"></path><path d="M17 11.5a2.2 2.2 0 1 0 0-4.4"></path><path d="M15.5 15.5a4.2 4.2 0 0 1 4.5 4.2"></path>',
     drivers: '<path d="M4.5 15.5V7.8c0-1.3 1-2.3 2.3-2.3h10.4c1.3 0 2.3 1 2.3 2.3v7.7"></path><path d="M6.2 11.2h11.6"></path><path d="M8 18.3a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"></path><path d="M16 18.3a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"></path><path d="M14.8 8.7a1.35 1.35 0 1 0 0-2.7 1.35 1.35 0 0 0 0 2.7Z"></path>',
     assistants: '<path d="M9 9.5a2.7 2.7 0 1 0 0-5.4 2.7 2.7 0 0 0 0 5.4Z"></path><path d="M4.5 20v-1.8A4.5 4.5 0 0 1 9 13.7h.4"></path><path d="M16.2 12.2a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"></path><path d="M12.4 20v-.9a3.8 3.8 0 0 1 7.6 0v.9"></path><path d="M19.4 7.9h2"></path>',
@@ -9605,6 +9612,7 @@ function content() {
   if (state.screen === "transfers") return (isTransportManagerUser() || isSpwAccount()) ? transfersView() : dashboard();
   if (state.screen === "spwContacts") return canAccessSpwContacts() ? spwContactsView() : dashboard();
   if (state.screen === "dailyBriefing") return canAccessDailyBriefing() ? dailyBriefingView() : dashboard();
+  if (state.screen === "studentAttendance") return canAccessStudentAttendance() ? studentAttendanceView() : dashboard();
   if (state.screen === "circuitStudents") return canOpenCircuitStudentsDashboard() ? circuitStudentsView() : dashboard();
   if (state.screen === "children") return childrenList();
   if (isSupportAssistanceSession() && state.screen === "messages") return `<article class="info-card privacy-masked-card"><h3>Messages</h3><p>Information masquée pour confidentialité</p></article>`;
@@ -13971,6 +13979,170 @@ function dailyBriefingIssuesList(rows = []) {
       <b class="badge ${issue.importance === "urgent" ? "danger" : "warning"}">${esc(issue.importance === "urgent" ? "URGENT" : "IMPORTANT")}</b>
     </button>`)).join("")}
   </div>`;
+}
+
+function canAccessStudentAttendance() {
+  return !isSupportAssistanceSession() && ["driver", "assistant"].includes(state.user?.role);
+}
+
+function canEncodeStudentAttendance() {
+  return canAccessStudentAttendance() && state.user?.role === "assistant";
+}
+
+function studentAttendanceDate() {
+  return localDateString();
+}
+
+function studentAttendanceDirection() {
+  return "morning";
+}
+
+function studentAttendanceId(childId, date = studentAttendanceDate(), direction = studentAttendanceDirection()) {
+  return `attendance-${childId}-${date}-${direction}`;
+}
+
+function studentAttendanceRecords() {
+  return Array.isArray(data.studentAttendance) ? data.studentAttendance : [];
+}
+
+function studentAttendanceRecordForChild(childId, date = studentAttendanceDate(), direction = studentAttendanceDirection()) {
+  const id = studentAttendanceId(childId, date, direction);
+  return studentAttendanceRecords().find((record) => record.id === id)
+    || studentAttendanceRecords().find((record) => record.studentId === childId && record.date === date && record.direction === direction)
+    || null;
+}
+
+function studentAttendanceFirestoreAvailable() {
+  return studentAttendanceFirestorePresent === true;
+}
+
+async function saveStudentAttendanceToFirestoreIfAvailable(record = {}) {
+  if (!studentAttendanceFirestoreAvailable() || !record?.id || navigator.onLine === false) return;
+  try {
+    const { db } = await import("./src/firebaseConfig.js");
+    if (!db) return;
+    const { doc, setDoc } = await import("firebase/firestore");
+    await setDoc(doc(db, "studentAttendance", record.id), record, { merge: true });
+  } catch (error) {
+    console.warn("Présence conservée localement, écriture Firestore indisponible.", error);
+  }
+}
+
+function studentAttendanceIsClosed(record = {}) {
+  return record.status === "closed" || !!record.closedAt;
+}
+
+function studentAttendanceStatusLabel(status = "") {
+  return { present: "Présent", absent: "Absent" }[status] || "Non encodé";
+}
+
+function studentAttendanceStatusBadge(record = {}) {
+  if (!record?.attendanceStatus) return `<b class="badge warning">À encoder</b>`;
+  if (record.attendanceStatus === "present") return `<b class="badge ok">Présent</b>`;
+  if (record.attendanceStatus === "absent") return `<b class="badge danger">Absent</b>`;
+  return `<b class="badge warning">À vérifier</b>`;
+}
+
+function studentAttendanceRows() {
+  return dailyBriefingRows(studentAttendanceDirection()).map((row) => {
+    const record = studentAttendanceRecordForChild(row.child.id);
+    return { ...row, attendance: record };
+  });
+}
+
+function studentAttendanceView() {
+  const rows = studentAttendanceRows();
+  const presentCount = rows.filter((row) => row.attendance?.attendanceStatus === "present").length;
+  const absentCount = rows.filter((row) => row.attendance?.attendanceStatus === "absent").length;
+  const pendingCount = rows.length - presentCount - absentCount;
+  const encodeAllowed = canEncodeStudentAttendance();
+  return `<section class="view-stack compact-stack">
+    <div class="section-title action-title">
+      <div><p class="eyebrow">${esc(encodeAllowed ? "Encodage simple" : "Lecture seule")}</p><h2>Présences du jour</h2></div>
+      <span class="badge ok">${esc(encodeAllowed ? "Présent / absent" : "Lecture seule chauffeur")}</span>
+    </div>
+    <article class="info-card">
+      <h3>Résumé</h3>
+      ${sectionRows([
+        ["Date", formatDateOnly(studentAttendanceDate())],
+        ["Rôle connecté", accountRoleLabel(state.user)],
+        ["Élèves attendus", rows.length],
+        ["Présents", presentCount],
+        ["Absents", absentCount],
+        ["À encoder", pendingCount],
+        ["Firestore", studentAttendanceFirestoreAvailable() ? "Collection existante détectée" : "Local uniquement"]
+      ])}
+      <p class="muted">V1 limitée : la convoyeuse encode seulement Présent ou Absent. Le chauffeur consulte uniquement.</p>
+    </article>
+    <article class="info-card">
+      <h3>Liste des élèves attendus</h3>
+      ${studentAttendanceRowsList(rows)}
+    </article>
+  </section>`;
+}
+
+function studentAttendanceRowsList(rows = []) {
+  return `<div class="quick-list-inner">
+    ${rows.map(studentAttendanceStudentRow).join("") || `<p class="muted">Aucun élève visible pour les présences du jour.</p>`}
+  </div>`;
+}
+
+function studentAttendanceStudentRow(row) {
+  const record = row.attendance || {};
+  const isClosed = studentAttendanceIsClosed(record);
+  const canEncode = canEncodeStudentAttendance() && !isClosed;
+  const lastUpdate = record.updatedAt || record.validatedAt || "";
+  return `<div class="child-row">
+    <span>${esc(quickAssignmentReadableValue(fullName(row.child), "Élève sans nom"))}</span>
+    <small>${esc(`📍 ${quickAssignmentReadableValue(row.startLabel)} · 🚌 ${quickAssignmentReadableValue(row.circuitLabels.join(", "))} · 🏫 ${quickAssignmentReadableValue(row.schoolLabel, "Aucune")}`)}${lastUpdate ? `<br>${esc(`Dernière validation : ${formatDateTime(lastUpdate)}`)}` : ""}</small>
+    ${studentAttendanceStatusBadge(record)}
+    ${isClosed ? `<b class="badge">Clôturé</b>` : ""}
+    ${canEncode ? `<div class="form-actions">
+      <button class="secondary-button compact-action" type="button" data-student-attendance="${esc(row.child.id)}" data-attendance-status="present">Présent</button>
+      <button class="danger-button compact-action" type="button" data-student-attendance="${esc(row.child.id)}" data-attendance-status="absent">Absent</button>
+    </div>` : ""}
+  </div>`;
+}
+
+function saveStudentAttendanceStatus(childId, attendanceStatus) {
+  if (!canEncodeStudentAttendance()) return alert("Encodage réservé à la convoyeuse.");
+  if (!["present", "absent"].includes(attendanceStatus)) return;
+  const child = visibleChildren().find((item) => item.id === childId);
+  if (!child) return alert("Élève introuvable.");
+  const date = studentAttendanceDate();
+  const direction = studentAttendanceDirection();
+  const existing = studentAttendanceRecordForChild(child.id, date, direction);
+  if (studentAttendanceIsClosed(existing)) return alert("Cette présence est clôturée.");
+  const view = transportViewForChild(child, dailyBriefingTransportContext(direction));
+  const now = new Date().toISOString();
+  const shouldPersistFirestore = studentAttendanceFirestoreAvailable();
+  const record = {
+    ...(existing || {}),
+    id: existing?.id || studentAttendanceId(child.id, date, direction),
+    date,
+    direction,
+    studentId: child.id,
+    studentName: fullName(child),
+    transportManagerId: child.transportManagerId || transportManagerIdForUser(state.user),
+    circuitIds: view.transport.circuitIds || [],
+    circuitLabel: quickAssignmentCircuitLabels(view).join(", "),
+    driverIds: view.transport.driverIds || [],
+    assistantId: state.user.id,
+    assistantIds: uniqueText([state.user.id, ...(view.transport.assistantIds || [])]),
+    attendanceStatus,
+    validatedAt: now,
+    validatedBy: state.user.id,
+    validatedByRole: state.user.role,
+    updatedAt: now,
+    updatedBy: state.user.id,
+    status: existing?.status || "open"
+  };
+  data.studentAttendance = Array.isArray(data.studentAttendance) ? data.studentAttendance : [];
+  if (existing) Object.assign(existing, record);
+  else data.studentAttendance.push(record);
+  saveData();
+  if (shouldPersistFirestore) saveStudentAttendanceToFirestoreIfAvailable(record);
+  render();
 }
 
 function driverByRef(ref) {
@@ -19483,6 +19655,9 @@ function bindEvents() {
     state.editingType = "";
     state.editingId = "";
     render();
+  }));
+  document.querySelectorAll("[data-student-attendance]").forEach((button) => button.addEventListener("click", () => {
+    saveStudentAttendanceStatus(button.dataset.studentAttendance, button.dataset.attendanceStatus);
   }));
   document.querySelectorAll("[data-security-group-tab]").forEach((button) => button.addEventListener("click", () => {
     state.securityGroupTab = button.dataset.securityGroupTab;

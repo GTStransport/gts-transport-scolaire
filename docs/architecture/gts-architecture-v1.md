@@ -6,7 +6,9 @@ Architecture validée le 17/06/2026
 
 GTS Connect est une plateforme de gestion du transport scolaire specialise. Son architecture cible distingue clairement le referentiel officiel des eleves et l'organisation operationnelle du transport.
 
-La fiche eleve est une donnee officielle SPW. Le transporteur n'est pas proprietaire des eleves : il organise uniquement les trajets, les circuits, les passages, les vehicules, les chauffeurs, les convoyeuses et les transferts.
+La fiche eleve est une donnee officielle SPW. Le transporteur n'est pas proprietaire des eleves : il organise uniquement les trajets, les circuits, les passages, les vehicules, les chauffeurs et les transferts.
+
+Regle officielle convoyeuses : les convoyeuses appartiennent au referentiel SPW. Le transporteur peut les lire de maniere limitee et les affecter par reference dans l'organisation du transport, mais il ne peut jamais creer, modifier, supprimer ou administrer une fiche convoyeuse.
 
 Le modele V1 conserve les donnees existantes en compatibilite, mais formalise l'architecture cible autour de trajets segmentes :
 
@@ -33,6 +35,7 @@ Le SPW gere :
 - handicap et PMR ;
 - garde alternee ;
 - ecoles ;
+- convoyeuses ;
 - parents et responsables ;
 - informations officielles de l'eleve.
 
@@ -47,13 +50,13 @@ Le transporteur gere :
 - passages ;
 - affectations de trajet ;
 - chauffeurs ;
-- convoyeuses ;
 - vehicules ;
 - transferts operationnels ;
 - retards ;
 - remplacements.
 
 Le transporteur ne cree pas, ne supprime pas et ne modifie pas les donnees officielles de l'eleve.
+Le transporteur ne cree pas, ne supprime pas et ne modifie pas les donnees personnelles ou administratives d'une convoyeuse.
 
 ## 3. Roles
 
@@ -72,6 +75,7 @@ Le chauffeur voit uniquement les passages, segments et eleves qui le concernent.
 ### Convoyeuse
 
 La convoyeuse voit les eleves qu'elle accompagne, les transferts, les changements de car, les absences et les informations sensibles autorisees.
+Elle peut lire sa propre fiche et, si necessaire a l'exploitation terrain, les convoyeuses associees au meme circuit ou au meme transfert.
 
 ### Parent
 
@@ -164,6 +168,24 @@ Propriete transporteur. Peut indiquer la compatibilite PMR.
 ### `circuits`
 
 Propriete transporteur. Represente une ligne operationnelle.
+
+### `assistants`
+
+Referentiel SPW.
+
+Les convoyeuses sont creees, modifiees, desactivees et gouvernees par le SPW.
+
+Le transporteur peut uniquement :
+
+- lire les convoyeuses necessaires a ses circuits, passages ou transferts ;
+- referencer une convoyeuse dans `assistantId` ou `assistantIds` sur les objets transport.
+
+Le transporteur ne peut jamais :
+
+- creer une convoyeuse ;
+- modifier une fiche convoyeuse ;
+- modifier les donnees personnelles d'une convoyeuse ;
+- supprimer ou desactiver une convoyeuse.
 
 ## 5. Types De Transport
 
@@ -267,6 +289,7 @@ Il couvre les cas PMR, les vehicules adaptes et les prises en charge individuali
 
 - `children`
 - `schools`
+- `assistants`
 
 ### Propriete Transporteur
 
@@ -276,7 +299,6 @@ Il couvre les cas PMR, les vehicules adaptes et les prises en charge individuali
 - `circuits`
 - `vehicles`
 - `drivers`
-- `assistants`
 
 ### Referentiel Partage
 
@@ -307,14 +329,22 @@ Les IDs utiles doivent etre denormalises dans `studentAssignments` pour securise
 Regles cibles :
 
 - `children` modifiable uniquement par SPW ;
+- `assistants` modifiable uniquement par SPW ;
 - `studentAssignments` modifiable par transporteur ;
 - `stopPassages` et `tripSegments` modifiables par transporteur ;
 - parents en lecture uniquement sur leurs enfants et trajets ;
 - chauffeurs en lecture uniquement sur leurs passages ;
 - convoyeuses en lecture uniquement sur leurs passages ;
+- transporteurs en lecture limitee sur les convoyeuses necessaires a leurs circuits, passages et transferts ;
+- chauffeurs en lecture limitee sur les convoyeuses necessaires a leurs circuits ou transferts ;
+- convoyeuses en lecture sur leur fiche et les collegues necessaires au meme circuit ou transfert ;
+- parents sans acces direct au referentiel `assistants` ;
+- support sans acces direct au referentiel `assistants` ;
+- suppression physique des convoyeuses interdite ;
+- desactivation des convoyeuses reservee au SPW ;
 - SPW en supervision globale selon perimetre.
 
-Les donnees medicales, PMR, garde alternee et donnees administratives ne doivent pas etre modifiables par le transporteur.
+Les donnees medicales, PMR, garde alternee, donnees administratives eleve et donnees personnelles convoyeuse ne doivent pas etre modifiables par le transporteur.
 
 ## 14. Impact UI
 

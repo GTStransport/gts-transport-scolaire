@@ -2043,6 +2043,11 @@ h2 {
   margin-bottom: 14px;
 }
 
+.admin-login-screen .premium-profile-grid {
+  grid-template-columns: repeat(2, minmax(180px, 190px));
+  justify-content: center;
+}
+
 .premium-profile-card {
   position: relative;
   min-height: 166px;

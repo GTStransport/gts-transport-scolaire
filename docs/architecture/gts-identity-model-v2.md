@@ -356,10 +356,13 @@ request.auth.token.transportManagerId = perimetre transporteur
 
 ### Acces Firestore Attendus
 
+Le profil `assistants/{assistantId}` est un referentiel SPW-owned.
+
 La convoyeuse peut lire :
 
 - son profil utilisateur ;
 - son profil convoyeuse ;
+- les autres convoyeuses uniquement si elles participent au meme circuit ou au meme transfert necessaire ;
 - les `studentAssignments` dont `assistantIds` contient son identifiant ;
 - les `tripSegments` dont `assistantIds` contient son identifiant ;
 - les `stopPassages` dont `assistantIds` contient son identifiant ;
@@ -369,6 +372,7 @@ La convoyeuse ne peut pas :
 
 - modifier les affectations ;
 - modifier les eleves ;
+- creer, modifier, desactiver ou supprimer une fiche convoyeuse ;
 - lire les eleves hors accompagnement ;
 - lire toutes les donnees transporteur.
 
@@ -377,7 +381,10 @@ La convoyeuse ne peut pas :
 ```json
 {
   "assistantIds": ["assistant-1"],
-  "transportManagerId": "tm-1"
+  "transportManagerId": "tm-1",
+  "visibleToAssistantIds": ["assistant-2"],
+  "circuitIds": ["circuit-4104"],
+  "transferHubIds": ["transfer-a"]
 }
 ```
 
@@ -386,6 +393,7 @@ La convoyeuse ne peut pas :
 - coexistence legacy `assistantId` et `convoyeurId` ;
 - `users.id` different de `assistants.id` ;
 - remplacement non ajoute dans `assistantIds` ;
+- transporteur considere a tort comme proprietaire de `assistants` ;
 - acces trop large par `transportManagerId`.
 
 ### Compatibilite Legacy
@@ -438,19 +446,25 @@ Le transporteur peut :
 - lire ses `studentAssignments` ;
 - creer/modifier ses `studentAssignments` ;
 - lire les eleves necessaires a l'organisation transport.
+- lire les convoyeuses necessaires a ses circuits, passages et transferts.
 
 Le transporteur ne peut pas :
 
 - creer un eleve ;
 - supprimer un eleve ;
 - modifier les donnees officielles SPW ;
+- creer une convoyeuse ;
+- modifier une fiche convoyeuse ;
+- modifier les donnees personnelles d'une convoyeuse ;
+- supprimer ou desactiver une convoyeuse ;
 - lire les documents d'un autre `transportManagerId`.
 
 ### Champs V2 Necessaires
 
 ```json
 {
-  "transportManagerId": "tm-1"
+  "transportManagerId": "tm-1",
+  "visibleToTransportManagerIds": ["tm-1"]
 }
 ```
 
@@ -458,6 +472,7 @@ Le transporteur ne peut pas :
 
 - utilisateur secondaire avec `request.auth.uid != transportManagerId` ;
 - regles basees sur UID au lieu de `token.transportManagerId` ;
+- confusion entre visibilite transporteur et propriete SPW des convoyeuses ;
 - documents V2 sans `transportManagerId`.
 
 ### Compatibilite Legacy
@@ -501,6 +516,7 @@ Le SPW peut :
 - gerer les donnees administratives ;
 - gerer les donnees medicales ;
 - gerer les ecoles ;
+- creer, modifier et desactiver les convoyeuses ;
 - lire les affectations V2 pour controle.
 
 Le SPW ne devrait pas modifier directement :
@@ -511,10 +527,13 @@ Le SPW ne devrait pas modifier directement :
 
 sauf decision metier explicite.
 
+Le SPW est proprietaire du referentiel `assistants`. La suppression physique des convoyeuses est interdite : le SPW doit utiliser une desactivation logique, par exemple `active: false`.
+
 ### Risques
 
 - SPW represente comme `role=spw` ou `role=admin + visualTheme=spw` ;
 - regles qui ne testent qu'un seul cas ;
+- suppression physique de convoyeuse au lieu d'une desactivation ;
 - confusion SPW / transporteur.
 
 ### Compatibilite Legacy

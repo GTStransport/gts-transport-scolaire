@@ -9,14 +9,39 @@ const __dirname = path.dirname(__filename);
 const projectRoot = path.resolve(__dirname, "..");
 const envPath = path.join(projectRoot, ".env.local");
 const backupRoot = path.join(projectRoot, "backups");
+const retentionDays = Number(process.env.GTS_BACKUP_RETENTION_DAYS || 30);
 
 const collectionsToBackup = [
   "students",
+  "children",
   "users",
+  "parents",
+  "transportManagers",
   "circuits",
-  "incidents",
+  "schools",
+  "vehicles",
   "drivers",
-  "parents"
+  "assistants",
+  "messages",
+  "privateMessages",
+  "teamMessages",
+  "directMessages",
+  "studentMedical",
+  "studentSensitive",
+  "studentIssues",
+  "studentAbsences",
+  "parentChangeRequests",
+  "transportTransfers",
+  "transferDelays",
+  "supportRequests",
+  "supportReports",
+  "supportPermissions",
+  "accessRequests",
+  "historyLogs",
+  "securityLogs",
+  "loginLogs",
+  "serviceStatus",
+  "settings"
 ];
 
 function parseEnv(content = "") {
@@ -93,6 +118,22 @@ async function backupCollection(db, collectionName, outputDir, exportedAt) {
   return { collection: collectionName, count: documents.length, file: outputFile };
 }
 
+async function cleanupOldBackups() {
+  if (!Number.isFinite(retentionDays) || retentionDays <= 0) return [];
+  const entries = await fs.readdir(backupRoot, { withFileTypes: true }).catch(() => []);
+  const threshold = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
+  const removed = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const fullPath = path.join(backupRoot, entry.name);
+    const stat = await fs.stat(fullPath).catch(() => null);
+    if (!stat || stat.mtimeMs >= threshold) continue;
+    await fs.rm(fullPath, { recursive: true, force: true });
+    removed.push(entry.name);
+  }
+  return removed;
+}
+
 async function main() {
   const exportedAt = new Date().toISOString();
   const outputDir = path.join(backupRoot, backupFolderName());
@@ -112,6 +153,7 @@ async function main() {
     exportedAt,
     projectId: app.options.projectId,
     outputDir,
+    retentionDays,
     collections: results.map((result) => ({
       name: result.collection,
       count: result.count,
@@ -119,6 +161,8 @@ async function main() {
     }))
   };
   await fs.writeFile(path.join(outputDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  const removed = await cleanupOldBackups();
+  if (removed.length) console.log(`Anciennes sauvegardes supprimées (${retentionDays} j) : ${removed.join(", ")}`);
   console.log(`Sauvegarde terminee : ${path.relative(projectRoot, outputDir)}`);
 }
 

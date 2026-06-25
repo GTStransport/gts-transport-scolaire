@@ -46,6 +46,7 @@ Le SPW gere :
 - donnees medicales ;
 - handicap et PMR ;
 - ecoles ;
+- convoyeuses ;
 - garde alternee ;
 - parents et responsables ;
 - informations officielles de l'eleve.
@@ -62,12 +63,12 @@ Le transporteur gere :
 - passages ;
 - affectations transport ;
 - chauffeurs ;
-- convoyeuses ;
 - vehicules ;
 - transferts operationnels ;
 - remplacements.
 
 Le transporteur ne cree pas, ne supprime pas et ne modifie pas les donnees officielles de l'eleve.
+Le transporteur ne cree pas, ne supprime pas et ne modifie pas les convoyeuses. Il peut uniquement lire les convoyeuses necessaires a ses circuits, passages ou transferts, puis les referencer dans les objets transport V2.
 
 ## 4. Architecture Metier V2
 
@@ -437,10 +438,18 @@ active ASC, schoolIds ARRAY_CONTAINS
 Les Firestore Rules V2 doivent garantir :
 
 - SPW modifie `children` ;
+- SPW cree, modifie et desactive les convoyeuses dans `assistants` ;
 - transporteur modifie uniquement l'organisation du transport ;
+- transporteur lit les convoyeuses necessaires a ses circuits, passages et transferts, sans jamais modifier `assistants` ;
 - parent lit uniquement ses enfants ;
 - chauffeur lit uniquement ses passages, segments et affectations ;
+- chauffeur lit uniquement les convoyeuses necessaires a ses circuits ou transferts ;
 - convoyeuse lit uniquement ses passages, segments et affectations ;
+- convoyeuse lit sa fiche et les collegues necessaires au meme circuit ou transfert ;
+- parent ne lit pas directement le referentiel `assistants` ;
+- support ne lit pas directement le referentiel `assistants` ;
+- suppression physique des convoyeuses interdite ;
+- desactivation des convoyeuses reservee au SPW ;
 - support et admin restent encadres.
 
 ### Donnees Denormalisees Utiles
@@ -456,6 +465,20 @@ Pour permettre des regles efficaces, `studentAssignments` doit denormaliser :
 - `circuitIds` ;
 - `schoolId` ;
 - `transferHubIds`.
+
+Pour le referentiel SPW `assistants`, les champs de visibilite recommandes sont :
+
+- `owner: "spw"` ;
+- `active` ;
+- `visibleToTransportManagerIds` ;
+- `visibleToDriverIds` ;
+- `visibleToAssistantIds` ;
+- `circuitIds` ;
+- `transferHubIds` ;
+- `userId` ;
+- `firebaseUid`.
+
+Ces champs autorisent l'exploitation terrain sans transferer la propriete des convoyeuses au transporteur.
 
 ### Risque A Eviter
 

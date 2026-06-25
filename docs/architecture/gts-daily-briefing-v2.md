@@ -1,4 +1,4 @@
-# GTS Daily Briefing V2
+# Briefing Du Jour GTS V2
 
 Architecture validée le 17/06/2026
 
@@ -158,7 +158,52 @@ Objectif :
 - éviter les appels inutiles ;
 - aider la convoyeuse à encoder les présences.
 
-## 8. Élèves PMR
+## 8. Nouveaux Élèves
+
+Le briefing doit signaler les élèves récemment ajoutés au circuit ou pris en charge pour la première fois par l'équipage du jour.
+
+Objectifs :
+
+- attirer l'attention du chauffeur et de la convoyeuse ;
+- éviter qu'un nouvel élève soit oublié ;
+- rappeler l'arrêt actif, l'école et les consignes utiles ;
+- aider une remplaçante à identifier rapidement l'élève.
+
+Informations visibles :
+
+- nom et prénom ;
+- arrêt actif ou domicile ;
+- école ;
+- direction concernée ;
+- date de première prise en charge si disponible ;
+- badge `Nouvel élève`.
+
+Le badge doit rester temporaire, par exemple quelques jours ou jusqu'à confirmation de prise de connaissance.
+
+## 9. Consignes De Prise En Charge
+
+Le briefing affiche les consignes opérationnelles du jour.
+
+Exemples :
+
+- ne pas prendre aujourd'hui ;
+- reste à la garderie ;
+- congé pédagogique ;
+- parent récupère l'enfant ;
+- retour internat ;
+- garde alternée active ;
+- consigne exceptionnelle validée SPW.
+
+La consigne doit apparaître au bon endroit :
+
+- en haut si urgente ;
+- sur la carte de l'élève concerné ;
+- dans la liste de présence si elle modifie la prise en charge ;
+- dans le bloc transfert si elle concerne un transfert non PMR.
+
+Une consigne officielle visible au bon moment évite une erreur de prise en charge.
+
+## 10. Élèves PMR
 
 Le briefing affiche les élèves PMR uniquement si l'information est nécessaire à la prise en charge.
 
@@ -180,7 +225,7 @@ Rappel métier :
 - PMR ne passe jamais par transfert ;
 - centre spécialisé = trajet direct.
 
-## 9. Internat Et Retour Week-End
+## 11. Internat Et Retour Week-End
 
 Le briefing doit signaler les cas internat utiles au jour.
 
@@ -200,7 +245,7 @@ Parent actif : maman
 Destination : domicile maman
 ```
 
-## 10. Garde Alternée Active
+## 12. Garde Alternée Active
 
 Si la garde alternée influence le trajet du jour, le briefing affiche :
 
@@ -213,7 +258,7 @@ La logique doit réutiliser la résidence active calculée officiellement.
 
 Ne pas recréer une seconde logique de garde alternée.
 
-## 11. Transferts Du Jour
+## 13. Transferts Du Jour
 
 Si le circuit comporte un transfert, le briefing affiche :
 
@@ -229,7 +274,7 @@ Si le circuit comporte un transfert, le briefing affiche :
 
 Les transferts concernent uniquement les élèves non PMR.
 
-## 12. Consignes SPW
+## 14. Consignes SPW
 
 Le briefing affiche les consignes SPW applicables au jour et au circuit.
 
@@ -243,7 +288,7 @@ Exemples :
 
 Une consigne SPW publiée dans GTS fait foi.
 
-## 13. Informations Officielles Importantes
+## 15. Informations Officielles Importantes
 
 Le briefing doit afficher les informations officielles :
 
@@ -262,7 +307,25 @@ Nouvelle consigne SPW sur le transfert
 [J'ai lu et compris]
 ```
 
-## 14. Présences À Encoder
+## 16. Alertes Importantes
+
+Les alertes importantes doivent être visibles avant la liste complète des élèves.
+
+Alertes possibles :
+
+- information urgente non confirmée ;
+- absence signalée tardivement ;
+- remplacement chauffeur ;
+- remplacement convoyeuse ;
+- véhicule remplacé ;
+- transfert modifié ;
+- consigne de prise en charge urgente ;
+- garde alternée active avec arrêt différent ;
+- retour internat à ne pas oublier.
+
+Les alertes doivent être courtes, actionnables et liées à une donnée officielle.
+
+## 17. Présences À Encoder
 
 La convoyeuse voit la feuille de présence du jour.
 
@@ -286,7 +349,28 @@ Le briefing doit afficher :
 - absents ;
 - bouton de validation du circuit.
 
-## 15. Contacts Temporaires Autorisés
+## 18. Mode Remplaçant
+
+Le briefing doit fonctionner pour :
+
+- chauffeur volant ;
+- convoyeuse remplaçante ;
+- chauffeur et convoyeuse remplaçants en même temps.
+
+En mode remplaçant, le briefing affiche uniquement :
+
+- le circuit concerné ;
+- la période de remplacement ;
+- l'équipage réel du jour ;
+- les élèves attendus ;
+- les absences signalées ;
+- les consignes de prise en charge ;
+- les informations officielles utiles ;
+- les contacts temporaires autorisés.
+
+Le remplaçant ne reçoit aucun accès global aux autres circuits.
+
+## 19. Contacts Temporaires Autorisés
 
 En cas de remplacement, GTS peut partager temporairement les contacts utiles.
 
@@ -319,7 +403,57 @@ Règles :
 - accès limité au jour ou à la période ;
 - révocation automatique après remplacement.
 
-## 16. Traçabilité Des Consultations
+## 20. Notifications
+
+Le briefing peut être alimenté par des notifications ciblées.
+
+Notifications à prévoir :
+
+- nouvelle information officielle urgente ;
+- nouvelle consigne de prise en charge ;
+- remplacement chauffeur ;
+- remplacement convoyeuse ;
+- absence signalée ;
+- changement véhicule ;
+- briefing du jour disponible ;
+- confirmation urgente attendue.
+
+Règles :
+
+- pas de donnée sensible dans le push ;
+- contenu complet uniquement après authentification ;
+- notification limitée au rôle et au circuit concerné ;
+- trace de l'envoi et de la consultation.
+
+Exemple de notification :
+
+```txt
+Nouvelle consigne GTS à consulter avant le départ.
+```
+
+## 21. Ordre D'Affichage
+
+Ordre recommandé :
+
+1. Alertes urgentes à confirmer.
+2. Équipage du jour.
+3. Véhicule du jour.
+4. Circuit du jour.
+5. Remplacements actifs.
+6. Informations officielles importantes.
+7. Consignes de prise en charge.
+8. Absences signalées.
+9. Nouveaux élèves.
+10. Garde alternée active.
+11. Internat / retour week-end.
+12. Transferts du jour.
+13. Élèves attendus.
+14. Présences à encoder.
+15. Contacts temporaires autorisés.
+
+L'ordre doit privilégier ce qui évite une erreur immédiate avant les détails de consultation.
+
+## 22. Traçabilité Des Consultations
 
 Chaque consultation importante doit être journalisée.
 
@@ -346,7 +480,7 @@ Exemple :
 }
 ```
 
-## 17. Sécurité
+## 23. Sécurité
 
 Règles de sécurité :
 
@@ -367,7 +501,34 @@ Le briefing ne doit pas permettre :
 - de consulter des données médicales non nécessaires ;
 - de conserver un accès après remplacement.
 
-## 18. Données Sources
+## 24. Sécurité / RGPD
+
+Le briefing concentre des informations opérationnelles sensibles. Il doit respecter :
+
+- minimisation ;
+- accès limité au jour ;
+- accès limité au circuit ;
+- accès limité au rôle ;
+- révocation automatique des remplacements ;
+- journalisation des accès ;
+- absence de données sensibles inutiles ;
+- support sans accès direct.
+
+Les données médicales ne doivent apparaître que sous forme de besoins opérationnels strictement nécessaires.
+
+Exemples acceptables :
+
+- véhicule adapté requis ;
+- fauteuil roulant ;
+- aide à la montée.
+
+Exemples à éviter :
+
+- diagnostic ;
+- historique médical ;
+- détails familiaux sensibles.
+
+## 25. Données Sources
 
 Le briefing peut être construit depuis :
 
@@ -385,7 +546,7 @@ Le briefing peut être construit depuis :
 
 Le briefing doit rester une vue calculée, pas une duplication complète de toutes les données.
 
-## 19. UI Prévue
+## 26. UI Prévue
 
 Structure recommandée :
 
@@ -412,7 +573,22 @@ Priorités UX :
 - pas de longs formulaires ;
 - présence en un geste.
 
-## 20. Roadmap
+## 27. Gains Métier
+
+Le briefing du jour apporte :
+
+- moins d'oublis avant départ ;
+- moins d'appels de dernière minute ;
+- meilleure préparation des remplaçants ;
+- meilleure prise en compte des absences ;
+- meilleure gestion des gardes alternées ;
+- moins d'erreurs de prise ou dépose ;
+- meilleure coordination chauffeur/convoyeuse ;
+- meilleure traçabilité ;
+- réduction des relais WhatsApp ou papier ;
+- meilleure preuve de consultation.
+
+## 28. Roadmap
 
 ### Phase 1 : Documentation
 
@@ -442,7 +618,7 @@ Permettre consultation et saisie de présence sans réseau stable.
 
 Tracer les consultations et confirmations.
 
-## 21. Recommandation Officielle
+## 29. Recommandation Officielle
 
 Le briefing du jour doit devenir l'écran quotidien principal des équipages.
 

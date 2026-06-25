@@ -490,58 +490,127 @@ Vue administrative :
 - export PDF ;
 - statistiques.
 
-## 15. Gestion Des Remplacements Convoyeuses
+## 15. Gestion Des Remplacements D'Équipage
 
 ### 15.1 Problème Métier
 
-Lorsqu'une convoyeuse est absente, une convoyeuse de remplacement peut être affectée au dernier moment.
+Lorsqu'un membre de l'équipage est absent, un remplacement peut être affecté au dernier moment.
 
 Problèmes constatés :
 
-- la remplaçante ne reçoit pas toujours les documents à temps ;
-- elle ne connaît pas les élèves ;
-- elle ne connaît pas les absences signalées ;
-- elle ne connaît pas les consignes du jour ;
-- elle peut arriver sans aucune information utile.
+- le remplaçant ou la remplaçante ne reçoit pas toujours les documents à temps ;
+- il ou elle ne connaît pas les élèves ;
+- il ou elle ne connaît pas les absences signalées ;
+- il ou elle ne connaît pas les consignes du jour ;
+- il ou elle peut arriver sans aucune information utile.
 
-GTS doit éviter qu'une convoyeuse remplaçante arrive sur un circuit sans les informations minimales nécessaires à la prise en charge.
+GTS doit éviter qu'un remplaçant arrive sur un circuit sans les informations minimales nécessaires à la prise en charge.
 
-### 15.2 Objectif
+### 15.2 Règles Métier
 
-Lorsqu'une convoyeuse de remplacement est affectée à un circuit, GTS doit lui donner automatiquement :
+Un chauffeur titulaire est attribué à un circuit ou à un car.
+
+Les chauffeurs volants ne sont attribués à aucun car fixe.
+
+Un chauffeur volant intervient uniquement lorsqu'un chauffeur titulaire est absent.
+
+Le remplacement chauffeur ne doit pas être confondu avec le remplacement convoyeuse.
+
+### 15.3 Cas 1 : Convoyeuse Absente
+
+Cas métier :
+
+- un chauffeur a déjà son circuit attribué ;
+- une convoyeuse titulaire est prévue sur ce même circuit ;
+- si la convoyeuse titulaire est absente, le SPW affecte une convoyeuse remplaçante sur ce même circuit ;
+- le chauffeur reste sur son circuit ;
+- seule la convoyeuse affectée au circuit change temporairement.
+
+Conséquence :
+
+- aucun accès à d'autres circuits ne doit être créé ;
+- aucun changement d'affectation chauffeur ne doit être créé ;
+- aucun transfert de circuit ne doit être déduit du remplacement ;
+- la remplaçante reçoit uniquement les informations du circuit concerné.
+
+### 15.4 Cas 2 : Chauffeur Absent
+
+Cas métier :
+
+- un chauffeur titulaire est prévu sur le circuit ou le car ;
+- le chauffeur titulaire est absent ;
+- un chauffeur volant remplace temporairement le chauffeur titulaire ;
+- la convoyeuse prévue reste normalement la même ;
+- le chauffeur volant reçoit les informations du circuit concerné ;
+- le chauffeur volant reçoit un accès temporaire uniquement pour la période du remplacement ;
+- le chauffeur titulaire ne doit pas être supprimé du circuit ;
+- le chauffeur titulaire est seulement remplacé temporairement.
+
+Conséquence :
+
+- aucun changement définitif du circuit ne doit être créé ;
+- aucun nouveau circuit ne doit être attribué au chauffeur volant ;
+- le chauffeur volant ne reçoit pas d'accès global transporteur ;
+- la convoyeuse prévue doit voir le chauffeur volant avec qui elle travaille pendant la période concernée.
+
+### 15.5 Cas 3 : Chauffeur Et Convoyeuse Absents
+
+Cas métier :
+
+- le chauffeur titulaire est absent ;
+- la convoyeuse titulaire est absente ;
+- un chauffeur volant est affecté ;
+- une convoyeuse remplaçante est affectée ;
+- les deux remplaçants interviennent sur le même circuit ;
+- les deux reçoivent les informations du même circuit ;
+- les contacts sont partagés uniquement entre les personnes affectées au remplacement.
+
+Conséquence :
+
+- aucun accès à d'autres circuits ne doit être créé ;
+- les droits temporaires concernent uniquement le circuit, la date et la période définis ;
+- les titulaires ne sont pas supprimés du circuit ;
+- les remplaçants cessent d'avoir accès à la fin du remplacement.
+
+### 15.6 Objectif
+
+Lorsqu'un remplacement est affecté à un circuit, GTS doit donner automatiquement au remplaçant :
 
 - accès à la liste des élèves du jour ;
 - accès à la feuille de présence numérique ;
-- accès au chauffeur avec qui elle travaille ;
+- accès à la personne avec qui il travaille sur le circuit ;
 - accès aux informations ciblées concernant le circuit ;
 - accès aux consignes utiles du jour ;
 - accès aux transferts du jour si concernés ;
 - accès aux informations nécessaires à la prise en charge.
 
-Le chauffeur concerné doit être informé automatiquement du remplacement et voir la convoyeuse avec qui il travaille pendant la période concernée.
+Les membres d'équipage concernés doivent être informés automatiquement du remplacement.
 
 L'accès doit rester temporaire, limité et tracé.
 
-### 15.3 Workflow SPW
+### 15.7 Workflow SPW
 
-Le SPW peut affecter une convoyeuse de remplacement à un circuit.
+Le SPW peut affecter un remplacement à un circuit existant.
 
 Étapes recommandées :
 
 1. choisir la date ;
-2. choisir le circuit ;
-3. choisir la convoyeuse absente ;
-4. choisir la convoyeuse remplaçante ;
-5. définir la période de remplacement ;
-6. valider l'accès temporaire.
+2. choisir le circuit concerné ;
+3. indiquer le type de remplacement : chauffeur, convoyeuse ou les deux ;
+4. choisir le titulaire absent ;
+5. choisir le remplaçant ;
+6. définir la période de remplacement ;
+7. valider l'accès temporaire.
 
 Après validation, GTS prépare automatiquement les droits temporaires nécessaires.
 
-GTS doit aussi préparer la visibilité temporaire entre le chauffeur concerné et la convoyeuse remplaçante.
+Le circuit reste inchangé.
+
+GTS prépare aussi la visibilité temporaire entre les personnes qui travaillent ensemble sur ce circuit pendant le remplacement.
 
 Le SPW peut aussi révoquer manuellement l'accès si le remplacement est annulé.
 
-### 15.4 Workflow Convoyeuse Remplaçante
+### 15.8 Workflow Convoyeuse Remplaçante
 
 La convoyeuse remplaçante ouvre GTS.
 
@@ -554,7 +623,7 @@ Elle voit uniquement :
 - les absences déjà signalées ;
 - les consignes ciblées du jour ;
 - les transferts concernés si le circuit passe par un transfert ;
-- le chauffeur avec qui elle travaille ;
+- le chauffeur titulaire ou volant avec qui elle travaille ;
 - les informations nécessaires à la prise en charge.
 
 Elle ne voit pas :
@@ -565,9 +634,11 @@ Elle ne voit pas :
 - le répertoire global des chauffeurs ou convoyeuses ;
 - les données sensibles non nécessaires.
 
-### 15.5 Workflow Chauffeur Concerné
+### 15.9 Workflow Chauffeur Titulaire Concerné
 
-Lorsqu'une convoyeuse remplaçante est affectée, le chauffeur concerné doit être informé automatiquement.
+Lorsqu'une convoyeuse remplaçante est affectée, le chauffeur titulaire concerné doit être informé automatiquement.
+
+Il reste sur son circuit attribué.
 
 Il voit temporairement :
 
@@ -581,9 +652,35 @@ Il ne voit pas :
 
 - le répertoire global des convoyeuses ;
 - les convoyeuses hors circuit ;
+- les autres circuits ;
 - les informations hors période de remplacement.
 
-### 15.6 Droits Temporaires
+### 15.10 Workflow Chauffeur Volant
+
+Lorsqu'un chauffeur titulaire est absent, le chauffeur volant ouvre GTS.
+
+Il voit uniquement :
+
+- le circuit concerné ;
+- la date concernée ;
+- la liste des élèves du jour ;
+- les absences déjà signalées ;
+- les consignes ciblées du jour ;
+- les transferts concernés si le circuit passe par un transfert ;
+- la convoyeuse prévue ou remplaçante avec qui il travaille ;
+- les informations nécessaires à la prise en charge.
+
+Il ne voit pas :
+
+- les autres circuits ;
+- les autres élèves ;
+- les informations hors période ;
+- le répertoire global des chauffeurs ou convoyeuses ;
+- les données sensibles non nécessaires.
+
+Le chauffeur volant n'est pas ajouté comme chauffeur titulaire du circuit.
+
+### 15.11 Droits Temporaires
 
 Les droits de remplacement doivent être bornés.
 
@@ -591,9 +688,11 @@ Champs recommandés pour un futur modèle de remplacement :
 
 ```json
 {
+  "replacementType": "assistant",
   "replacementAssistantId": "assistant-remplacement",
   "originalAssistantId": "assistant-absente",
-  "driverId": "driver-1",
+  "replacementDriverId": "",
+  "originalDriverId": "driver-1",
   "circuitId": "circuit-4104",
   "date": "2026-06-17",
   "startsAt": "2026-06-17T06:00:00.000Z",
@@ -605,16 +704,29 @@ Champs recommandés pour un futur modèle de remplacement :
 }
 ```
 
+Valeurs possibles de `replacementType` :
+
+```txt
+assistant
+driver
+driver_and_assistant
+```
+
 Règles :
 
 - accès limité au circuit concerné ;
 - accès limité à la date ou période du remplacement ;
-- partage des contacts limité au chauffeur et à la convoyeuse remplaçante concernés ;
+- partage des contacts limité aux personnes affectées au remplacement ;
+- aucun accès à d'autres circuits ;
+- aucun changement définitif de circuit chauffeur ;
+- aucun changement définitif de convoyeuse titulaire ;
+- aucun remplaçant ne devient titulaire par ce mécanisme ;
+- aucun accès global transporteur ;
 - révocation automatique à `endsAt` ;
 - révocation manuelle possible par SPW ;
 - aucun accès permanent ajouté sans validation SPW.
 
-### 15.7 Données De Contact Visibles Temporairement
+### 15.12 Données De Contact Visibles Temporairement
 
 Les contacts utiles peuvent être partagés uniquement pendant la période du remplacement.
 
@@ -632,28 +744,32 @@ Elles doivent être limitées :
 
 - au circuit concerné ;
 - à la date ou période du remplacement ;
-- au chauffeur concerné ;
-- à la convoyeuse remplaçante concernée.
+- au chauffeur titulaire ou volant concerné ;
+- à la convoyeuse titulaire ou remplaçante concernée.
 
 Après la fin du remplacement, l'accès doit être révoqué automatiquement.
 
-### 15.8 Sécurité
+### 15.13 Sécurité
 
 Principes de sécurité :
 
-- la remplaçante n'obtient pas un accès global transporteur ;
+- un remplaçant n'obtient pas un accès global transporteur ;
 - l'accès ne doit pas être basé uniquement sur `transportManagerId` ;
 - l'accès doit être lié au circuit, à la date et à la période ;
-- le partage de contact est limité au binôme chauffeur / convoyeuse remplaçante ;
+- le chauffeur titulaire conserve son circuit attribué sauf absence temporaire ;
+- le chauffeur volant ne devient pas titulaire du circuit ;
+- la convoyeuse titulaire n'est pas supprimée du circuit en cas de remplacement ;
+- le remplacement ne crée aucun accès à d'autres circuits ;
+- le partage de contact est limité aux personnes affectées au remplacement ;
 - pas de partage global du répertoire ;
 - révocation automatique après la fin du remplacement ;
 - les données médicales restent minimisées ;
 - le support n'a pas d'accès direct aux contenus sensibles ;
 - le parent ne voit pas les informations de remplacement internes.
 
-La convoyeuse remplaçante peut consulter uniquement les données nécessaires à l'exécution du remplacement.
+Le remplaçant peut consulter uniquement les données nécessaires à l'exécution du remplacement.
 
-### 15.9 Traçabilité
+### 15.14 Traçabilité
 
 Toute attribution de remplacement doit être journalisée.
 
@@ -661,9 +777,10 @@ Actions à tracer :
 
 - création du remplacement ;
 - activation des droits temporaires ;
-- première consultation par la remplaçante ;
-- notification automatique du chauffeur ;
-- notification automatique de la convoyeuse remplaçante ;
+- type de remplacement ;
+- confirmation que les titulaires ne sont pas supprimés du circuit ;
+- première consultation par le remplaçant ;
+- notification automatique des personnes concernées ;
 - accès aux coordonnées temporaires ;
 - validation de présence ;
 - modification de présence ;
@@ -676,7 +793,9 @@ Exemple d'historique :
 ```json
 {
   "action": "replacement_access_granted",
+  "replacementType": "assistant",
   "assistantId": "assistant-remplacement",
+  "driverId": "driver-1",
   "circuitId": "circuit-4104",
   "date": "2026-06-17",
   "actorId": "spw-1",
@@ -698,9 +817,14 @@ Exemple d'accès contact :
 }
 ```
 
-### 15.10 Impact Sur La Feuille De Présence
+### 15.15 Impact Sur La Feuille De Présence
 
-La feuille de présence numérique doit accepter une convoyeuse titulaire ou remplaçante.
+La feuille de présence numérique doit accepter :
+
+- une convoyeuse titulaire ;
+- une convoyeuse remplaçante ;
+- un chauffeur titulaire ;
+- un chauffeur volant.
 
 Champs utiles :
 
@@ -708,9 +832,11 @@ Champs utiles :
 {
   "assistantId": "assistant-remplacement",
   "originalAssistantId": "assistant-absente",
-  "driverId": "driver-1",
+  "driverId": "driver-volant",
+  "originalDriverId": "driver-titulaire",
   "replacement": true,
-  "replacementReason": "absence",
+  "replacementType": "driver_and_assistant",
+  "replacementReason": "absence_equipage",
   "validatedAt": "Timestamp"
 }
 ```
@@ -722,18 +848,22 @@ Présent
 Absent
 ```
 
-La remplaçante ne doit pas encoder plus d'informations qu'une convoyeuse titulaire.
+Le remplacement ne change pas la simplicité de saisie.
 
-### 15.11 Impact Sur La Diffusion Ciblée D'Informations
+La convoyeuse titulaire ou remplaçante ne doit pas encoder plus d'informations.
 
-La diffusion ciblée doit inclure automatiquement la convoyeuse remplaçante pendant la période active.
+### 15.16 Impact Sur La Diffusion Ciblée D'Informations
+
+La diffusion ciblée doit inclure automatiquement les remplaçants pendant la période active.
 
 Elle doit notifier automatiquement :
 
-- le chauffeur concerné ;
+- le chauffeur titulaire si une convoyeuse remplaçante est affectée ;
+- la convoyeuse titulaire si un chauffeur volant est affecté ;
+- le chauffeur volant ;
 - la convoyeuse remplaçante.
 
-La convoyeuse remplaçante doit recevoir :
+La convoyeuse remplaçante ou le chauffeur volant doit recevoir :
 
 - informations du circuit ;
 - consignes SPW liées au circuit ;
@@ -741,7 +871,7 @@ La convoyeuse remplaçante doit recevoir :
 - retards ou changements de trajet ;
 - incidents utiles à la prise en charge.
 
-Le chauffeur doit recevoir :
+Le chauffeur titulaire doit recevoir, en cas de remplacement convoyeuse :
 
 - information qu'une convoyeuse remplaçante est affectée ;
 - prénom/nom de la convoyeuse remplaçante ;
@@ -749,13 +879,28 @@ Le chauffeur doit recevoir :
 - circuit concerné ;
 - horaire de service.
 
-Elle ne doit plus recevoir ces informations après la fin du remplacement.
+La convoyeuse titulaire doit recevoir, en cas de remplacement chauffeur :
+
+- information qu'un chauffeur volant est affecté ;
+- prénom/nom du chauffeur volant ;
+- téléphone professionnel si disponible ;
+- circuit concerné ;
+- horaire de service.
+
+Les notifications doivent préciser le cas métier :
+
+- convoyeuse absente : le chauffeur reste sur son circuit, seule la convoyeuse change temporairement ;
+- chauffeur absent : le chauffeur volant remplace temporairement le titulaire, la convoyeuse prévue reste normalement la même ;
+- chauffeur et convoyeuse absents : les deux remplaçants sont affectés sur le même circuit.
+
+Les remplaçants ne doivent plus recevoir ces informations après la fin du remplacement.
 
 Les destinataires calculés doivent donc tenir compte :
 
 - des `assistantIds` titulaires ;
+- des `driverIds` titulaires ;
 - des remplaçantes actives ;
-- du chauffeur concerné ;
+- des chauffeurs volants actifs ;
 - de la date ;
 - du circuit ;
 - du transfert éventuel.

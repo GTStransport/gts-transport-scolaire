@@ -40,9 +40,14 @@ paths=(
   "tecStops/tec-demo-hopital"
 )
 
-echo "Nettoyage des donnees de demonstration sur ${PROJECT_ID}"
-for path in "${paths[@]}"; do
-  echo "- ${path}"
-  firebase firestore:delete "${path}" --project "${PROJECT_ID}" --recursive --force >/dev/null
-done
-echo "Nettoyage demo termine."
+cat <<'EOF'
+Ce script est volontairement bloque.
+
+Les anciens identifiants de demonstration peuvent aussi etre utilises par des
+donnees reelles en production. Supprimer par chemin fixe risquerait donc
+d'effacer des comptes, eleves, circuits ou vehicules reels.
+
+Utiliser une sauvegarde Firestore et verifier chaque document avant tout
+nettoyage manuel.
+EOF
+exit 1

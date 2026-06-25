@@ -1,57 +1,115 @@
-# GTS Incident Management V2
+# Gestion Des Incidents GTS V2
 
 Architecture validée le 17/06/2026
 
 ## 1. Objectif
 
-GTS V2 doit remplacer les rapports papier d'incident par un système numérique avec suivi complet du dossier.
+GTS V2 doit remplacer le système actuel basé sur papier, mail, plateformes externes et transmissions manuelles par une gestion complète des incidents dans GTS.
 
 Principe officiel :
 
 ```txt
-La convoyeuse ou le chauffeur déclare un incident dans GTS.
-Le SPW reste seul décisionnaire des mesures prises.
+Un incident est créé une seule fois et suivi jusqu'à sa clôture sans échange parallèle de mails ou de papiers.
 ```
 
 Le système doit permettre :
 
-- déclaration rapide ;
-- suivi du statut ;
-- historique centralisé ;
-- traçabilité complète ;
-- réduction du papier et des mails ;
-- meilleure visibilité pour le SPW.
+- création rapide d'un incident par un acteur autorisé ;
+- suivi clair du statut ;
+- analyse centralisée par le SPW ;
+- demandes d'informations complémentaires tracées ;
+- décision SPW protégée ;
+- notifications ciblées ;
+- historique complet ;
+- intégration au dossier élève ;
+- réduction des pertes d'information.
 
 ## 2. Contexte Métier
 
-Aujourd'hui, les incidents peuvent être rédigés :
+Aujourd'hui :
 
-- sur papier ;
-- dans une plateforme externe ;
-- par mail ;
-- par message transmis à plusieurs personnes.
+- la convoyeuse rédige souvent un rapport papier ;
+- le document est transmis au SPW ;
+- certains éléments transitent par mail, téléphone ou plateforme externe ;
+- le suivi est difficile ;
+- le chauffeur n'a pas toujours le retour ;
+- le parent n'est pas toujours informé clairement ;
+- le transporteur ne sait pas toujours où en est le dossier.
 
 Problèmes constatés :
 
-- retard d'envoi ;
+- retard de transmission ;
 - perte d'information ;
-- suivi difficile ;
-- absence de visibilité sur l'état du dossier ;
 - double encodage ;
-- historique dispersé ;
-- difficulté à savoir si le SPW a reçu et traité le rapport.
+- suivi dispersé ;
+- absence de preuve claire de réception ;
+- statut du dossier difficile à connaître ;
+- risque de décisions prises sur des informations incomplètes.
 
-## 3. Types D'Incidents
+## 3. Création D'Incident
 
-Types officiels prévus :
+Un incident peut être créé par :
+
+- convoyeuse ;
+- chauffeur ;
+- transporteur ;
+- SPW.
+
+### Convoyeuse
+
+La convoyeuse peut déclarer un incident lié :
+
+- à son circuit du jour ;
+- à un élève qu'elle accompagne ;
+- à une présence ou absence problématique ;
+- à un transfert concerné ;
+- à une situation de sécurité observée.
+
+### Chauffeur
+
+Le chauffeur peut déclarer un incident lié :
+
+- à son circuit ;
+- au véhicule ;
+- à un élève transporté ;
+- à la sécurité routière ou opérationnelle ;
+- à une difficulté au point de chargement, de transfert ou de dépose.
+
+### Transporteur
+
+Le transporteur peut déclarer un incident lié :
+
+- à l'organisation du transport ;
+- à un chauffeur ;
+- à un véhicule ;
+- à un circuit ;
+- à un retard ou problème opérationnel ;
+- à une difficulté de prise en charge.
+
+Le transporteur ne peut pas prendre de décision SPW sur l'élève.
+
+### SPW
+
+Le SPW peut créer un incident :
+
+- à partir d'un signalement reçu ;
+- lors d'un suivi administratif ;
+- à partir d'une information officielle ;
+- dans le cadre du dossier élève.
+
+Le SPW reste seul responsable de l'analyse et des décisions officielles.
+
+## 4. Types D'Incidents
+
+Types officiels :
 
 ```txt
 behavior
 violence
-aggression
-damage
-instruction_refusal
-transfer_issue
+rule_violation
+transport_issue
+safety
+transfer
 other
 ```
 
@@ -59,17 +117,81 @@ Libellés métier :
 
 - comportement ;
 - violence ;
-- agression ;
-- dégradation ;
-- refus de consigne ;
-- problème de transfert ;
+- non-respect des règles ;
+- problème transport ;
+- sécurité ;
+- transfert ;
 - autre.
 
-Le type `other` doit rester disponible, mais doit être limité par un champ de description obligatoire.
+Règles :
 
-## 4. Informations Enregistrées
+- le type `other` doit exiger une description précise ;
+- le type `safety` doit être traité comme prioritaire ;
+- le type `violence` doit alerter le SPW immédiatement ;
+- le type `transfer` est réservé aux incidents non PMR liés à un transfert réel.
 
-Champs minimaux :
+## 5. Niveaux
+
+Niveaux officiels :
+
+```txt
+low
+medium
+high
+critical
+```
+
+Libellés métier :
+
+- faible ;
+- moyen ;
+- élevé ;
+- critique.
+
+### Faible
+
+Incident mineur, sans danger immédiat.
+
+Exemples :
+
+- oubli de consigne ;
+- comportement isolé sans conséquence ;
+- remarque opérationnelle simple.
+
+### Moyen
+
+Incident nécessitant une analyse SPW.
+
+Exemples :
+
+- non-respect répété des règles ;
+- conflit verbal ;
+- difficulté au point de prise en charge.
+
+### Élevé
+
+Incident sérieux nécessitant une réaction rapide.
+
+Exemples :
+
+- violence verbale importante ;
+- mise en danger ;
+- problème de transfert ayant impacté la prise en charge.
+
+### Critique
+
+Incident urgent nécessitant une attention immédiate.
+
+Exemples :
+
+- danger physique ;
+- violence grave ;
+- élève non localisé ;
+- problème de sécurité majeur.
+
+## 6. Informations Enregistrées
+
+Champs minimaux recommandés :
 
 ```json
 {
@@ -80,6 +202,8 @@ Champs minimaux :
   "time": "08:15",
   "circuitId": "circuit-4104",
   "circuitLabel": "4104",
+  "transportType": "circuit_ferme",
+  "direction": "morning",
   "driverId": "driver-1",
   "driverName": "Chauffeur Nom",
   "assistantId": "assistant-1",
@@ -87,8 +211,9 @@ Champs minimaux :
   "transportManagerId": "tm-1",
   "schoolId": "school-1",
   "incidentType": "behavior",
+  "severity": "medium",
   "description": "Description factuelle de l'incident.",
-  "status": "sent",
+  "status": "submitted",
   "createdBy": "assistant-1",
   "createdByRole": "assistant",
   "createdAt": "Timestamp",
@@ -96,7 +221,22 @@ Champs minimaux :
 }
 ```
 
-Pièces jointes futures :
+Principes :
+
+- la description doit rester factuelle ;
+- les données médicales ne doivent être ajoutées que si elles sont strictement nécessaires ;
+- les informations sensibles doivent rester visibles uniquement aux rôles autorisés ;
+- les décisions SPW doivent être séparées du signalement initial.
+
+## 7. Pièces Jointes
+
+Types prévus :
+
+- texte ;
+- document ;
+- photo si autorisé.
+
+Exemple :
 
 ```json
 {
@@ -107,340 +247,390 @@ Pièces jointes futures :
       "fileName": "incident.jpg",
       "storagePath": "incidents/incident-123/incident.jpg",
       "uploadedBy": "assistant-1",
-      "uploadedAt": "Timestamp"
+      "uploadedAt": "Timestamp",
+      "visibility": "spw_only"
     }
   ]
 }
 ```
 
-Règle : les pièces jointes ne sont pas obligatoires dans la première version.
+Règles :
 
-## 5. Workflow
+- les pièces jointes ne sont pas obligatoires ;
+- les photos doivent être autorisées explicitement avant usage ;
+- aucun fichier sensible ne doit être envoyé en notification push ;
+- les pièces jointes doivent être protégées par les mêmes droits que l'incident ;
+- la suppression physique doit être encadrée par une politique SPW.
+
+## 8. Workflow
 
 Statuts officiels :
 
 ```txt
 draft
-sent
-received_by_spw
-in_review
-additional_info_requested
+submitted
+spw_review
+additional_information_requested
+decision_taken
 closed
 ```
 
 ### `draft`
 
-Le déclarant prépare le rapport.
+Le déclarant prépare l'incident.
 
-Visible uniquement par le déclarant et les rôles autorisés selon validation future.
+Visible uniquement par le déclarant et les rôles explicitement autorisés.
 
-### `sent`
+### `submitted`
 
-Le rapport est envoyé.
+L'incident est soumis officiellement.
 
-Il devient visible au SPW.
+Le SPW est notifié.
 
-### `received_by_spw`
-
-Le SPW confirme la réception.
-
-### `in_review`
+### `spw_review`
 
 Le SPW analyse le dossier.
 
-### `additional_info_requested`
+Le SPW peut :
 
-Le SPW demande un complément.
+- consulter l'historique ;
+- demander un complément ;
+- préparer une décision ;
+- décider de communiquer ou non au parent.
 
-Le complément peut être demandé à :
+### `additional_information_requested`
+
+Le SPW demande un complément à un acteur concerné.
+
+Complément possible auprès de :
 
 - convoyeuse ;
 - chauffeur ;
-- transporteur.
+- transporteur ;
+- autre agent SPW autorisé.
+
+### `decision_taken`
+
+Le SPW a pris une décision.
+
+La décision peut être :
+
+- interne SPW ;
+- communiquée au transporteur ;
+- communiquée au parent ;
+- intégrée au dossier élève ;
+- reliée à une consigne de prise en charge.
 
 ### `closed`
 
 Le SPW clôture le dossier.
 
-La clôture doit être horodatée et historisée.
+La clôture doit être :
 
-## 6. Visibilité Par Rôle
+- horodatée ;
+- historisée ;
+- liée au décideur SPW ;
+- non modifiable sans réouverture tracée.
 
-### Convoyeuse
+## 9. Historique Complet
 
-Peut :
+Chaque événement doit être historisé :
 
-- créer un incident lié à son circuit, ses élèves ou son transfert ;
-- voir ses incidents déclarés ;
-- compléter si le SPW demande un complément ;
-- voir le statut du dossier.
-
-Ne peut pas :
-
-- décider de mesures ;
-- exclure un élève ;
-- modifier un incident clôturé ;
-- voir les incidents hors périmètre.
-
-### Chauffeur
-
-Peut :
-
-- créer un incident lié à son circuit, ses élèves ou son transfert ;
-- voir ses incidents déclarés ;
-- compléter si le SPW demande un complément ;
-- voir le statut du dossier.
-
-Ne peut pas :
-
-- décider de mesures ;
-- exclure un élève ;
-- voir les incidents hors périmètre.
-
-### Transporteur
-
-Peut :
-
-- voir les incidents liés à son périmètre transport ;
-- suivre les statuts ;
-- répondre à une demande de complément si concerné.
-
-Ne peut pas :
-
-- décider de mesures SPW ;
-- modifier les données officielles de l'élève ;
-- clôturer un dossier SPW ;
-- exclure un élève.
-
-### SPW
-
-Peut :
-
-- lire tous les incidents ;
-- confirmer réception ;
-- analyser ;
-- demander un complément ;
-- décider des mesures ;
-- clôturer.
-
-Le SPW est seul décisionnaire des mesures prises.
-
-### Parent
-
-Accès non automatique.
-
-Le parent ne doit pas voir directement tous les rapports d'incident.
-
-Une communication parentale peut être faite ultérieurement par le SPW via une information officielle ou un canal validé.
-
-## 7. Notifications
-
-Notifications prévues :
-
-- création d'un incident ;
-- réception SPW ;
+- création ;
+- soumission ;
+- lecture SPW ;
 - changement de statut ;
 - demande de complément ;
-- clôture.
-
-Règles :
-
-- aucune donnée sensible dans le push ;
-- pas de détail d'incident dans la notification ;
-- contenu complet uniquement après authentification ;
-- notification parent uniquement si SPW décide de communiquer.
-
-Exemples :
-
-```txt
-Nouvel incident à consulter
-Demande de complément sur un incident
-Incident clôturé
-```
-
-## 8. Historique Complet
-
-Chaque incident doit conserver un historique.
-
-Actions à tracer :
-
-- création brouillon ;
-- envoi ;
-- réception SPW ;
-- passage en analyse ;
-- demande de complément ;
-- ajout de complément ;
-- changement de statut ;
+- réponse au complément ;
+- ajout de pièce jointe ;
+- décision ;
+- notification ;
 - clôture ;
-- consultation sensible ;
-- ajout de pièce jointe future.
+- consultation sensible.
 
 Exemple :
 
 ```json
 {
-  "action": "status_changed",
-  "from": "sent",
-  "to": "received_by_spw",
+  "incidentId": "incident-123",
+  "eventType": "status_changed",
+  "fromStatus": "submitted",
+  "toStatus": "spw_review",
   "actorId": "spw-1",
   "actorRole": "spw",
-  "at": "Timestamp"
+  "createdAt": "Timestamp"
 }
 ```
 
-## 9. Traçabilité
+L'historique ne doit pas être modifiable par les utilisateurs métier.
 
-La traçabilité doit permettre de répondre à :
+## 10. Notifications
 
-- qui a déclaré ?
-- quand ?
-- sur quel élève ?
-- sur quel circuit ?
-- qui a consulté ?
-- qui a demandé un complément ?
-- qui a clôturé ?
-- quelle mesure a été décidée par le SPW ?
+Destinataires possibles :
 
-Toute consultation par un rôle non SPW doit rester limitée au périmètre autorisé.
-
-## 10. Sécurité Et RGPD
-
-Un incident peut contenir des données sensibles.
-
-Principes :
-
-- minimisation ;
-- accès par rôle ;
-- accès limité au périmètre ;
-- pas de push avec détail sensible ;
-- pas de partage parent automatique ;
-- support sans accès direct aux contenus sensibles ;
-- historique obligatoire ;
-- suppression physique évitée.
-
-Contenu à éviter dans les champs libres :
-
-- diagnostic médical ;
-- données de santé inutiles ;
-- identité d'autres élèves si non nécessaire ;
-- jugement personnel ;
-- propos non factuels ;
-- détails familiaux non pertinents.
-
-Le rapport doit rester factuel.
-
-Recommandation de formulation :
-
-```txt
-Décrire les faits observés, sans interprétation inutile.
-```
-
-## 11. Exclusion
-
-Règle officielle :
-
-```txt
-Seul le SPW peut décider d'une exclusion.
-```
-
-Ne peuvent jamais décider d'une exclusion :
-
-- chauffeur ;
-- convoyeuse ;
+- SPW ;
 - transporteur ;
-- parent ;
-- support.
+- chauffeur concerné ;
+- convoyeuse concernée ;
+- parent concerné.
 
-Le système peut permettre de signaler un incident grave, mais la mesure d'exclusion reste une décision SPW.
+Règles par événement :
 
-Si une exclusion est décidée, elle doit être gérée dans le référentiel officiel élève ou dans un module SPW dédié, pas comme une simple action du rapport d'incident.
+- création : SPW notifié ;
+- demande de complément : acteur concerné notifié ;
+- changement de statut important : acteurs concernés notifiés ;
+- décision prise : notification selon décision SPW ;
+- clôture : notification selon visibilité autorisée.
 
-## 12. Intégration Future
+Règles de sécurité :
 
-### Informations Officielles
+- aucune donnée sensible dans le push ;
+- pas de description complète dans une notification ;
+- contenu complet uniquement après authentification ;
+- parent notifié uniquement si le SPW décide une communication parentale ;
+- transporteur notifié uniquement dans son périmètre.
 
-Le SPW peut publier une information officielle liée à un incident si nécessaire.
+Exemples de notifications :
+
+```txt
+Nouvel incident à consulter dans GTS.
+Demande de complément sur un incident.
+Décision SPW disponible.
+Incident clôturé.
+```
+
+## 11. Confidentialité
+
+Principe :
+
+```txt
+Chaque acteur voit uniquement ce qui le concerne.
+```
+
+### SPW
+
+Accès complet aux incidents, décisions, historiques et pièces jointes selon habilitation interne.
+
+### Transporteur
+
+Accès limité :
+
+- incidents liés à son périmètre transport ;
+- circuits qu'il organise ;
+- véhicules ou chauffeurs concernés ;
+- demandes de complément qui lui sont adressées.
+
+Il ne voit pas les décisions SPW sensibles non partagées.
+
+### Chauffeur
+
+Accès limité :
+
+- incidents qu'il crée ;
+- incidents liés à son circuit ou remplacement ;
+- demandes de complément qui lui sont adressées ;
+- statut utile au suivi.
+
+### Convoyeuse
+
+Accès limité :
+
+- incidents qu'elle crée ;
+- incidents liés à son circuit ou remplacement ;
+- demandes de complément qui lui sont adressées ;
+- statut utile au suivi.
+
+### Parent
+
+Accès non automatique au rapport complet.
+
+Le parent peut recevoir :
+
+- une information validée par le SPW ;
+- une décision SPW communiquée officiellement ;
+- un résumé adapté si le SPW l'autorise.
+
+### Support
+
+Aucun accès direct aux contenus sensibles par défaut.
+
+L'accès support éventuel doit être :
+
+- exceptionnel ;
+- limité ;
+- journalisé ;
+- validé par une règle d'intervention.
+
+## 12. Décisions SPW Protégées
+
+Le SPW est seul décisionnaire des mesures.
+
+Décisions possibles :
+
+- aucune suite ;
+- rappel de consigne ;
+- information parent ;
+- adaptation de prise en charge ;
+- suivi dossier élève ;
+- mesure administrative ;
+- autre mesure SPW.
+
+Exclusion :
+
+- jamais décidée par chauffeur ;
+- jamais décidée par convoyeuse ;
+- jamais décidée par transporteur ;
+- uniquement SPW.
+
+Les décisions doivent être séparées du signalement initial pour éviter qu'un déclarant puisse modifier ou influencer la décision officielle.
+
+## 13. Intégration Dossier Élève
+
+Chaque incident lié à un élève doit pouvoir apparaître dans le dossier élève SPW.
+
+Le dossier élève doit afficher :
+
+- date ;
+- type ;
+- niveau ;
+- circuit ;
+- statut ;
+- décision SPW si visible ;
+- pièces jointes selon droits ;
+- historique utile.
+
+Règles :
+
+- SPW voit l'historique complet ;
+- transporteur voit uniquement ce qui concerne l'organisation du transport ;
+- chauffeur et convoyeuse voient uniquement ce qui est nécessaire à leur mission ;
+- parent voit uniquement les informations validées par le SPW.
+
+## 14. Intégration Briefing Du Jour
+
+Un incident ne doit pas transformer le briefing du jour en dossier sensible complet.
+
+Le briefing peut afficher uniquement :
+
+- consigne opérationnelle validée ;
+- alerte importante ;
+- demande d'attention ;
+- changement de prise en charge ;
+- information officielle liée.
 
 Exemple :
 
 ```txt
-Consigne de prise en charge modifiée à partir du 20/06/2026.
+Consigne SPW : appliquer la procédure validée pour l'élève concerné.
 ```
 
-### Briefing Du Jour
+Le détail complet de l'incident reste dans le module incidents et le dossier élève SPW.
 
-Le briefing du jour peut afficher une consigne issue d'un incident uniquement si elle est nécessaire au trajet.
+## 15. Traçabilité Complète
 
-Il ne doit pas afficher le rapport complet.
+À journaliser :
 
-### Dossier Élève
+- création ;
+- soumission ;
+- consultation ;
+- modification ;
+- demande de complément ;
+- réponse ;
+- décision ;
+- notification ;
+- lecture parent si applicable ;
+- clôture ;
+- réouverture éventuelle.
 
-Le dossier élève peut contenir un historique SPW des incidents.
+Les actions sensibles doivent inclure :
 
-Accès :
+- acteur ;
+- rôle ;
+- date ;
+- heure ;
+- document concerné ;
+- changement effectué ;
+- source de l'accès.
 
-- SPW complet ;
-- transporteur limité aux informations nécessaires ;
-- chauffeur/convoyeuse uniquement consignes utiles ;
-- parent selon décision SPW.
+Objectif :
 
-## 13. Gains Métier
+- preuve de traitement ;
+- audit RGPD ;
+- réduction des contestations ;
+- responsabilité claire.
+
+## 16. Sécurité Et RGPD
+
+Principes :
+
+- minimisation des données ;
+- accès par périmètre ;
+- deny by default ;
+- contenu sensible uniquement après authentification ;
+- notifications push sans détail sensible ;
+- décisions SPW protégées ;
+- pièces jointes sécurisées ;
+- journalisation des accès sensibles ;
+- durée de conservation définie par le SPW ;
+- export possible pour dossier officiel ;
+- rectification par SPW uniquement.
+
+Données sensibles à protéger :
+
+- description détaillée ;
+- comportement ;
+- violence ;
+- sécurité ;
+- informations familiales ;
+- informations médicales éventuelles ;
+- pièces jointes ;
+- décisions SPW.
+
+Le support ne doit pas accéder aux incidents sensibles par défaut.
+
+## 17. Gains Métier
 
 Gains attendus :
 
 - moins de papier ;
 - moins de mails ;
+- moins de pertes d'information ;
 - suivi transparent ;
+- meilleur retour aux chauffeurs et convoyeuses concernés ;
+- meilleure visibilité pour le transporteur ;
+- information parentale mieux maîtrisée ;
 - historique centralisé ;
-- moins de double encodage ;
-- meilleure visibilité SPW ;
-- réduction des pertes d'information ;
-- traçabilité des décisions ;
-- clarification des responsabilités.
+- traçabilité SPW ;
+- intégration directe au dossier élève.
 
-## 14. Roadmap
+## 18. Roadmap
 
-### Phase 1 : Documentation
+Phases recommandées :
 
-Formaliser le modèle incident V2.
+1. Documentation officielle du modèle incident.
+2. Définition des Firestore Rules.
+3. Création des types et validations.
+4. Création de l'écran de déclaration.
+5. Création du suivi SPW.
+6. Ajout des demandes de complément.
+7. Ajout des notifications.
+8. Intégration dossier élève.
+9. Intégration briefing du jour.
+10. Ajout des pièces jointes autorisées.
 
-### Phase 2 : Lecture Et Brouillon
+## 19. Recommandation Officielle
 
-Créer une première structure en lecture/brouillon local si nécessaire.
-
-### Phase 3 : Déclaration Numérique
-
-Permettre chauffeur/convoyeuse de déclarer un incident.
-
-### Phase 4 : Workflow SPW
-
-Ajouter réception, analyse, demande de complément et clôture.
-
-### Phase 5 : Notifications
-
-Notifier les rôles concernés sans contenu sensible.
-
-### Phase 6 : Historique Et Audit
-
-Tracer toutes les actions.
-
-### Phase 7 : Pièces Jointes Futures
-
-Ajouter les pièces jointes seulement après validation sécurité/RGPD.
-
-## 15. Recommandation Officielle
-
-GTS V2 doit remplacer progressivement les rapports papier d'incident.
+GTS V2 doit considérer l'incident comme un dossier suivi, pas comme un simple message.
 
 La première version doit rester simple :
 
-- déclaration factuelle ;
-- statut visible ;
-- SPW décisionnaire ;
-- historique complet ;
-- pas de pièce jointe obligatoire ;
-- pas de notification sensible.
+- création ;
+- type ;
+- niveau ;
+- description ;
+- statut ;
+- suivi SPW ;
+- historique ;
+- notifications minimisées.
 
-Le rapport d'incident numérique n'est pas une sanction automatique.
-
-Il est une source structurée pour permettre au SPW d'analyser, décider et tracer.
+Les pièces jointes, exports avancés et analyses statistiques peuvent arriver après la stabilisation du workflow principal.
