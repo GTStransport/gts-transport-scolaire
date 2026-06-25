@@ -9253,6 +9253,7 @@ function baseNavigationItems(role = roleKey()) {
   ];
   if (role === "driver") return [
     { screen: "dashboard", label: "Tableau de bord" },
+    { screen: "dailyBriefing", label: "Briefing du jour" },
     { screen: "children", label: "Élèves" },
     { screen: "replacementRules", label: "Transfert" },
     { screen: "messages", label: messagesNavLabel() },
@@ -9263,6 +9264,7 @@ function baseNavigationItems(role = roleKey()) {
   ];
   if (role === "assistant") return [
     { screen: "dashboard", label: "Tableau de bord" },
+    { screen: "dailyBriefing", label: "Briefing du jour" },
     { screen: "children", label: "Élèves" },
     { screen: "spwContacts", label: "Contact SPW" },
     { screen: "replacementRules", label: "Organisation transferts" },
@@ -9337,6 +9339,7 @@ function configuredNavigationItems(role = roleKey()) {
 function navIcon(screen) {
   const icons = {
     dashboard: '<path d="M4 11.5 12 5l8 6.5"></path><path d="M6.5 10.5V20h11v-9.5"></path><path d="M9.5 20v-5h5v5"></path>',
+    dailyBriefing: '<path d="M7 4.5h10"></path><path d="M8.5 2.8v4"></path><path d="M15.5 2.8v4"></path><path d="M5.5 8.5h13"></path><path d="M6.5 5.5h11v15h-11v-15Z"></path><path d="M9 12h6"></path><path d="M9 15h4"></path>',
     children: '<path d="M9 10a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"></path><path d="M4 20a5 5 0 0 1 10 0"></path><path d="M17 11.5a2.2 2.2 0 1 0 0-4.4"></path><path d="M15.5 15.5a4.2 4.2 0 0 1 4.5 4.2"></path>',
     drivers: '<path d="M4.5 15.5V7.8c0-1.3 1-2.3 2.3-2.3h10.4c1.3 0 2.3 1 2.3 2.3v7.7"></path><path d="M6.2 11.2h11.6"></path><path d="M8 18.3a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"></path><path d="M16 18.3a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"></path><path d="M14.8 8.7a1.35 1.35 0 1 0 0-2.7 1.35 1.35 0 0 0 0 2.7Z"></path>',
     assistants: '<path d="M9 9.5a2.7 2.7 0 1 0 0-5.4 2.7 2.7 0 0 0 0 5.4Z"></path><path d="M4.5 20v-1.8A4.5 4.5 0 0 1 9 13.7h.4"></path><path d="M16.2 12.2a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"></path><path d="M12.4 20v-.9a3.8 3.8 0 0 1 7.6 0v.9"></path><path d="M19.4 7.9h2"></path>',
@@ -9601,6 +9604,7 @@ function content() {
   if (state.screen === "delayCenter") return canAccessGlobalDelayCenter() ? delayCenterView() : dashboard();
   if (state.screen === "transfers") return (isTransportManagerUser() || isSpwAccount()) ? transfersView() : dashboard();
   if (state.screen === "spwContacts") return canAccessSpwContacts() ? spwContactsView() : dashboard();
+  if (state.screen === "dailyBriefing") return canAccessDailyBriefing() ? dailyBriefingView() : dashboard();
   if (state.screen === "circuitStudents") return canOpenCircuitStudentsDashboard() ? circuitStudentsView() : dashboard();
   if (state.screen === "children") return childrenList();
   if (isSupportAssistanceSession() && state.screen === "messages") return `<article class="info-card privacy-masked-card"><h3>Messages</h3><p>Information masquée pour confidentialité</p></article>`;
@@ -13767,6 +13771,208 @@ function assistantDashboardSummary() {
   };
 }
 
+function canAccessDailyBriefing() {
+  return !isSupportAssistanceSession() && ["driver", "assistant"].includes(state.user?.role);
+}
+
+function dailyBriefingTransportContext(direction = "morning") {
+  return {
+    date: new Date(),
+    direction,
+    transportManagerId: transportManagerIdForUser(state.user),
+    studentAssignments: data.studentAssignments || [],
+    stopPassages: data.stopPassages || [],
+    tripSegments: data.tripSegments || [],
+    vehicles: visibleCollection("vehicles"),
+    drivers: visibleCollection("drivers"),
+    assistants: visibleCollection("assistants")
+  };
+}
+
+function dailyBriefingRows(direction = "morning") {
+  const context = dailyBriefingTransportContext(direction);
+  const today = localDateString();
+  return visibleChildren()
+    .slice()
+    .sort((a, b) => fullName(a).localeCompare(fullName(b), "fr", { sensitivity: "base" }))
+    .map((child) => {
+      const view = transportViewForChild(child, context);
+      const activeResidence = activeResidenceForChild(child, context.date);
+      const absence = activeAbsenceForChild(child, today);
+      const issues = studentIssuesForChild(child.id).filter((issue) => issue.status !== "resolved" && ["urgent", "important"].includes(issue.importance));
+      const row = {
+        child,
+        view,
+        activeResidence,
+        absence,
+        issues,
+        startLabel: quickAssignmentStartLabel(child, view),
+        schoolLabel: quickAssignmentSchoolLabel(child, view),
+        circuitLabels: quickAssignmentCircuitLabels(view),
+        driverLabels: quickAssignmentDriverLabels(view, context.drivers),
+        assistantLabels: quickAssignmentAssistantLabels(view, context.assistants),
+        vehicleLabels: quickAssignmentVehicleLabels(view, context.vehicles),
+        transferLabel: quickAssignmentReadableValue(view.summary.transferLabel, ""),
+        isBoardingStudent: view.summary.isBoardingStudent === true,
+        boardingMode: view.summary.boardingMode || "",
+        isAlternatingResidenceActive: view.summary.isAlternatingResidenceActive === true,
+        isPmr: view.summary.isPmr === true
+      };
+      return { ...row, alerts: dailyBriefingRowAlerts(row) };
+    });
+}
+
+function dailyBriefingRowAlerts(row) {
+  const alerts = [...(row.view.alerts || [])].filter((alert) => alert.level !== "info");
+  if (!row.startLabel) alerts.push(transportViewAlert("missing_pickup", "warning", "Arrêt actif ou domicile manquant."));
+  if (!row.schoolLabel) alerts.push(transportViewAlert("missing_school", "warning", "École manquante."));
+  if (!row.circuitLabels.length) alerts.push(transportViewAlert("missing_circuit", "warning", "Circuit manquant."));
+  if (!row.driverLabels.length) alerts.push(transportViewAlert("missing_driver", "warning", "Chauffeur manquant."));
+  if (!row.assistantLabels.length) alerts.push(transportViewAlert("missing_assistant", "warning", "Convoyeuse manquante."));
+  if (!row.vehicleLabels.length) alerts.push(transportViewAlert("missing_vehicle", "warning", "Véhicule manquant."));
+  if (row.absence) alerts.push(transportViewAlert("declared_absence", "info", "Absence déclarée aujourd'hui."));
+  row.issues.forEach((issue) => alerts.push(transportViewAlert(
+    issue.importance === "urgent" ? "urgent_student_issue" : "student_issue",
+    issue.importance === "urgent" ? "critical" : "warning",
+    `${studentIssueTypeLabel(issue.type)} - ${studentIssueImportanceLabel(issue.importance)}`
+  )));
+  return alerts;
+}
+
+function dailyBriefingAggregate(rows = []) {
+  const circuits = new Set();
+  const drivers = new Set();
+  const assistants = new Set();
+  const vehicles = new Set();
+  rows.forEach((row) => {
+    row.circuitLabels.forEach((label) => circuits.add(label));
+    row.driverLabels.forEach((label) => drivers.add(label));
+    row.assistantLabels.forEach((label) => assistants.add(label));
+    row.vehicleLabels.forEach((label) => vehicles.add(label));
+  });
+  return { circuits, drivers, assistants, vehicles };
+}
+
+function dailyBriefingView() {
+  const rows = dailyBriefingRows("morning");
+  const aggregate = dailyBriefingAggregate(rows);
+  const absentRows = rows.filter((row) => row.absence);
+  const issueRows = rows.filter((row) => row.issues.length);
+  const alertRows = rows.filter((row) => row.alerts.some((alert) => alert.level !== "info"));
+  const outOfServiceVehicles = outOfServiceVehiclesForCurrentUser();
+  const roleLabelText = accountRoleLabel(state.user);
+  return `<section class="view-stack compact-stack">
+    <div class="section-title action-title">
+      <div><p class="eyebrow">Lecture seule</p><h2>Briefing du jour</h2></div>
+      <span class="badge ok">Aucune écriture Firestore</span>
+    </div>
+    <article class="info-card">
+      <h3>Aujourd'hui</h3>
+      ${sectionRows([
+        ["Date", formatDateOnly(localDateString())],
+        ["Rôle connecté", roleLabelText],
+        ["Utilisateur", fullName(state.user)],
+        ["Circuit(s)", quickAssignmentReadableValue([...aggregate.circuits].join(", "))],
+        ["Élèves attendus", rows.length],
+        ["Absences déclarées", absentRows.length],
+        ["Alertes à traiter", alertRows.length + outOfServiceVehicles.length]
+      ])}
+    </article>
+    <article class="info-card">
+      <h3>Équipage et véhicule</h3>
+      ${sectionRows([
+        ["Chauffeur", quickAssignmentReadableValue([...aggregate.drivers].join(", "), "Aucun chauffeur")],
+        ["Convoyeuse", quickAssignmentReadableValue([...aggregate.assistants].join(", "), "Aucune convoyeuse")],
+        ["Véhicule", quickAssignmentReadableValue([...aggregate.vehicles].join(", "), "Aucun véhicule")]
+      ])}
+    </article>
+    <article class="info-card">
+      <h3>Alertes du jour</h3>
+      ${dailyBriefingAlertsList(rows, outOfServiceVehicles)}
+    </article>
+    <article class="info-card">
+      <h3>Absences déclarées</h3>
+      ${dailyBriefingAbsenceList(absentRows)}
+    </article>
+    <article class="info-card">
+      <h3>Élèves attendus</h3>
+      ${dailyBriefingStudentsList(rows)}
+    </article>
+    ${issueRows.length ? `<article class="info-card">
+      <h3>Incidents et points d'attention visibles</h3>
+      ${dailyBriefingIssuesList(issueRows)}
+    </article>` : ""}
+  </section>`;
+}
+
+function dailyBriefingAlertsList(rows = [], outOfServiceVehicles = []) {
+  const rowAlerts = rows.flatMap((row) =>
+    row.alerts
+      .filter((alert) => alert.level !== "info")
+      .map((alert) => ({ ...alert, studentName: fullName(row.child) }))
+  );
+  const vehicleAlerts = outOfServiceVehicles.map((vehicle) => ({
+    code: "vehicle_out_of_service",
+    level: "warning",
+    studentName: vehicle.busNumber || vehicle.licensePlate || "Véhicule",
+    message: `Véhicule indisponible${vehicleCircuitLabel(vehicle) ? ` - ${vehicleCircuitLabel(vehicle)}` : ""}.`
+  }));
+  const alerts = [...vehicleAlerts, ...rowAlerts];
+  return `<div class="quick-list-inner">
+    ${alerts.map((alert) => `<div class="child-row">
+      <span>${esc(quickAssignmentReadableValue(alert.studentName, "Aucun élève"))}</span>
+      <small>${esc(alert.message || alert.code || "Alerte")}</small>
+      ${quickAssignmentAlertBadges([alert])}
+    </div>`).join("") || `<p class="muted">Aucune alerte critique pour le périmètre visible.</p>`}
+  </div>`;
+}
+
+function dailyBriefingAbsenceList(rows = []) {
+  return `<div class="quick-list-inner">
+    ${rows.map((row) => `<button class="child-row" type="button" data-open-child="${esc(row.child.id)}">
+      <span>${esc(fullName(row.child))}</span>
+      <small>${esc([
+        `Circuit : ${quickAssignmentReadableValue(row.circuitLabels.join(", "))}`,
+        `Arrêt : ${quickAssignmentReadableValue(row.startLabel)}`,
+        `Source : ${quickAssignmentReadableValue(row.absence?.source || row.absence?.createdByRole || "Absence déclarée")}`
+      ].join(" · "))}</small>
+      <b class="badge danger">Absent</b>
+    </button>`).join("") || `<p class="muted">Aucune absence déclarée aujourd'hui.</p>`}
+  </div>`;
+}
+
+function dailyBriefingStudentsList(rows = []) {
+  return `<div class="quick-list-inner">
+    ${rows.map(dailyBriefingStudentRow).join("") || `<p class="muted">Aucun élève visible pour le briefing du jour.</p>`}
+  </div>`;
+}
+
+function dailyBriefingStudentRow(row) {
+  const issueCount = row.alerts.filter((alert) => alert.level !== "info").length;
+  return `<button class="child-row" type="button" data-open-child="${esc(row.child.id)}">
+    <span>${esc(quickAssignmentReadableValue(fullName(row.child), "Élève sans nom"))}</span>
+    <small>${esc(`📍 Arrêt / domicile : ${quickAssignmentReadableValue(row.startLabel)}`)}<br>
+      ${esc(`🏫 École : ${quickAssignmentReadableValue(row.schoolLabel, "Aucune")}`)}<br>
+      ${esc(`🚌 Circuit : ${quickAssignmentReadableValue(row.circuitLabels.join(", "))}`)}<br>
+      ${esc(`👨 Chauffeur : ${quickAssignmentReadableValue(row.driverLabels.join(", "))}`)}<br>
+      ${esc(`👩 Convoyeuse : ${quickAssignmentReadableValue(row.assistantLabels.join(", "), "Aucune")}`)}<br>
+      ${esc(`🚐 Véhicule : ${quickAssignmentReadableValue(row.vehicleLabels.join(", "))}`)}${row.transferLabel ? `<br>${esc(`🔄 Transfert : ${row.transferLabel}`)}` : ""}${row.isAlternatingResidenceActive ? `<br>${esc(`📅 Garde alternée : ${quickAssignmentReadableValue(row.activeResidence.parentLabel, "Parent actif")}`)}` : ""}${row.isBoardingStudent ? `<br>${esc(`🏠 Internat : ${quickAssignmentBoardingModeLabel(row.boardingMode)}`)}` : ""}${row.absence ? `<br>${esc("🚫 Absence déclarée aujourd'hui")}` : ""}</small>
+    ${row.absence ? `<b class="badge danger">ABSENT</b>` : `<b class="badge ok">ATTENDU</b>`}
+    ${issueCount ? `<b class="badge warning">${esc(issueCount)} alerte${issueCount > 1 ? "s" : ""}</b>` : ""}
+    ${quickAssignmentAlertBadges(row.alerts)}
+  </button>`;
+}
+
+function dailyBriefingIssuesList(rows = []) {
+  return `<div class="quick-list-inner">
+    ${rows.flatMap((row) => row.issues.map((issue) => `<button class="child-row" type="button" data-open-child="${esc(row.child.id)}">
+      <span>${esc(fullName(row.child))}</span>
+      <small>${esc(`${studentIssueTypeLabel(issue.type)} · ${studentIssueImportanceLabel(issue.importance)} · ${studentIssueStatusLabel(issue.status)}`)}</small>
+      <b class="badge ${issue.importance === "urgent" ? "danger" : "warning"}">${esc(issue.importance === "urgent" ? "URGENT" : "IMPORTANT")}</b>
+    </button>`)).join("")}
+  </div>`;
+}
+
 function driverByRef(ref) {
   const value = String(ref || "").trim().toLowerCase();
   if (!value) return null;
@@ -16652,6 +16858,11 @@ function quickAssignmentAlertBadges(alerts = []) {
     missing_home_address: "Domicile manquant",
     missing_school: "École manquante",
     missing_circuit: "Circuit manquant",
+    missing_assistant: "Convoyeuse manquante",
+    declared_absence: "Absence déclarée",
+    urgent_student_issue: "Point urgent",
+    student_issue: "Point d'attention",
+    vehicle_out_of_service: "Véhicule indisponible",
     pmr_wheelchair_capacity_exceeded: "Capacité dépassée",
     missing_transfer_hub: "Hub manquant",
     missing_incoming_circuit: "Car entrant manquant",
